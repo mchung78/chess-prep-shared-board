@@ -24,56 +24,29 @@ should - this repo holds only the generic board UI. If a future change to
 
 Live: https://mchung78.github.io/chess-prep-shared-board/board.html
 
-## Live sync (issue #385)
+## Live sync (issues #385, #387, and #388)
 
-The board optionally syncs its state (current FEN + move list) live across
-every open viewer via a single Firebase Realtime Database node, so two
-people looking at the board see the same position update in real time
-with no reload. Deliberately evaluated *before* Render/Neon (TASK_120) for
-this specific need - see #385 for why. Without a Firebase project
-configured, the board still works fine as a local-only tool for a single
-viewer.
+The optional Firebase Realtime Database integration stores one versioned state
+at `/board/state`: the normalized base FEN, current FEN, bounded space-delimited
+SAN history, and a server timestamp. Receiving clients validate the exact shape,
+replay SAN from the transmitted base, and require the reconstructed FEN to match
+before replacing the local board. With the placeholder config checked in here,
+the board remains local-only.
 
-### Setup
+Firebase web configuration values are public project identifiers, **not secrets
+or authorization controls**. Actual write authorization is enforced by
+`rules.json`: reads are public, while writes require Firebase Authentication, an
+administrator-managed `/admin/authorizedWriters/{uid}` entry, and the emergency
+`/admin/writesEnabled` switch approved in #388. Both `/admin` values are denied
+to browser clients and must be managed through the Firebase Console or a
+separately controlled Admin SDK tool. Never commit service-account credentials.
 
-1. Create a Firebase project at <https://console.firebase.google.com/>
-   (Google Analytics not needed - skip it).
-2. In the project: Build → Realtime Database → Create Database.
-   Start in **locked mode** - the rules below replace the default, so
-   locked-vs-test-mode doesn't matter once they're applied.
-3. Paste the contents of `rules.json` (this repo's root) into
-   Realtime Database → Rules, and publish.
-4. Register a **Web app** (Project settings → your apps → `</>`) to get
-   a config object (`apiKey`, `authDomain`, `databaseURL`, `projectId`,
-   `storageBucket`, `messagingSenderId`, `appId`).
-5. Paste that config object into `board.html`'s `firebaseConfig`
-   placeholder, replacing every `REPLACE_ME`, in the canonical source
-   (`chess-prep-coaching-sync`), then run `sync_shared_board.py` to push
-   it here.
-
-### What's actually secret here (and what isn't)
-
-The `firebaseConfig` values in `board.html` are **not secrets** -
-they identify the Firebase project, they don't grant privileged access,
-and Google's own docs say as much. It's fine for them to sit in a public
-repo's client-side JS. The real access gate is `rules.json`: it restricts
-the database to a single `board` node, requires exactly the fields
-`fen`/`moves`/`updatedAt`, and bounds each field's size, precisely so that
-having the (also public) config values doesn't let anyone write arbitrary
-data. If you ever change the rules, keep that property - don't loosen
-validation just because "the config is public anyway."
-
-### Design notes
-
-- **Single shared board, no auth.** Access is "you have the board's URL,"
-  matching how the board's Pages hosting already works. Revisit only if
-  a second board/room is ever actually needed (see #382).
-- **Last-write-wins.** If two people move at nearly the same instant, one
-  write simply overwrites the other. Fine for a single low-stakes board;
-  stated here explicitly rather than left as an accident.
-- **Move list, not just FEN, is synced**, so other viewers get the real
-  move history (and correct turn/undo state), not just a static final
-  position - see the comment above `pushSharedState()` in `board.html`.
+Before deployment, run `npm run test:rules` in the canonical
+`chess-prep-coaching-sync` repository, obtain independent security review, seed
+the allowlist with only required writers, and leave `writesEnabled` false until
+the tested rules are published. The client deliberately reports Local only,
+Connecting, Synced, or Error instead of treating initialization as proof of a
+working connection. Simultaneous valid writes remain last-write-wins.
 
 ### Vendored dependencies
 
