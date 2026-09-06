@@ -9,8 +9,14 @@ Canonical source for the board lives in
 `skills/chess-coach/assets/board.html`, where it's also used as the
 chess-coach Skill's inline artifact. This repo exists solely so the same
 board can be served as a durable, sign-in-free URL via GitHub Pages, since
-Pages requires a public repo on GitHub's Free plan. When `board.html`
-changes, update the canonical copy first, then copy it here.
+Pages requires a public repo on GitHub's Free plan.
+
+**Never hand-edit `board.html` here.** After changing the canonical copy,
+run `skills/chess-coach/scripts/sync_shared_board.py` (in the
+coaching-sync repo) to push it here - one command instead of a manual
+copy that's easy to forget (this is exactly what happened once already:
+a Codex review of issue #381 flagged the two-copies-with-no-sync-process
+gap before this script existed).
 
 No coaching data, credentials, or personal information lives here or ever
 should - this repo holds only the generic board UI. If a future change to
@@ -41,8 +47,9 @@ viewer.
    a config object (`apiKey`, `authDomain`, `databaseURL`, `projectId`,
    `storageBucket`, `messagingSenderId`, `appId`).
 5. Paste that config object into `board.html`'s `firebaseConfig`
-   placeholder, replacing every `REPLACE_ME`. Commit to the canonical
-   source first, then copy here.
+   placeholder, replacing every `REPLACE_ME`, in the canonical source
+   (`chess-prep-coaching-sync`), then run `sync_shared_board.py` to push
+   it here.
 
 ### What's actually secret here (and what isn't)
 
@@ -67,3 +74,15 @@ validation just because "the config is public anyway."
 - **Move list, not just FEN, is synced**, so other viewers get the real
   move history (and correct turn/undo state), not just a static final
   position - see the comment above `pushSharedState()` in `board.html`.
+
+### Vendored dependencies
+
+`chess.js` 0.10.3 is embedded inline in `board.html` rather than loaded
+from the cdnjs CDN - works identically whether this file runs as a
+claude.ai artifact widget or a standalone Pages site, with no runtime
+dependency on a third party and no visit-leakage to it. If a newer
+chess.js version is ever wanted, re-vendor it the same way rather than
+switching back to a `<script src>` CDN reference. The Firebase SDK above
+is *not* vendored the same way - it's large, and it's a first-party CDN
+for the exact service this file already depends on, so inlining it would
+just bloat the file for no real benefit.
