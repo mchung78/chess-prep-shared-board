@@ -114,9 +114,9 @@ var syncStatusEl = document.getElementById('syncStatus');
   These config values are NOT secrets by design - they identify the
   Firebase project, they don't grant privileged access. The actual
   access gate is the database's security rules (see rules.json in this
-  repo's root), which restrict writes to exactly {fen, moves, updatedAt}
-  with bounded field sizes, independent of whether this config is
-  public. Don't treat filling this in as something that needs hiding.
+  repo's root), which requires an authenticated allowlisted UID and restricts state to
+  exactly {schemaVersion, baseFen, currentFen, movesSan, updatedAt} with
+  bounded field sizes, independent of whether this config is public. Don't treat filling this in as something that needs hiding.
 */
 var firebaseConfig = {
   apiKey: "REPLACE_ME",
