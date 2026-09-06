@@ -1,4 +1,15 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+<!--
+  Firebase compat SDK (issue #385) - live sync of the shared board's
+  state (FEN + move list) via Realtime Database. Compat build chosen
+  over the modular v9+ SDK deliberately: this file is plain script-tag
+  JS with no bundler, and compat's global `firebase` object matches
+  that style with far less boilerplate for a two-call use (ref + set +
+  on('value')). Revisit only if this file ever grows a build step for
+  an unrelated reason.
+-->
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-database-compat.js"></script>
 <style>
 /*
   Defined locally rather than assumed from a host stylesheet - confirmed
@@ -41,7 +52,7 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 <button id="loadFenBtn">Load</button>
 </div>
 <p id="fenError" style="font-size:13px; color:var(--text-danger, #f66); margin:0 0 12px; display:none;">That didn't parse. Check it and try again.</p>
-<label style="font-size:13px; color:var(--text-secondary, #aaa); display:block; margin-bottom:4px;">Moves</label>
+<label style="font-size:13px; color:var(--text-secondary, #aaa); display:block; margin-bottom:4px;">Moves <span id="syncStatus" style="font-weight:normal;"></span></label>
 <div id="moveList" style="font-size:14px; line-height:1.7; max-height:200px; overflow-y:auto; color:var(--text-primary, #eee);">Start position</div>
 <div id="discussBox" style="display:none; margin-top:12px;">
 <label style="font-size:13px; color:var(--text-secondary, #aaa); display:block; margin-bottom:4px;">Copy this and paste it into Claude (pre-selected - just press Ctrl/Cmd+C):</label>
@@ -74,6 +85,89 @@ var turnLabel = document.getElementById('turnLabel');
 var moveListEl = document.getElementById('moveList');
 var fenInput = document.getElementById('fenInput');
 var fenError = document.getElementById('fenError');
+var syncStatusEl = document.getElementById('syncStatus');
+
+/*
+  Live shared-board sync (issue #385). Single Realtime Database node,
+  no auth: the board's URL is already fully public via GitHub Pages
+  (#381), so a "you have the link" access model here is consistent with
+  how the board already works rather than a new, inconsistent gate.
+
+  These config values are NOT secrets by design - they identify the
+  Firebase project, they don't grant privileged access. The actual
+  access gate is the database's security rules (see rules.json in this
+  repo's root), which restrict writes to exactly {fen, moves, updatedAt}
+  with bounded field sizes, independent of whether this config is
+  public. Don't treat filling this in as something that needs hiding.
+*/
+var firebaseConfig = {
+  apiKey: "REPLACE_ME",
+  authDomain: "REPLACE_ME.firebaseapp.com",
+  databaseURL: "https://REPLACE_ME-default-rtdb.firebaseio.com",
+  projectId: "REPLACE_ME",
+  storageBucket: "REPLACE_ME.appspot.com",
+  messagingSenderId: "REPLACE_ME",
+  appId: "REPLACE_ME"
+};
+var boardRef = null;
+var firebaseReady = false;
+try {
+  if (firebaseConfig.apiKey !== 'REPLACE_ME') {
+    firebase.initializeApp(firebaseConfig);
+    boardRef = firebase.database().ref('board');
+    firebaseReady = true;
+  }
+} catch (e) {
+  console.warn('Firebase sync not available - running local-only.', e);
+}
+if (syncStatusEl) {
+  syncStatusEl.textContent = firebaseReady ? '(synced live)' : '(local only \u2014 sync not configured)';
+}
+
+/*
+  Move list, not FEN alone, is the reconstruction source: chess.js
+  doesn't rebuild move history from a bare loaded FEN, so replaying the
+  SAN move list is what lets other viewers see a real move list (and
+  correct undo/turn state), not just a static final position. FEN is
+  still stored alongside it - useful on its own (e.g. pasting into the
+  existing Load-FEN box) and as the fallback for the one case move
+  replay can't handle: a custom position loaded via that same Load-FEN
+  box has no move history to replay in the first place, exactly
+  mirroring the pre-existing local-only quirk noted at loadFenBtn below.
+*/
+function pushSharedState() {
+  if (!firebaseReady || !boardRef) return;
+  boardRef.set({
+    fen: game.fen(),
+    moves: game.history(),
+    updatedAt: Date.now()
+  });
+}
+
+function applyRemoteState(data) {
+  if (!data) return;
+  var g = new Chess();
+  var replayed = false;
+  if (data.moves && data.moves.length) {
+    replayed = true;
+    for (var i = 0; i < data.moves.length; i++) {
+      if (!g.move(data.moves[i])) { replayed = false; break; }
+    }
+  }
+  if (!replayed) {
+    g = new Chess();
+    if (data.fen) g.load(data.fen);
+  }
+  game = g;
+  selected = null;
+  render();
+}
+
+if (firebaseReady) {
+  boardRef.on('value', function(snapshot) {
+    applyRemoteState(snapshot.val());
+  });
+}
 
 /*
   Square colors approximate the Lichess "Blue" board theme (screenshot
@@ -288,8 +382,10 @@ function onCustomDragUp(ev) {
   dragCtx = null;
   if (!wasMoved) return;  // below the movement threshold - let the ordinary click event handle it
   selected = null;
-  if (dropSq && dropSq !== fromSq) { attemptMove(fromSq, dropSq); }
+  var moved = false;
+  if (dropSq && dropSq !== fromSq) { moved = attemptMove(fromSq, dropSq); }
   render();
+  if (moved) pushSharedState();
 }
 
 function render() {
@@ -393,6 +489,7 @@ function onSquareClick(sq) {
     if (attemptMove(selected, sq)) {
       selected = null;
       render();
+      pushSharedState();
       return;
     }
   }
@@ -409,12 +506,14 @@ document.getElementById('resetBtn').onclick = function() {
   selected = null;
   fenError.style.display = 'none';
   render();
+  pushSharedState();
 };
 
 document.getElementById('undoBtn').onclick = function() {
   game.undo();
   selected = null;
   render();
+  pushSharedState();
 };
 
 document.getElementById('flipBtn').onclick = function() {
@@ -433,6 +532,7 @@ document.getElementById('loadFenBtn').onclick = function() {
   selected = null;
   fenError.style.display = 'none';
   render();
+  pushSharedState();
 };
 
 document.getElementById('discussBtn').onclick = function() {
