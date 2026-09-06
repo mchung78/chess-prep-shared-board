@@ -1,0 +1,27 @@
+{
+  "rules": {
+    "board": {
+      ".read": true,
+      ".write": true,
+      ".validate": "newData.hasChildren(['fen', 'moves', 'updatedAt'])",
+      "fen": {
+        ".validate": "newData.isString() && newData.val().length <= 100"
+      },
+      "moves": {
+        "$index": {
+          ".validate": "$index.matches(/^[0-9]{1,3}$/) && newData.isString() && newData.val().length <= 10"
+        }
+      },
+      "updatedAt": {
+        ".validate": "newData.isNumber()"
+      },
+      "$other": {
+        ".validate": false
+      }
+    },
+    "$other": {
+      ".read": false,
+      ".write": false
+    }
+  }
+}
