@@ -51,6 +51,16 @@ viewer.
    (`chess-prep-coaching-sync`), then run `sync_shared_board.py` to push
    it here.
 
+### ⚠ Client/rules mismatch (see #388)
+
+`rules.json` now requires an authenticated, allowlisted writer, but
+`board.html` has no Google Sign-In flow and never writes `admin/*`. If
+`rules.json` is published to the live Firebase project before the client
+is updated, **reads keep working but all writes silently fail** for
+every user, coach included, until sign-in is added and at least one UID
+is added to `admin/authorizedWriters` with `admin/writesEnabled` set to
+`true`. Don't publish these rules to production ahead of that client work.
+
 ### What's actually secret here (and what isn't)
 
 The `firebaseConfig` values in `board.html` are **not secrets** -
@@ -65,9 +75,14 @@ validation just because "the config is public anyway."
 
 ### Design notes
 
-- **Single shared board, no auth.** Access is "you have the board's URL,"
-  matching how the board's Pages hosting already works. Revisit only if
-  a second board/room is ever actually needed (see #382).
+- **Authenticated writes (issue #388).** The original "no auth, URL is
+  the access control" design was superseded following #385's reviews:
+  writes now require Google sign-in plus the signed-in UID being present
+  in `admin/authorizedWriters`, gated by an admin-only `admin/writesEnabled`
+  kill switch. Reads remain fully public. **`board.html` does not yet
+  implement the client side of this (no Google Sign-In UI) — see the
+  warning below.** Revisit the single-board-vs-multi-room question
+  separately if a second board/room is ever actually needed (see #382).
 - **Last-write-wins.** If two people move at nearly the same instant, one
   write simply overwrites the other. Fine for a single low-stakes board;
   stated here explicitly rather than left as an accident.

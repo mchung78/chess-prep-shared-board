@@ -2,7 +2,7 @@
   "rules": {
     "board": {
       ".read": true,
-      ".write": true,
+      ".write": "root.child('admin/writesEnabled').val() === true && auth != null && root.child('admin/authorizedWriters').child(auth.uid).val() === true",
       ".validate": "newData.hasChildren(['fen', 'moves', 'updatedAt'])",
       "fen": {
         ".validate": "newData.isString() && newData.val().length <= 100"
@@ -18,6 +18,10 @@
       "$other": {
         ".validate": false
       }
+    },
+    "admin": {
+      ".read": false,
+      ".write": false
     },
     "$other": {
       ".read": false,
