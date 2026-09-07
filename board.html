@@ -105,26 +105,30 @@ var fenError = document.getElementById('fenError');
 var syncStatusEl = document.getElementById('syncStatus');
 
 /*
-  Live shared-board sync (issue #385). Single Realtime Database node,
-  no auth: the board's URL is already fully public via GitHub Pages
-  (#381), so a "you have the link" access model here is consistent with
-  how the board already works rather than a new, inconsistent gate.
+  Live shared-board sync (issue #385). Single Realtime Database node.
+
+  Writes require Google sign-in plus the signed-in UID being present in
+  admin/authorizedWriters, gated by an admin-only admin/writesEnabled
+  kill switch (issue #388, superseding the original no-auth design after
+  #385's review discussion). Reads stay fully public - anyone with the
+  board's URL can watch live, matching how Pages hosting (#381) already
+  works. See rules.json in the chess-prep-shared-board repo for the
+  actual enforcement; this file's job is just to sign in and write.
 
   These config values are NOT secrets by design - they identify the
-  Firebase project, they don't grant privileged access. The actual
-  access gate is the database's security rules (see rules.json in this
-  repo's root), which restrict writes to exactly {fen, moves, updatedAt}
-  with bounded field sizes, independent of whether this config is
-  public. Don't treat filling this in as something that needs hiding.
+  Firebase project, they don't grant privileged access. The real access
+  gate is the database's security rules, independent of whether this
+  config is public. Don't treat filling this in as something that needs
+  hiding.
 */
 var firebaseConfig = {
-  apiKey: "REPLACE_ME",
-  authDomain: "REPLACE_ME.firebaseapp.com",
-  databaseURL: "https://REPLACE_ME-default-rtdb.firebaseio.com",
-  projectId: "REPLACE_ME",
-  storageBucket: "REPLACE_ME.appspot.com",
-  messagingSenderId: "REPLACE_ME",
-  appId: "REPLACE_ME"
+  apiKey: "AIzaSyBJo0j6enFcBCHEc3kAa_L2BwlIMJWTRvg",
+  authDomain: "chess-prep-sync.firebaseapp.com",
+  databaseURL: "https://chess-prep-sync-default-rtdb.firebaseio.com",
+  projectId: "chess-prep-sync",
+  storageBucket: "chess-prep-sync.firebasestorage.app",
+  messagingSenderId: "785376461633",
+  appId: "1:785376461633:web:d9d86f5562c7fd36aa57c0"
 };
 var boardRef = null;
 var firebaseReady = false;
