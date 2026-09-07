@@ -92,6 +92,8 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 */
 var INITIAL_FEN = '';
 var game = INITIAL_FEN ? new Chess(normalizeFen(INITIAL_FEN)) : new Chess();
+var STANDARD_FEN = new Chess().fen();
+var baseFen = game.fen();
 var selected = null;
 var flipped = false;
 var dragCtx = null;  // { fromSq, startX, startY, moved, ghostEl, hoverSq } while a custom drag is in progress
@@ -105,21 +107,16 @@ var fenError = document.getElementById('fenError');
 var syncStatusEl = document.getElementById('syncStatus');
 
 /*
-  Live shared-board sync (issue #385). Single Realtime Database node.
-
-  Writes require Google sign-in plus the signed-in UID being present in
-  admin/authorizedWriters, gated by an admin-only admin/writesEnabled
-  kill switch (issue #388, superseding the original no-auth design after
-  #385's review discussion). Reads stay fully public - anyone with the
-  board's URL can watch live, matching how Pages hosting (#381) already
-  works. See rules.json in the chess-prep-shared-board repo for the
-  actual enforcement; this file's job is just to sign in and write.
+  Live shared-board sync (issues #385/#387). Reads are public, but writes
+  require Firebase Authentication plus the server-side UID allowlist chosen
+  in #388. Last-write-wins is intentional for this single-board experiment.
 
   These config values are NOT secrets by design - they identify the
-  Firebase project, they don't grant privileged access. The real access
-  gate is the database's security rules, independent of whether this
-  config is public. Don't treat filling this in as something that needs
-  hiding.
+  Firebase project, they don't grant privileged access. The actual
+  access gate is the database's security rules (see rules.json in this
+  repo's root), which requires an authenticated allowlisted UID and restricts state to
+  exactly {schemaVersion, baseFen, currentFen, movesSan, updatedAt} with
+  bounded field sizes, independent of whether this config is public. Don't treat filling this in as something that needs hiding.
 */
 var firebaseConfig = {
   apiKey: "AIzaSyBJo0j6enFcBCHEc3kAa_L2BwlIMJWTRvg",
@@ -135,15 +132,19 @@ var firebaseReady = false;
 try {
   if (firebaseConfig.apiKey !== 'REPLACE_ME') {
     firebase.initializeApp(firebaseConfig);
-    boardRef = firebase.database().ref('board');
+    boardRef = firebase.database().ref('board/state');
     firebaseReady = true;
   }
 } catch (e) {
   console.warn('Firebase sync not available - running local-only.', e);
 }
-if (syncStatusEl) {
-  syncStatusEl.textContent = firebaseReady ? '(synced live)' : '(local only \u2014 sync not configured)';
+var listenerHealthy = false;
+function setSyncStatus(state, detail) {
+  if (!syncStatusEl) return;
+  var labels = { local: 'local only', connecting: 'connecting', synced: 'synced', error: 'sync error' };
+  syncStatusEl.textContent = '(' + labels[state] + (detail ? ': ' + detail : '') + ')';
 }
+setSyncStatus(firebaseReady ? 'connecting' : 'local', firebaseReady ? '' : 'not configured');
 
 /*
   Move list, not FEN alone, is the reconstruction source: chess.js
@@ -156,37 +157,110 @@ if (syncStatusEl) {
   box has no move history to replay in the first place, exactly
   mirroring the pre-existing local-only quirk noted at loadFenBtn below.
 */
+/* TASK_387_STATE_CODEC_START - kept pure so the deterministic Node tests can extract it. */
+var STATE_SCHEMA_VERSION = 1;
+var STATE_FIELDS = ['baseFen', 'currentFen', 'movesSan', 'schemaVersion', 'updatedAt'];
+var MAX_FEN_LENGTH = 100;
+var MAX_MOVES_LENGTH = 10000;
+var MAX_PLIES = 1000;
+
+function parseFen(value, label) {
+  if (typeof value !== 'string' || value.length < 1 || value.length > MAX_FEN_LENGTH) {
+    throw new Error(label + ' must be a 1-100 character FEN');
+  }
+  var normalized = normalizeFen(value);
+  var parsed = new Chess();
+  if (!parsed.load(normalized)) throw new Error(label + ' is not valid FEN');
+  return { fen: parsed.fen(), game: parsed };
+}
+
+function serializeSharedState(activeGame, trackedBaseFen, timestamp) {
+  var parsedBase = parseFen(trackedBaseFen, 'Base FEN');
+  var parsedCurrent = parseFen(activeGame.fen(), 'Current FEN');
+  var moves = activeGame.history();
+  if (moves.length > MAX_PLIES) throw new Error('Move history exceeds 1000 plies');
+  var movesSan = moves.join(' ');
+  if (movesSan.length > MAX_MOVES_LENGTH) throw new Error('Move history exceeds 10000 characters');
+  return {
+    schemaVersion: STATE_SCHEMA_VERSION,
+    baseFen: parsedBase.fen,
+    currentFen: parsedCurrent.fen,
+    movesSan: movesSan,
+    updatedAt: timestamp
+  };
+}
+
+function decodeSharedState(data) {
+  if (!data || Object.prototype.toString.call(data) !== '[object Object]') {
+    throw new Error('Remote state must be an object');
+  }
+  var keys = Object.keys(data).sort();
+  if (keys.length !== STATE_FIELDS.length || keys.some(function(key, index) { return key !== STATE_FIELDS[index]; })) {
+    throw new Error('Remote state has missing or unknown fields');
+  }
+  if (!Number.isInteger(data.schemaVersion) || data.schemaVersion !== STATE_SCHEMA_VERSION) {
+    throw new Error('Unsupported remote state version');
+  }
+  if (typeof data.updatedAt !== 'number' || !Number.isFinite(data.updatedAt)) {
+    throw new Error('Remote timestamp is invalid');
+  }
+  if (typeof data.movesSan !== 'string' || data.movesSan.length > MAX_MOVES_LENGTH) {
+    throw new Error('Remote move history is invalid');
+  }
+  var base = parseFen(data.baseFen, 'Remote base FEN');
+  var current = parseFen(data.currentFen, 'Remote current FEN');
+  var tokens = data.movesSan === '' ? [] : data.movesSan.split(' ');
+  if (tokens.length > MAX_PLIES || tokens.some(function(token) { return !token; })) {
+    throw new Error('Remote move history is invalid');
+  }
+  for (var i = 0; i < tokens.length; i++) {
+    var move = base.game.move(tokens[i]);
+    if (!move || move.san !== tokens[i]) throw new Error('Remote move history contains invalid SAN');
+  }
+  if (base.game.fen() !== current.fen) throw new Error('Remote position does not match its move history');
+  return { game: base.game, baseFen: base.fen };
+}
+/* TASK_387_STATE_CODEC_END */
+
 function pushSharedState() {
   if (!firebaseReady || !boardRef) return;
-  boardRef.set({
-    fen: game.fen(),
-    moves: game.history(),
-    updatedAt: Date.now()
+  var payload;
+  try {
+    payload = serializeSharedState(game, baseFen, firebase.database.ServerValue.TIMESTAMP);
+  } catch (e) {
+    setSyncStatus('error', e.message);
+    return;
+  }
+  boardRef.set(payload).then(function() {
+    if (listenerHealthy) setSyncStatus('synced');
+  }).catch(function() {
+    setSyncStatus('error', 'write failed');
   });
 }
 
 function applyRemoteState(data) {
-  if (!data) return;
-  var g = new Chess();
-  var replayed = false;
-  if (data.moves && data.moves.length) {
-    replayed = true;
-    for (var i = 0; i < data.moves.length; i++) {
-      if (!g.move(data.moves[i])) { replayed = false; break; }
-    }
+  try {
+    var decoded = decodeSharedState(data);
+    game = decoded.game;
+    baseFen = decoded.baseFen;
+    selected = null;
+    render();
+    setSyncStatus('synced');
+    return true;
+  } catch (e) {
+    setSyncStatus('error', e.message);
+    return false;
   }
-  if (!replayed) {
-    g = new Chess();
-    if (data.fen) g.load(data.fen);
-  }
-  game = g;
-  selected = null;
-  render();
 }
 
 if (firebaseReady) {
   boardRef.on('value', function(snapshot) {
-    applyRemoteState(snapshot.val());
+    listenerHealthy = true;
+    var value = snapshot.val();
+    if (value !== null) applyRemoteState(value);
+  }, function() {
+    listenerHealthy = false;
+    setSyncStatus('error', 'read failed');
   });
 }
 
@@ -524,6 +598,7 @@ function onSquareClick(sq) {
 
 document.getElementById('resetBtn').onclick = function() {
   game = new Chess();
+  baseFen = STANDARD_FEN;
   selected = null;
   fenError.style.display = 'none';
   render();
@@ -550,6 +625,7 @@ document.getElementById('loadFenBtn').onclick = function() {
   var ok = test.load(value);
   if (!ok) { fenError.textContent = "That didn't parse. Check it and try again."; fenError.style.display = 'block'; return; }
   game = test;
+  baseFen = test.fen();
   selected = null;
   fenError.style.display = 'none';
   render();
