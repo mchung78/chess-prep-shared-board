@@ -27,6 +27,7 @@ var Chess=function(r){var u="b",s="w",l=-1,_="p",A="n",S="b",m="r",y="q",p="k",t
 -->
 <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-auth-compat.js"></script>
 <style>
 /*
   Defined locally rather than assumed from a host stylesheet - confirmed
@@ -70,6 +71,10 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 </div>
 <p id="fenError" style="font-size:13px; color:var(--text-danger, #f66); margin:0 0 12px; display:none;">That didn't parse. Check it and try again.</p>
 <label style="font-size:13px; color:var(--text-secondary, #aaa); display:block; margin-bottom:4px;">Moves <span id="syncStatus" style="font-weight:normal;"></span></label>
+<div id="authRow" style="display:none; align-items:center; gap:8px; margin-bottom:8px;">
+<button id="authBtn"></button>
+<span id="authStatus" style="font-size:12px; color:var(--text-secondary, #aaa);"></span>
+</div>
 <div id="moveList" style="font-size:14px; line-height:1.7; max-height:200px; overflow-y:auto; color:var(--text-primary, #eee);">Start position</div>
 <div id="discussBox" style="display:none; margin-top:12px;">
 <label style="font-size:13px; color:var(--text-secondary, #aaa); display:block; margin-bottom:4px;">Copy this and paste it into Claude (pre-selected - just press Ctrl/Cmd+C):</label>
@@ -105,6 +110,9 @@ var moveListEl = document.getElementById('moveList');
 var fenInput = document.getElementById('fenInput');
 var fenError = document.getElementById('fenError');
 var syncStatusEl = document.getElementById('syncStatus');
+var authRowEl = document.getElementById('authRow');
+var authBtnEl = document.getElementById('authBtn');
+var authStatusEl = document.getElementById('authStatus');
 
 /*
   Live shared-board sync (issues #385/#387). Reads are public, but writes
@@ -137,6 +145,48 @@ try {
   }
 } catch (e) {
   console.warn('Firebase sync not available - running local-only.', e);
+}
+
+/*
+  Sign-in (issue #388). Reads never required auth - this is purely so a
+  write attempt has a UID for the server-side rules to check against
+  admin/authorizedWriters. Being signed in is necessary but not
+  sufficient to write: the client has no way to know whether its own
+  UID is on the allowlist (admin/* is unreadable by design - see
+  rules.json), so "signed in" and "authorized to write" are shown as
+  separate states, distinguished only by whether an actual write
+  succeeds or comes back permission-denied.
+*/
+var currentUser = null;
+function updateAuthUI() {
+  if (!authBtnEl || !authStatusEl) return;
+  if (currentUser) {
+    authBtnEl.textContent = 'Sign out';
+    authStatusEl.textContent = 'Signed in as ' + (currentUser.email || currentUser.uid);
+  } else {
+    authBtnEl.textContent = 'Sign in with Google';
+    authStatusEl.textContent = 'Sign in to move pieces for everyone watching';
+  }
+}
+if (firebaseReady) {
+  if (authRowEl) authRowEl.style.display = 'flex';
+  firebase.auth().onAuthStateChanged(function(user) {
+    currentUser = user;
+    updateAuthUI();
+  });
+  if (authBtnEl) {
+    authBtnEl.addEventListener('click', function() {
+      if (currentUser) {
+        firebase.auth().signOut();
+        return;
+      }
+      firebase.auth().signInWithPopup(new firebase.auth.GoogleAuthProvider()).catch(function(e) {
+        console.warn('Sign-in failed', e);
+        if (authStatusEl) authStatusEl.textContent = 'Sign-in failed - try again';
+      });
+    });
+  }
+  updateAuthUI();
 }
 var listenerHealthy = false;
 function setSyncStatus(state, detail) {
@@ -233,8 +283,13 @@ function pushSharedState() {
   }
   boardRef.set(payload).then(function() {
     if (listenerHealthy) setSyncStatus('synced');
-  }).catch(function() {
-    setSyncStatus('error', 'write failed');
+  }).catch(function(err) {
+    var isPermissionDenied = err && (err.code === 'PERMISSION_DENIED' || /permission_denied/i.test(err.message || ''));
+    if (isPermissionDenied) {
+      setSyncStatus('error', currentUser ? 'not authorized to write' : 'sign in required to write');
+    } else {
+      setSyncStatus('error', 'write failed');
+    }
   });
 }
 
