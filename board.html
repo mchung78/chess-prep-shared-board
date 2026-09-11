@@ -224,6 +224,17 @@ function parseFen(value, label) {
   return { fen: parsed.fen(), game: parsed };
 }
 
+function comparableFen(game) {
+  var fields = game.fen().split(' ');
+  if (fields[3] !== '-') {
+    var hasLegalEnPassant = game.moves({ verbose: true }).some(function(move) {
+      return move.flags.indexOf('e') !== -1;
+    });
+    if (!hasLegalEnPassant) fields[3] = '-';
+  }
+  return fields.join(' ');
+}
+
 function serializeSharedState(activeGame, trackedBaseFen, timestamp) {
   var parsedBase = parseFen(trackedBaseFen, 'Base FEN');
   var parsedCurrent = parseFen(activeGame.fen(), 'Current FEN');
@@ -267,7 +278,9 @@ function decodeSharedState(data) {
     var move = base.game.move(tokens[i]);
     if (!move || move.san !== tokens[i]) throw new Error('Remote move history contains invalid SAN');
   }
-  if (base.game.fen() !== current.fen) throw new Error('Remote position does not match its move history');
+  if (comparableFen(base.game) !== comparableFen(current.game)) {
+    throw new Error('Remote position does not match its move history');
+  }
   return { game: base.game, baseFen: base.fen };
 }
 /* TASK_387_STATE_CODEC_END */
