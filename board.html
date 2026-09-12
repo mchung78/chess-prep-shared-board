@@ -244,8 +244,8 @@ function serializeSharedState(activeGame, trackedBaseFen, timestamp) {
   if (movesSan.length > MAX_MOVES_LENGTH) throw new Error('Move history exceeds 10000 characters');
   return {
     schemaVersion: STATE_SCHEMA_VERSION,
-    baseFen: parsedBase.fen,
-    currentFen: parsedCurrent.fen,
+    baseFen: comparableFen(parsedBase.game),
+    currentFen: comparableFen(parsedCurrent.game),
     movesSan: movesSan,
     updatedAt: timestamp
   };
