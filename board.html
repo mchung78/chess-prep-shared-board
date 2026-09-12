@@ -43,15 +43,16 @@ var Chess=function(r){var u="b",s="w",l=-1,_="p",A="n",S="b",m="r",y="q",p="k",t
 */
 .sr-only { position:absolute !important; width:1px !important; height:1px !important; padding:0 !important; margin:-1px !important; overflow:hidden !important; clip:rect(0,0,0,0) !important; clip-path:inset(50%) !important; white-space:nowrap !important; border:0 !important; }
 html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, #eee); margin:0; }
+#board { grid-template-columns:repeat(8,var(--square-size,44px)); grid-template-rows:repeat(8,var(--square-size,44px)); }
 </style>
 <div style="padding: 1rem 0;">
 <h2 class="sr-only" style="position:absolute !important; width:1px !important; height:1px !important; padding:0 !important; margin:-1px !important; overflow:hidden !important; clip:rect(0,0,0,0) !important; clip-path:inset(50%) !important; white-space:nowrap !important; border:0 !important;">Interactive chess board for studying positions and sending them to Claude</h2>
-<div style="display:flex; gap:20px; flex-wrap:wrap; align-items:flex-start;">
-<div>
+<div id="boardLayout" style="display:flex; gap:20px; flex-wrap:wrap; align-items:flex-start;">
+<div id="boardPanel" style="flex:1 1 352px; min-width:212px; max-width:596px;">
 <div style="display:flex;">
 <div id="ranks" style="display:flex; flex-direction:column; margin-right:4px;"></div>
 <div>
-<div id="board" style="display:grid; grid-template-columns:repeat(8,44px); grid-template-rows:repeat(8,44px); border:0.5px solid var(--border-strong, #666); position:relative;"></div>
+<div id="board" style="display:grid; border:0.5px solid var(--border-strong, #666); position:relative;"></div>
 <div id="files" style="display:flex; margin-top:2px;"></div>
 </div>
 </div>
@@ -103,6 +104,7 @@ var selected = null;
 var flipped = false;
 var dragCtx = null;  // { fromSq, startX, startY, moved, ghostEl, hoverSq } while a custom drag is in progress
 var boardEl = document.getElementById('board');
+var boardPanelEl = document.getElementById('boardPanel');
 var ranksEl = document.getElementById('ranks');
 var filesEl = document.getElementById('files');
 var turnLabel = document.getElementById('turnLabel');
@@ -113,6 +115,32 @@ var syncStatusEl = document.getElementById('syncStatus');
 var authRowEl = document.getElementById('authRow');
 var authBtnEl = document.getElementById('authBtn');
 var authStatusEl = document.getElementById('authStatus');
+
+/* TASK_467_BOARD_RESIZE_START - pure calculation is exercised by the Node regression test. */
+function calculateSquareSize(containerWidth, availableHeight) {
+  var widthLimited = (containerWidth - 20) / 8; // rank labels and their margin
+  return Math.max(24, Math.min(72, Math.floor(widthLimited), Math.floor(availableHeight / 8)));
+}
+/* TASK_467_BOARD_RESIZE_END */
+
+function resizeBoard() {
+  if (!boardPanelEl || !boardEl) return;
+  var availableHeight = window.innerHeight - boardEl.getBoundingClientRect().top - 64;
+  var squareSize = calculateSquareSize(boardPanelEl.clientWidth, availableHeight);
+  document.documentElement.style.setProperty('--square-size', squareSize + 'px');
+}
+
+var resizeTimer = null;
+function scheduleBoardResize() {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(resizeBoard, 120);
+}
+if (typeof ResizeObserver === 'function') {
+  new ResizeObserver(scheduleBoardResize).observe(boardPanelEl);
+} else {
+  window.addEventListener('resize', scheduleBoardResize);
+}
+requestAnimationFrame(resizeBoard);
 
 /*
   Live shared-board sync (issues #385/#387). Reads are public, but writes
@@ -340,7 +368,6 @@ if (firebaseReady) {
 */
 var LIGHT_SQUARE = '#dee3e6';
 var DARK_SQUARE = '#8ca2ad';
-var PIECE_SIZE = 42;  // px within a 44px cell - bumped from an initial 40 per live feedback, "still some empty space"
 var HIGHLIGHT_COLOR = 'rgba(255, 214, 51, 0.35)';  // shared tint for the drag-source ghost square and the drop-target hover square
 
 /*
@@ -407,7 +434,7 @@ function renderCoords() {
     var rankNum = flipped ? r + 1 : 8 - r;
     var rEl = document.createElement('div');
     rEl.textContent = rankNum;
-    rEl.style.height = '44px';
+    rEl.style.height = 'var(--square-size,44px)';
     rEl.style.display = 'flex';
     rEl.style.alignItems = 'center';
     rEl.style.fontSize = '12px';
@@ -418,7 +445,7 @@ function renderCoords() {
     var fileLetter = String.fromCharCode(97 + (flipped ? 7 - f : f));
     var fEl = document.createElement('div');
     fEl.textContent = fileLetter;
-    fEl.style.width = '44px';
+    fEl.style.width = 'var(--square-size,44px)';
     fEl.style.textAlign = 'center';
     fEl.style.fontSize = '12px';
     fEl.style.color = 'var(--text-muted, #999)';
@@ -471,8 +498,8 @@ function createGhostEl(sq) {
   var piece = game.get(sq);
   var el = document.createElement('div');
   el.style.position = 'fixed';
-  el.style.width = '44px';
-  el.style.height = '44px';
+  el.style.width = 'var(--square-size,44px)';
+  el.style.height = 'var(--square-size,44px)';
   el.style.pointerEvents = 'none';  // critical: lets elementFromPoint() see the real cell/square underneath, not the ghost itself
   el.style.zIndex = '1000';
   el.style.display = 'flex';
@@ -483,8 +510,8 @@ function createGhostEl(sq) {
 }
 
 function positionGhost(el, x, y) {
-  el.style.left = (x - 22) + 'px';  // center the 44px ghost on the cursor
-  el.style.top = (y - 22) + 'px';
+  el.style.left = (x - el.offsetWidth / 2) + 'px';
+  el.style.top = (y - el.offsetHeight / 2) + 'px';
 }
 
 function squareAtPoint(x, y) {
@@ -502,8 +529,8 @@ function showHoverHighlight(sq) {
   el.style.position = 'absolute';
   el.style.left = cellEl.offsetLeft + 'px';
   el.style.top = cellEl.offsetTop + 'px';
-  el.style.width = '44px';
-  el.style.height = '44px';
+  el.style.width = 'var(--square-size,44px)';
+  el.style.height = 'var(--square-size,44px)';
   el.style.background = HIGHLIGHT_COLOR;
   el.style.pointerEvents = 'none';
   boardEl.appendChild(el);
@@ -565,8 +592,8 @@ function render() {
       var isLight = (r + f) % 2 === 0;
       var cell = document.createElement('div');
       cell.dataset.square = sq;
-      cell.style.width = '44px';
-      cell.style.height = '44px';
+      cell.style.width = 'var(--square-size,44px)';
+      cell.style.height = 'var(--square-size,44px)';
       cell.style.display = 'flex';
       cell.style.alignItems = 'center';
       cell.style.justifyContent = 'center';
@@ -587,8 +614,8 @@ function render() {
         span.style.display = 'flex';
         span.style.alignItems = 'center';
         span.style.justifyContent = 'center';
-        span.style.width = PIECE_SIZE + 'px';
-        span.style.height = PIECE_SIZE + 'px';
+        span.style.width = 'calc(var(--square-size,44px) * 0.9545)';
+        span.style.height = 'calc(var(--square-size,44px) * 0.9545)';
         span.style.userSelect = 'none';
         span.dataset.fromSquare = sq;
         span.style.cursor = 'pointer';
