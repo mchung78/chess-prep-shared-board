@@ -76,6 +76,13 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 <button id="authBtn"></button>
 <span id="authStatus" style="font-size:12px; color:var(--text-secondary, #aaa);"></span>
 </div>
+<div style="display:flex; gap:6px; align-items:center; margin-bottom:8px;">
+<button id="navFirstBtn" title="First move (Home)" aria-label="Jump to start position">|◀</button>
+<button id="navBackBtn" title="Back one move (←)" aria-label="Step back one move">◀</button>
+<button id="navForwardBtn" title="Forward one move (→)" aria-label="Step forward one move">▶</button>
+<button id="navLiveBtn" title="Jump to the current live position (End)" aria-label="Jump to live position">Live ▶|</button>
+<span id="navStatus" style="font-size:12px; color:var(--text-secondary, #aaa);"></span>
+</div>
 <div id="moveList" style="font-size:14px; line-height:1.7; max-height:200px; overflow-y:auto; color:var(--text-primary, #eee);">Start position</div>
 <div id="discussBox" style="display:none; margin-top:12px;">
 <label style="font-size:13px; color:var(--text-secondary, #aaa); display:block; margin-bottom:4px;">Copy this and paste it into Claude (pre-selected - just press Ctrl/Cmd+C):</label>
@@ -103,12 +110,28 @@ var baseFen = game.fen();
 var selected = null;
 var flipped = false;
 var dragCtx = null;  // { fromSq, startX, startY, moved, ghostEl, hoverSq } while a custom drag is in progress
+/*
+  TASK_613: viewPly is the navigation cursor, separate from game's own
+  live/authoritative move stack - "how many of game.history()'s plies
+  are currently displayed", 0..game.history().length. This is what lets
+  someone browse an earlier position without truncating or otherwise
+  touching the real move list (the old Undo-repeatedly-to-look-back
+  approach actually popped moves off game itself, with no way forward
+  again). See buildViewGame()/render() for how this drives the board,
+  and isAtLive() for why interactivity is gated on it.
+*/
+var viewPly = 0;
 var boardEl = document.getElementById('board');
 var boardPanelEl = document.getElementById('boardPanel');
 var ranksEl = document.getElementById('ranks');
 var filesEl = document.getElementById('files');
 var turnLabel = document.getElementById('turnLabel');
 var moveListEl = document.getElementById('moveList');
+var navStatusEl = document.getElementById('navStatus');
+var navFirstBtn = document.getElementById('navFirstBtn');
+var navBackBtn = document.getElementById('navBackBtn');
+var navForwardBtn = document.getElementById('navForwardBtn');
+var navLiveBtn = document.getElementById('navLiveBtn');
 var fenInput = document.getElementById('fenInput');
 var fenError = document.getElementById('fenError');
 var syncStatusEl = document.getElementById('syncStatus');
@@ -313,6 +336,37 @@ function decodeSharedState(data) {
 }
 /* TASK_387_STATE_CODEC_END */
 
+/*
+  TASK_613: pure navigation-cursor arithmetic, kept side-effect-free (no
+  reference to game/viewPly globals) so the Node-vm extraction harness
+  used for TASK_387/TASK_467 above can test it directly - see
+  skills/chess-coach/test/board-navigation.test.js.
+*/
+/* TASK_613_VIEW_NAV_START */
+function clampViewPly(ply, historyLength) {
+  if (ply < 0) return 0;
+  if (ply > historyLength) return historyLength;
+  return ply;
+}
+
+/*
+  Decides where the view cursor lands after a remote (Firebase) update
+  changes the live history's length. wasAtLive is whatever the viewer
+  was looking at *before* the update landed:
+  - following live (wasAtLive true) -> keep following, jump to the new
+    tip, same as it always has.
+  - mid-history (wasAtLive false) -> leave them exactly where they were,
+    clamped only if the new history is now shorter than their position
+    (e.g. someone hit Reset while this viewer was browsing an old
+    position) - never yank a browsing viewer forward to the new tip
+    just because a move arrived elsewhere.
+*/
+function nextViewPlyOnRemoteUpdate(currentPly, wasAtLive, newHistoryLength) {
+  if (wasAtLive) return newHistoryLength;
+  return clampViewPly(currentPly, newHistoryLength);
+}
+/* TASK_613_VIEW_NAV_END */
+
 function pushSharedState() {
   if (!firebaseReady || !boardRef) return;
   var payload;
@@ -336,9 +390,11 @@ function pushSharedState() {
 
 function applyRemoteState(data) {
   try {
+    var wasAtLive = (viewPly === game.history().length);
     var decoded = decodeSharedState(data);
     game = decoded.game;
     baseFen = decoded.baseFen;
+    viewPly = nextViewPlyOnRemoteUpdate(viewPly, wasAtLive, game.history().length);
     selected = null;
     render();
     setSyncStatus('synced');
@@ -578,10 +634,46 @@ function onCustomDragUp(ev) {
   if (moved) pushSharedState();
 }
 
+/*
+  TASK_613: true when the view cursor is on the live tip - the only
+  state in which the board is interactive (dragging/clicking to move).
+  Browsing an earlier position is read-only: the piece-move entry
+  points (onSquareClick, the drag onmousedown handler below) all check
+  this before doing anything, rather than letting a move be attempted
+  against a temporary replayed position that isn't the real game.
+*/
+function isAtLive() {
+  return viewPly === game.history().length;
+}
+
+/*
+  The position actually shown on the board/turn-label - game's own live
+  position when following live, or a replay from baseFen through the
+  first viewPly plies of game.history() otherwise. Rebuilt on every
+  render() call rather than cached: viewPly only changes on an explicit
+  nav action (a handful of chess.js moves to replay, at most
+  MAX_PLIES), so this is cheap enough not to need memoizing - see
+  MAX_PLIES above if that assumption ever stops holding.
+*/
+function buildViewGame() {
+  if (isAtLive()) return game;
+  var viewGame = new Chess(normalizeFen(baseFen));
+  var hist = game.history();
+  for (var i = 0; i < viewPly; i++) viewGame.move(hist[i]);
+  return viewGame;
+}
+
+function goToPly(ply) {
+  viewPly = clampViewPly(ply, game.history().length);
+  selected = null;
+  render();
+}
+
 function render() {
   boardEl.innerHTML = '';
   renderCoords();
-  var board = game.board();
+  var displayGame = buildViewGame();
+  var board = displayGame.board();
   for (var r = 0; r < 8; r++) {
     for (var f = 0; f < 8; f++) {
       var boardRow = flipped ? 7 - r : r;
@@ -621,6 +713,7 @@ function render() {
         span.style.cursor = 'pointer';
         span.onmousedown = (function(fromSq) {
           return function(ev) {
+            if (!isAtLive()) return;  // TASK_613: browsing history is read-only
             var p = game.get(fromSq);
             if (!p || p.color !== game.turn()) return;
             ev.preventDefault();
@@ -637,7 +730,7 @@ function render() {
     }
   }
   if (selected) {
-    var moves = game.moves({ square: selected, verbose: true });
+    var moves = displayGame.moves({ square: selected, verbose: true });
     for (var i = 0; i < moves.length; i++) {
       var dest = boardEl.querySelector('[data-square="' + moves[i].to + '"]');
       if (!dest) continue;
@@ -658,26 +751,87 @@ function render() {
       dest.appendChild(marker);
     }
   }
-  turnLabel.textContent = (game.turn() === 'w' ? 'White' : 'Black') + ' to move' + (game.in_checkmate() ? ' - checkmate' : game.in_check() ? ' - check' : '');
+  turnLabel.textContent = (displayGame.turn() === 'w' ? 'White' : 'Black') + ' to move' +
+    (displayGame.in_checkmate() ? ' - checkmate' : displayGame.in_check() ? ' - check' : '') +
+    (isAtLive() ? '' : ' (viewing move ' + viewPly + ' of ' + game.history().length + ')');
+  renderMoveList();
+  renderNavControls();
+}
+
+/*
+  TASK_613: the move list, rebuilt from game's real (always-full)
+  history on every render - navigating never touches game itself, only
+  viewPly, so this always has every move regardless of what's currently
+  displayed. Each SAN is its own clickable span (jump straight to the
+  position right after that move); the currently-viewed ply is
+  highlighted so browsing has a visible "you are here".
+*/
+function renderMoveList() {
+  moveListEl.innerHTML = '';
   var hist = game.history();
-  if (hist.length === 0) {
-    moveListEl.textContent = 'Start position';
-  } else {
-    var parts = [];
-    for (var i = 0; i < hist.length; i += 2) {
-      var num = (i / 2) + 1;
-      parts.push(num + '. ' + hist[i] + (hist[i+1] ? ' ' + hist[i+1] : ''));
+  var startSpan = document.createElement('span');
+  startSpan.textContent = 'Start position';
+  startSpan.style.cursor = 'pointer';
+  startSpan.style.marginRight = '8px';
+  if (viewPly === 0) startSpan.style.background = 'var(--border-accent, #4a9eff)';
+  startSpan.onclick = function() { goToPly(0); };
+  moveListEl.appendChild(startSpan);
+  if (hist.length === 0) return;
+  for (var i = 0; i < hist.length; i += 2) {
+    var num = (i / 2) + 1;
+    var numSpan = document.createElement('span');
+    numSpan.textContent = num + '. ';
+    numSpan.style.color = 'var(--text-secondary, #aaa)';
+    moveListEl.appendChild(numSpan);
+    moveListEl.appendChild(makeMoveSpan(hist[i], i + 1));
+    if (hist[i + 1]) {
+      moveListEl.appendChild(document.createTextNode(' '));
+      moveListEl.appendChild(makeMoveSpan(hist[i + 1], i + 2));
     }
-    moveListEl.textContent = parts.join('  ');
+    moveListEl.appendChild(document.createTextNode('  '));
+  }
+}
+
+function makeMoveSpan(san, ply) {
+  var span = document.createElement('span');
+  span.textContent = san;
+  span.style.cursor = 'pointer';
+  span.style.padding = '0 2px';
+  span.style.borderRadius = '3px';
+  if (ply === viewPly) {
+    span.style.background = 'var(--border-accent, #4a9eff)';
+    span.style.color = '#fff';
+  }
+  span.onclick = function() { goToPly(ply); };
+  return span;
+}
+
+/*
+  TASK_613: first/back/forward/live nav buttons, kept in sync with
+  viewPly on every render (disabled at either end of the move list, and
+  "Live" hidden entirely once already there - nothing useful to jump
+  to). navStatusEl mirrors what's already in the turn label so it's
+  visible even for a screen reader landing on the nav row directly.
+*/
+function renderNavControls() {
+  var histLength = game.history().length;
+  navFirstBtn.disabled = (viewPly === 0);
+  navBackBtn.disabled = (viewPly === 0);
+  navForwardBtn.disabled = (viewPly === histLength);
+  navLiveBtn.style.display = isAtLive() ? 'none' : '';
+  if (navStatusEl) {
+    navStatusEl.textContent = isAtLive() ? '' : 'viewing move ' + viewPly + ' of ' + histLength;
   }
 }
 
 function onSquareClick(sq) {
+  if (!isAtLive()) return;  // TASK_613: browsing history is read-only
   var piece = game.get(sq);
   if (selected) {
     if (selected === sq) { selected = null; render(); return; }
     if (attemptMove(selected, sq)) {
       selected = null;
+      viewPly = game.history().length;
       render();
       pushSharedState();
       return;
@@ -695,6 +849,7 @@ document.getElementById('resetBtn').onclick = function() {
   game = new Chess();
   baseFen = STANDARD_FEN;
   selected = null;
+  viewPly = 0;
   fenError.style.display = 'none';
   render();
   pushSharedState();
@@ -703,9 +858,30 @@ document.getElementById('resetBtn').onclick = function() {
 document.getElementById('undoBtn').onclick = function() {
   game.undo();
   selected = null;
+  viewPly = game.history().length;
   render();
   pushSharedState();
 };
+
+document.getElementById('navFirstBtn').onclick = function() { goToPly(0); };
+document.getElementById('navBackBtn').onclick = function() { goToPly(viewPly - 1); };
+document.getElementById('navForwardBtn').onclick = function() { goToPly(viewPly + 1); };
+document.getElementById('navLiveBtn').onclick = function() { goToPly(game.history().length); };
+
+/*
+  TASK_613: arrow-key/Home/End navigation, same shortcuts as
+  lichess/chess.com's analysis boards. Ignored while focus is in a text
+  input (fenInput, discussText) so typing a FEN or selecting the
+  copy-to-Claude text doesn't also step through moves.
+*/
+document.addEventListener('keydown', function(ev) {
+  var tag = document.activeElement && document.activeElement.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+  if (ev.key === 'ArrowLeft') { ev.preventDefault(); goToPly(viewPly - 1); }
+  else if (ev.key === 'ArrowRight') { ev.preventDefault(); goToPly(viewPly + 1); }
+  else if (ev.key === 'Home') { ev.preventDefault(); goToPly(0); }
+  else if (ev.key === 'End') { ev.preventDefault(); goToPly(game.history().length); }
+});
 
 document.getElementById('flipBtn').onclick = function() {
   flipped = !flipped;
@@ -722,6 +898,7 @@ document.getElementById('loadFenBtn').onclick = function() {
   game = test;
   baseFen = test.fen();
   selected = null;
+  viewPly = 0;
   fenError.style.display = 'none';
   render();
   pushSharedState();
