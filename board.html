@@ -630,6 +630,7 @@ function onCustomDragUp(ev) {
   selected = null;
   var moved = false;
   if (dropSq && dropSq !== fromSq) { moved = attemptMove(fromSq, dropSq); }
+  if (moved) viewPly = game.history().length;  // TASK_613: follow the move just made, same as the click-to-move path
   render();
   if (moved) pushSharedState();
 }
