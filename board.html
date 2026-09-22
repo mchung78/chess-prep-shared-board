@@ -863,8 +863,8 @@ var LICHESS_CLOUD_EVAL_URL = 'https://lichess.org/api/cloud-eval';
 var ENGINE_API_DELAY_MS = 500;     // minimum spacing between actual Lichess calls
 var ENGINE_DEBOUNCE_MS = 500;      // position-stability debounce before firing a lookup at all
 var ENGINE_LOCAL_REFRESH_MS = 500; // how often the badge updates with local-Stockfish deepening progress
-var STOCKFISH_TIME_LIMIT_S = 2;
-var STOCKFISH_DEPTH_LIMIT = 18;
+var STOCKFISH_TIME_LIMIT_S = 5;   // TASK_614: bumped from 2s so a depth-24 search actually has time to get there - "go depth N movetime M" stops at whichever bound hits first
+var STOCKFISH_DEPTH_LIMIT = 24;   // Michael's preference (2026-09-22) - was 18
 var STOCKFISH_HARD_TIMEOUT_BUFFER_MS = 15000;
 // Co-located with board.html itself on the deployed static site (both
 // GitHub Pages and Cloudflare Pages serve straight from the same repo
