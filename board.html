@@ -65,6 +65,13 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 </div>
 <div style="flex:1; min-width:220px;">
 <p id="turnLabel" style="font-size:14px; color:var(--text-secondary, #aaa); margin:0 0 12px;">White to move</p>
+<div style="display:flex; align-items:center; gap:8px; margin-bottom:12px;">
+<label style="font-size:13px; color:var(--text-secondary, #aaa); display:flex; align-items:center; gap:6px; cursor:pointer; user-select:none;">
+<input id="analysisModeCheckbox" type="checkbox">
+Analysis mode
+</label>
+<span id="evalBadge" style="display:none; font-size:13px; font-weight:600; padding:2px 8px; border-radius:4px; background:var(--bg-secondary, #3a3a3c); border:1px solid #888;"></span>
+</div>
 <label style="font-size:13px; color:var(--text-secondary, #aaa); display:block; margin-bottom:4px;">Load FEN or positionKey</label>
 <div style="display:flex; gap:6px; margin-bottom:4px;">
 <input id="fenInput" type="text" placeholder="Full FEN or 4-field positionKey..." style="flex:1;">
@@ -132,6 +139,8 @@ var navFirstBtn = document.getElementById('navFirstBtn');
 var navBackBtn = document.getElementById('navBackBtn');
 var navForwardBtn = document.getElementById('navForwardBtn');
 var navLiveBtn = document.getElementById('navLiveBtn');
+var analysisModeCheckbox = document.getElementById('analysisModeCheckbox');
+var evalBadgeEl = document.getElementById('evalBadge');
 var fenInput = document.getElementById('fenInput');
 var fenError = document.getElementById('fenError');
 var syncStatusEl = document.getElementById('syncStatus');
@@ -366,6 +375,163 @@ function nextViewPlyOnRemoteUpdate(currentPly, wasAtLive, newHistoryLength) {
   return clampViewPly(currentPly, newHistoryLength);
 }
 /* TASK_613_VIEW_NAV_END */
+
+/*
+  TASK_614: analysis-mode engine eval - Lichess Cloud Eval primary,
+  local (vendored) Stockfish as an automatic fallback on a confirmed
+  Cloud Eval miss. Ported from the Chrome extension's
+  chrome-extension/lib/engine-eval.js (TASK_018), which powers the same
+  eval badge on ChessTempo - same response shapes, same UCI protocol,
+  same castling/side-to-move quirks, deliberately NOT copy-pasted
+  wholesale: that module is coupled to chrome.storage/chrome.runtime and
+  a background-service-worker rate limiter/cross-tab dedup, none of
+  which exist (or are needed) for one standalone board with one viewer.
+  Kept side-effect-free (no DOM/network/globals beyond Chess, which the
+  chess.js vendor block above already provides) so the Node-vm
+  extraction harness can test it directly - see
+  skills/chess-coach/test/board-engine-eval.test.js.
+*/
+/* TASK_614_ENGINE_EVAL_START */
+function formatEval(cp, mate) {
+  if (typeof mate === 'number' && !isNaN(mate)) {
+    return mate > 0 ? 'M+' + mate : 'M' + mate;
+  }
+  if (typeof cp === 'number' && !isNaN(cp)) {
+    var sign = cp > 0 ? '+' : '';
+    return sign + (cp / 100).toFixed(1);
+  }
+  return '\u2014';
+}
+
+var EVAL_NEUTRAL_COLOR = '#b0b0b0';
+var EVAL_WHITE_ADV_COLOR = '#4CAF50';
+var EVAL_WHITE_WIN_COLOR = '#7ffaff';
+var EVAL_BLACK_ADV_COLOR = '#ffb74d';
+var EVAL_BLACK_WIN_COLOR = '#ff5252';
+
+/*
+  Always White-perspective (positive cp/mate = White better) - the
+  standard analysis-board convention (lichess/chess.com), unlike the
+  Chrome extension's getEvalColor, which colors relative to "my color"
+  since it's reading a repertoire for one specific player. A shared,
+  spectator-facing board has no single "my color" to key off.
+*/
+function evalColorFor(cp, mate) {
+  if (typeof mate === 'number' && !isNaN(mate)) {
+    return mate > 0 ? EVAL_WHITE_WIN_COLOR : EVAL_BLACK_WIN_COLOR;
+  }
+  if (typeof cp === 'number' && !isNaN(cp)) {
+    if (cp >= 150) return EVAL_WHITE_WIN_COLOR;
+    if (cp >= 50) return EVAL_WHITE_ADV_COLOR;
+    if (cp <= -150) return EVAL_BLACK_WIN_COLOR;
+    if (cp <= -50) return EVAL_BLACK_ADV_COLOR;
+  }
+  return EVAL_NEUTRAL_COLOR;
+}
+
+/*
+  Trims a Lichess Cloud Eval response to just what the badge needs.
+  Real response shape (verified live against lichess.org/api/cloud-eval
+  by the Chrome extension's own trimEngineData, chrome-extension/lib/
+  constants.js - not assumed): depth/knodes are top-level, shared across
+  every requested PV; `moves` is one space-separated UCI string, not an
+  array; there's no `analysis` wrapper or `best.san` field - the first
+  move of pvs[0].moves is the best move.
+*/
+function trimCloudEvalResponse(data) {
+  if (!data || typeof data !== 'object') return null;
+  var pvs = data.pvs;
+  if (!Array.isArray(pvs) || pvs.length === 0) return null;
+  var top = pvs[0];
+  if (!top) return null;
+  var hasMate = typeof top.mate === 'number';
+  var hasCp = typeof top.cp === 'number';
+  if (!hasMate && !hasCp) return null;
+  var movesStr = typeof top.moves === 'string' ? top.moves.trim() : '';
+  var pv = movesStr ? movesStr.split(/\s+/) : [];
+  return {
+    cp: hasMate ? null : top.cp,
+    mate: hasMate ? top.mate : null,
+    bestMove: pv[0] || null,
+    depth: typeof data.depth === 'number' ? data.depth : 0
+  };
+}
+
+/*
+  UCI "info ... score cp|mate N ... depth D ... pv ..." and
+  "bestmove <uci>" line parsing - identical protocol/format to the
+  Chrome extension's parseUciScoreLine/parseUciBestmoveLine, since it's
+  the same vendored engine (stockfish-18-lite-single) talking the same
+  UCI protocol either way.
+*/
+function parseUciScoreLine(line) {
+  var scoreMatch = line.match(/\bscore (cp|mate) (-?\d+)/);
+  if (!scoreMatch) return null;
+  var depthMatch = line.match(/\bdepth (\d+)/);
+  var pvMatch = line.match(/\bpv (.+)$/);
+  var kind = scoreMatch[1];
+  var value = parseInt(scoreMatch[2], 10);
+  return {
+    depth: depthMatch ? parseInt(depthMatch[1], 10) : 0,
+    cp: kind === 'cp' ? value : null,
+    mate: kind === 'mate' ? value : null,
+    pv: pvMatch ? pvMatch[1].trim().split(/\s+/) : []
+  };
+}
+
+function parseUciBestmoveLine(line) {
+  var match = line.match(/^bestmove\s+(\S+)/);
+  return match ? match[1] : null;
+}
+
+/*
+  UCI's score cp/mate is relative to the side to move, NOT White -
+  unlike Cloud Eval's cp/mate, which Lichess already reports
+  White-relative (and which formatEval/evalColorFor both assume).
+  fenSideToMove() extracts the FEN's 2nd field so the local-Stockfish
+  path can flip the sign once, at the source, rather than every
+  downstream consumer needing to know whose turn it was.
+*/
+function fenSideToMove(fen) {
+  if (!fen) return null;
+  var field = fen.split(' ')[1];
+  return (field === 'w' || field === 'b') ? field : null;
+}
+
+/*
+  Lichess Cloud Eval / UCI represent castling as "king-takes-own-rook"
+  (e1h1/e1a1/e8h8/e8a8), even for standard (non-Chess960) games - not
+  the "king moves two squares" notation chess.js's move() expects. A
+  king-takes-rook `to` square isn't a legal chess.js move (unreachable
+  by a king in one step) unless remapped first. Ported directly from
+  the Chrome extension's uciToSan/CASTLING_KING_TAKES_ROOK_TO_STANDARD
+  (chrome-extension/lib/engine-eval.js), which root-caused this against
+  real Cloud Eval responses.
+*/
+var CASTLING_KING_TAKES_ROOK_TO_STANDARD = {
+  e1h1: 'g1', e1a1: 'c1', e8h8: 'g8', e8a8: 'c8'
+};
+
+function uciToSan(fen, uciMove) {
+  if (!fen || !uciMove || uciMove.length < 4) return null;
+  try {
+    var chess = new Chess(normalizeFen(fen));
+    var from = uciMove.slice(0, 2);
+    var to = uciMove.slice(2, 4);
+    var remapped = CASTLING_KING_TAKES_ROOK_TO_STANDARD[from + to];
+    if (remapped) {
+      var piece = chess.get(from);
+      if (piece && piece.type === 'k') to = remapped;
+    }
+    var promotion = uciMove.length > 4 ? uciMove[4] : undefined;
+    var moveObj = promotion ? { from: from, to: to, promotion: promotion } : { from: from, to: to };
+    var result = chess.move(moveObj);
+    return result ? result.san : null;
+  } catch (e) {
+    return null;
+  }
+}
+/* TASK_614_ENGINE_EVAL_END */
 
 function pushSharedState() {
   if (!firebaseReady || !boardRef) return;
@@ -670,6 +836,236 @@ function goToPly(ply) {
   render();
 }
 
+/*
+  TASK_614: analysis-mode orchestration - debounce, cache, rate limit,
+  and the Cloud-Eval-then-local-Stockfish fallback sequence. The pure
+  parsing/formatting helpers this calls are in the TASK_614_ENGINE_EVAL
+  block above; this part is deliberately NOT in that block (network/
+  Worker/DOM side effects aren't something the Node-vm harness can or
+  should exercise).
+*/
+var LICHESS_CLOUD_EVAL_URL = 'https://lichess.org/api/cloud-eval';
+var ENGINE_API_DELAY_MS = 500;     // minimum spacing between actual Lichess calls
+var ENGINE_DEBOUNCE_MS = 500;      // position-stability debounce before firing a lookup at all
+var ENGINE_LOCAL_REFRESH_MS = 500; // how often the badge updates with local-Stockfish deepening progress
+var STOCKFISH_TIME_LIMIT_S = 2;
+var STOCKFISH_DEPTH_LIMIT = 18;
+var STOCKFISH_HARD_TIMEOUT_BUFFER_MS = 15000;
+// Co-located with board.html itself on the deployed static site (both
+// GitHub Pages and Cloudflare Pages serve straight from the same repo
+// directory) - see .github/scripts/sync_shared_board.py for what
+// pushes it there. A plain relative Worker() constructor works here
+// (unlike the Chrome extension's blob-URL workaround): that workaround
+// exists only because a content script on a third-party origin can't
+// construct a Worker pointing at a chrome-extension:// URL. This page
+// IS the origin, so no such restriction applies, and the engine
+// resolves its own .wasm relative to its own script path by default
+// (confirmed by reading stockfish-18-lite-single.js's own source)
+// without needing the extension's #<wasm-url> hash-fragment override.
+var STOCKFISH_SCRIPT_PATH = 'stockfish-18-lite-single.js';
+
+var analysisMode = false;
+var evalCache = new Map();        // fen -> trimmed eval object, or null for a cached Cloud Eval miss
+var evalDebounceTimer = null;
+var evalDebounceFen = null;       // the fen a pending/active eval run is for - re-entrancy guard for scheduleEval
+var evalActiveFen = null;         // the fen the CURRENTLY DISPLAYED badge belongs to - stale-result guard once a fetch/search resolves
+var evalLastApiCallTime = 0;
+var stockfishWorker = null;       // the in-flight local worker, if any (so it can be torn down if superseded)
+var stockfishAvailable = true;    // flips false after the engine script fails to load once - stop retrying it every Cloud Eval miss for the rest of the session
+
+try {
+  analysisMode = localStorage.getItem('chessPrepBoard.analysisMode') === '1';
+} catch (e) { /* private browsing / sandboxed context - default stays off */ }
+if (analysisModeCheckbox) analysisModeCheckbox.checked = analysisMode;
+
+function renderEvalBadge(state, evalData, fen) {
+  if (!evalBadgeEl) return;
+  if (!analysisMode) { evalBadgeEl.style.display = 'none'; return; }
+  evalBadgeEl.style.display = '';
+  if (state === 'analyzing') {
+    evalBadgeEl.textContent = 'Analyzing\u2026';
+    evalBadgeEl.style.color = EVAL_NEUTRAL_COLOR;
+    evalBadgeEl.style.borderColor = '#888';
+    return;
+  }
+  if (state === 'unavailable') {
+    evalBadgeEl.textContent = 'No eval available';
+    evalBadgeEl.style.color = EVAL_NEUTRAL_COLOR;
+    evalBadgeEl.style.borderColor = '#888';
+    return;
+  }
+  var text = formatEval(evalData.cp, evalData.mate);
+  if (evalData.bestMove) {
+    var san = uciToSan(fen, evalData.bestMove);
+    if (san) text += ' ' + san;
+  }
+  evalBadgeEl.textContent = text;
+  var color = evalColorFor(evalData.cp, evalData.mate);
+  evalBadgeEl.style.color = color;
+  evalBadgeEl.style.borderColor = color;
+}
+
+/*
+  Cache-first, then rate-limited (ENGINE_API_DELAY_MS between real
+  calls) Cloud Eval fetch. Mirrors fetchEngineEvalCoordinated in
+  chrome-extension/background.js minus the cross-tab dedup/queue (one
+  viewer, one board, nothing to coordinate across).
+*/
+async function fetchCloudEval(fen) {
+  if (evalCache.has(fen)) {
+    var cached = evalCache.get(fen);
+    return cached === null ? { status: 'miss' } : { status: 'ok', eval: cached };
+  }
+  var wait = ENGINE_API_DELAY_MS - (Date.now() - evalLastApiCallTime);
+  if (wait > 0) await new Promise(function(resolve) { setTimeout(resolve, wait); });
+  evalLastApiCallTime = Date.now();
+  try {
+    var url = LICHESS_CLOUD_EVAL_URL + '?fen=' + encodeURIComponent(fen) + '&multiPv=1';
+    var response = await fetch(url);
+    if (response.status === 404) {
+      evalCache.set(fen, null);
+      return { status: 'miss' };
+    }
+    if (response.status === 429) return { status: 'rate-limited' };
+    if (!response.ok) return { status: 'error' };
+    var data = await response.json();
+    var trimmed = trimCloudEvalResponse(data);
+    if (!trimmed) return { status: 'error' };
+    evalCache.set(fen, trimmed);
+    return { status: 'ok', eval: trimmed };
+  } catch (e) {
+    return { status: 'error' };
+  }
+}
+
+/*
+  Spins up the vendored local Stockfish, sends the position, and
+  resolves with the eval once "bestmove" arrives (or null on
+  timeout/error). Same UCI exchange as
+  chrome-extension/lib/engine-eval.js's runLocalEval - 'uci', 'isready',
+  'position fen', 'go depth <n> movetime <ms>', all sent without
+  waiting for intermediate acks (the engine queues and processes them
+  in order as it finishes initializing).
+*/
+function runLocalStockfish(fen) {
+  return new Promise(function(resolve) {
+    var worker;
+    try {
+      worker = new Worker(STOCKFISH_SCRIPT_PATH);
+    } catch (e) {
+      stockfishAvailable = false;
+      resolve(null);
+      return;
+    }
+    stockfishWorker = worker;
+    var latestInfo = null;
+    var settled = false;
+    var hardTimeout;
+    var refreshInterval = setInterval(function() {
+      if (latestInfo && evalActiveFen === fen) {
+        renderEvalBadge('resolved', { cp: latestInfo.cp, mate: latestInfo.mate, bestMove: latestInfo.pv[0] || null }, fen);
+      }
+    }, ENGINE_LOCAL_REFRESH_MS);
+
+    function finish(result) {
+      if (settled) return;
+      settled = true;
+      clearInterval(refreshInterval);
+      clearTimeout(hardTimeout);
+      try { worker.terminate(); } catch (e) { /* ignore */ }
+      if (stockfishWorker === worker) stockfishWorker = null;
+      resolve(result);
+    }
+
+    hardTimeout = setTimeout(function() {
+      try { worker.postMessage('stop'); } catch (e) { /* ignore */ }
+      setTimeout(function() { finish(null); }, 200);
+    }, STOCKFISH_TIME_LIMIT_S * 1000 + STOCKFISH_HARD_TIMEOUT_BUFFER_MS);
+
+    worker.onmessage = function(ev) {
+      var line = typeof ev.data === 'string' ? ev.data : '';
+      if (!line || line.indexOf('uciok') === 0 || line === 'readyok') return;
+      if (line.indexOf('info') === 0) {
+        var parsed = parseUciScoreLine(line);
+        if (parsed) {
+          // Flip UCI's side-to-move-relative score to the White-relative
+          // convention formatEval/evalColorFor both assume - see
+          // fenSideToMove's doc comment above.
+          if (fenSideToMove(fen) === 'b') {
+            if (parsed.cp !== null) parsed.cp = -parsed.cp;
+            if (parsed.mate !== null) parsed.mate = -parsed.mate;
+          }
+          latestInfo = parsed;
+        }
+        return;
+      }
+      var bestMove = parseUciBestmoveLine(line);
+      if (bestMove) {
+        if (!latestInfo) { finish(null); return; }
+        finish({ cp: latestInfo.cp, mate: latestInfo.mate, bestMove: bestMove, depth: latestInfo.depth });
+      }
+    };
+    worker.onerror = function() {
+      stockfishAvailable = false;
+      finish(null);
+    };
+
+    worker.postMessage('uci');
+    worker.postMessage('isready');
+    worker.postMessage('position fen ' + fen);
+    worker.postMessage('go depth ' + STOCKFISH_DEPTH_LIMIT + ' movetime ' + (STOCKFISH_TIME_LIMIT_S * 1000));
+  });
+}
+
+/*
+  Cloud Eval first; on a confirmed 404 miss (not a rate-limit or
+  network error - those might just be transient), fall back to local
+  Stockfish automatically. evalActiveFen is checked after every await so
+  a superseded run (position changed, or analysis mode turned off,
+  while a fetch/search was in flight) never overwrites a newer badge
+  with a stale result.
+*/
+async function runEval(fen) {
+  if (!analysisMode) return;
+  evalActiveFen = fen;
+  renderEvalBadge('analyzing', null, fen);
+  var result = await fetchCloudEval(fen);
+  if (evalActiveFen !== fen || !analysisMode) return;
+  if (result.status === 'ok') {
+    renderEvalBadge('resolved', result.eval, fen);
+    return;
+  }
+  if (result.status === 'miss' && stockfishAvailable) {
+    var local = await runLocalStockfish(fen);
+    if (evalActiveFen !== fen || !analysisMode) return;
+    renderEvalBadge(local ? 'resolved' : 'unavailable', local, fen);
+    return;
+  }
+  renderEvalBadge('unavailable', null, fen);
+}
+
+function scheduleEval(fen) {
+  if (!analysisMode || evalDebounceFen === fen) return;
+  clearTimeout(evalDebounceTimer);
+  evalDebounceFen = fen;
+  evalDebounceTimer = setTimeout(function() { runEval(fen); }, ENGINE_DEBOUNCE_MS);
+}
+
+if (analysisModeCheckbox) {
+  analysisModeCheckbox.addEventListener('change', function() {
+    analysisMode = analysisModeCheckbox.checked;
+    try { localStorage.setItem('chessPrepBoard.analysisMode', analysisMode ? '1' : '0'); } catch (e) { /* ignore */ }
+    clearTimeout(evalDebounceTimer);
+    evalDebounceFen = null;
+    evalActiveFen = null;
+    if (analysisMode) {
+      scheduleEval(buildViewGame().fen());
+    } else if (evalBadgeEl) {
+      evalBadgeEl.style.display = 'none';
+    }
+  });
+}
+
 function render() {
   boardEl.innerHTML = '';
   renderCoords();
@@ -757,6 +1153,7 @@ function render() {
     (isAtLive() ? '' : ' (viewing move ' + viewPly + ' of ' + game.history().length + ')');
   renderMoveList();
   renderNavControls();
+  if (analysisMode) scheduleEval(displayGame.fen());  // TASK_614: the position being VIEWED, not necessarily the live tip
 }
 
 /*
