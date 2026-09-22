@@ -403,6 +403,21 @@ function formatEval(cp, mate) {
   return '\u2014';
 }
 
+/*
+  The full badge text: eval, then search depth in parens, then the
+  best move in SAN - e.g. "+0.2 (24) Ba7". Depth is shown whenever
+  it's known (unlike the Chrome extension, where it's an opt-in
+  setting default off) - on this board it's the signal that lets you
+  tell a shallow in-progress local search apart from an already-deep
+  Cloud Eval hit, which is the whole point of showing both sources.
+*/
+function formatEvalBadgeText(cp, mate, depth, san) {
+  var text = formatEval(cp, mate);
+  if (typeof depth === 'number' && depth > 0) text += ' (' + depth + ')';
+  if (san) text += ' ' + san;
+  return text;
+}
+
 var EVAL_NEUTRAL_COLOR = '#b0b0b0';
 var EVAL_WHITE_ADV_COLOR = '#4CAF50';
 var EVAL_WHITE_WIN_COLOR = '#7ffaff';
@@ -894,12 +909,8 @@ function renderEvalBadge(state, evalData, fen) {
     evalBadgeEl.style.borderColor = '#888';
     return;
   }
-  var text = formatEval(evalData.cp, evalData.mate);
-  if (evalData.bestMove) {
-    var san = uciToSan(fen, evalData.bestMove);
-    if (san) text += ' ' + san;
-  }
-  evalBadgeEl.textContent = text;
+  var san = evalData.bestMove ? uciToSan(fen, evalData.bestMove) : null;
+  evalBadgeEl.textContent = formatEvalBadgeText(evalData.cp, evalData.mate, evalData.depth, san);
   var color = evalColorFor(evalData.cp, evalData.mate);
   evalBadgeEl.style.color = color;
   evalBadgeEl.style.borderColor = color;
@@ -963,7 +974,7 @@ function runLocalStockfish(fen) {
     var hardTimeout;
     var refreshInterval = setInterval(function() {
       if (latestInfo && evalActiveFen === fen) {
-        renderEvalBadge('resolved', { cp: latestInfo.cp, mate: latestInfo.mate, bestMove: latestInfo.pv[0] || null }, fen);
+        renderEvalBadge('resolved', { cp: latestInfo.cp, mate: latestInfo.mate, bestMove: latestInfo.pv[0] || null, depth: latestInfo.depth }, fen);
       }
     }, ENGINE_LOCAL_REFRESH_MS);
 
