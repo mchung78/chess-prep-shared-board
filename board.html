@@ -548,6 +548,111 @@ function uciToSan(fen, uciMove) {
 }
 /* TASK_614_ENGINE_EVAL_END */
 
+/*
+  TASK_620: move-list rarity coloring - same palette and "1 in N games"
+  thresholds as the Chrome extension (chrome-extension/lib/constants.js
+  LEVEL_COLORS, DEFAULT_LEVEL1/2/3_MAX; lib/color-scheme.js
+  getMoveColorForGamesInN), so a line looks the same here as on
+  ChessTempo/Chessable.
+
+  First pass (decided 2026-09-22, see
+  docs/tasks/TASK_620_board_move_list_probability_coloring.md): the
+  cumulative probability multiplies EVERY ply's share of games at the
+  position it was played from, friendly moves included. The extension
+  only multiplies opponent moves (your own in-book moves are free), which
+  needs a friendly color and a repertoire - later iterations take the
+  friendly color from the board orientation and converge on the
+  extension's numbers. Until then this reads rarer than the extension
+  for the same line, never more common.
+
+  Kept side-effect-free (no DOM/network/globals) so the Node-vm harness
+  can test it directly - see skills/chess-coach/test/board-move-colors.test.js.
+*/
+/* TASK_620_MOVE_COLORS_START */
+var RARITY_LEVEL_COLORS = { 1: '#32CD32', 2: '#00FFFF', 3: '#FFA500', 4: '#A598CD' };
+var RARITY_LEVEL1_MAX = 100;
+var RARITY_LEVEL2_MAX = 500;
+var RARITY_LEVEL3_MAX = 2500;
+
+function rarityColorForGamesInN(gamesInN) {
+  if (gamesInN <= RARITY_LEVEL1_MAX) return RARITY_LEVEL_COLORS[1];
+  if (gamesInN <= RARITY_LEVEL2_MAX) return RARITY_LEVEL_COLORS[2];
+  if (gamesInN <= RARITY_LEVEL3_MAX) return RARITY_LEVEL_COLORS[3];
+  return RARITY_LEVEL_COLORS[4];
+}
+
+// The Worker's cache key and the Explorer both ignore move counters, so
+// key stats by the first four FEN fields.
+function explorerPositionKey(fen) {
+  return String(fen).split(/\s+/).filter(Boolean).slice(0, 4).join(' ');
+}
+
+function stripSanDecorations(san) {
+  return String(san).replace(/[+#?!]+$/, '');
+}
+
+// Share of the position's games that continued with san, or 0 when the
+// Explorer has the position but not that move (or no games at all).
+function explorerMoveShare(stats, san) {
+  var total = stats.white + stats.draws + stats.black;
+  if (!(total > 0)) return 0;
+  var wanted = stripSanDecorations(san);
+  for (var i = 0; i < stats.moves.length; i++) {
+    var m = stats.moves[i];
+    if (stripSanDecorations(m.san) === wanted) return (m.white + m.draws + m.black) / total;
+  }
+  return 0;
+}
+
+/*
+  plies: [{ key, san }] - key is explorerPositionKey of the position the
+  move was played FROM. lookup(key) returns that position's stats, or
+  undefined when not known (yet). Returns one entry per ply:
+  - { state: 'colored', gamesInN, color }
+  - { state: 'offbook', color } - this move (or an earlier one) isn't in
+    the Explorer data; everything after an off-book move stays off book
+  - { state: 'unknown' } - stats for this ply or an earlier one aren't
+    available, so the cumulative product can't be computed yet
+*/
+function computeMoveRarity(plies, lookup) {
+  var result = [];
+  var cumulative = 1;
+  var status = 'ok';
+  for (var i = 0; i < plies.length; i++) {
+    if (status === 'offbook') { result.push({ state: 'offbook', color: RARITY_LEVEL_COLORS[4] }); continue; }
+    if (status === 'unknown') { result.push({ state: 'unknown' }); continue; }
+    var stats = lookup(plies[i].key);
+    if (!stats) { status = 'unknown'; result.push({ state: 'unknown' }); continue; }
+    var share = explorerMoveShare(stats, plies[i].san);
+    if (!(share > 0)) { status = 'offbook'; result.push({ state: 'offbook', color: RARITY_LEVEL_COLORS[4] }); continue; }
+    cumulative *= share;
+    var gamesInN = Math.max(1, Math.round(1 / cumulative));
+    result.push({ state: 'colored', gamesInN: gamesInN, color: rarityColorForGamesInN(gamesInN) });
+  }
+  return result;
+}
+
+function rarityTooltip(entry) {
+  if (!entry || entry.state === 'unknown') return '';
+  if (entry.state === 'offbook') return 'Off book - not in the Lichess Explorer (blitz/rapid, 1600-2000)';
+  return '1 in ' + entry.gamesInN.toLocaleString('en-US') + ' games reach this line';
+}
+
+// First ply whose stats still need fetching (undefined), or -1. Stops at
+// an off-book ply: nothing after it needs stats.
+function nextRarityFetchIndex(plies, lookup, isBlocked) {
+  for (var i = 0; i < plies.length; i++) {
+    var stats = lookup(plies[i].key);
+    if (stats) {
+      if (!(explorerMoveShare(stats, plies[i].san) > 0)) return -1;
+      continue;
+    }
+    return isBlocked(plies[i].key) ? -1 : i;
+  }
+  return -1;
+}
+/* TASK_620_MOVE_COLORS_END */
+
 function pushSharedState() {
   if (!firebaseReady || !boardRef) return;
   var payload;
@@ -577,6 +682,10 @@ function applyRemoteState(data) {
     baseFen = decoded.baseFen;
     viewPly = nextViewPlyOnRemoteUpdate(viewPly, wasAtLive, game.history().length);
     selected = null;
+    // TASK_620: a remote move usually means a player just filled the
+    // Explorer cache for it, so give earlier not_cached lookups a fresh
+    // set of retries instead of leaving them exhausted for the session.
+    explorerFailures.clear();
     render();
     setSyncStatus('synced');
     return true;
@@ -1077,6 +1186,114 @@ if (analysisModeCheckbox) {
   });
 }
 
+/*
+  TASK_620: Explorer fetch orchestration for the move-list colors. Talks
+  only to this project's Worker proxy (infra/mint-token-worker
+  /explorer): Lichess now requires a token, which lives server-side.
+  Cache hits are public; a miss is filled only for a signed-in,
+  allowlisted player, so a spectator's miss (404 not_cached) is retried a
+  few times shortly after - by then the player who made the move has
+  usually filled it. One request at a time, walking the move list from
+  the start, since each ply's color depends on every earlier one.
+*/
+var EXPLORER_PROXY_URL = 'https://mint-claude-agent-token.chess-prep.workers.dev/explorer';
+var EXPLORER_MIN_SPACING_MS = 250;
+var EXPLORER_MAX_ATTEMPTS = 3;
+var EXPLORER_RETRY_MS = { notCached: 5000, rateLimited: 10000, error: 30000 };
+var explorerStats = new Map();     // positionKey -> trimmed stats
+var explorerFailures = new Map();  // positionKey -> { attempts, retryAt }
+var explorerInFlight = false;
+var explorerRetryTimer = null;
+var explorerLastCallTime = 0;
+
+function explorerLookup(key) { return explorerStats.get(key); }
+
+function explorerBlocked(key) {
+  var failure = explorerFailures.get(key);
+  if (!failure) return false;
+  return failure.attempts >= EXPLORER_MAX_ATTEMPTS || Date.now() < failure.retryAt;
+}
+
+function recordExplorerFailure(key, delayMs) {
+  var failure = explorerFailures.get(key) || { attempts: 0, retryAt: 0 };
+  failure.attempts += 1;
+  failure.retryAt = Date.now() + delayMs;
+  explorerFailures.set(key, failure);
+  if (failure.attempts < EXPLORER_MAX_ATTEMPTS) {
+    clearTimeout(explorerRetryTimer);
+    explorerRetryTimer = setTimeout(function() { renderMoveList(); }, delayMs + 50);
+  }
+}
+
+async function explorerAuthHeader() {
+  try {
+    if (currentUser && typeof currentUser.getIdToken === 'function') {
+      return { Authorization: 'Bearer ' + await currentUser.getIdToken() };
+    }
+  } catch (e) { /* not signed in / token refresh failed - fetch as a spectator */ }
+  return {};
+}
+
+async function fetchExplorerStats(key) {
+  var wait = EXPLORER_MIN_SPACING_MS - (Date.now() - explorerLastCallTime);
+  if (wait > 0) await new Promise(function(resolve) { setTimeout(resolve, wait); });
+  explorerLastCallTime = Date.now();
+  var response;
+  try {
+    response = await fetch(EXPLORER_PROXY_URL + '?fen=' + encodeURIComponent(key + ' 0 1'), { headers: await explorerAuthHeader() });
+  } catch (e) {
+    recordExplorerFailure(key, EXPLORER_RETRY_MS.error);
+    return;
+  }
+  if (response.status === 200) {
+    try {
+      var body = await response.json();
+      if (body && body.stats && Array.isArray(body.stats.moves)) {
+        explorerStats.set(key, body.stats);
+        explorerFailures.delete(key);
+        return;
+      }
+    } catch (e) { /* fall through to the error path */ }
+    recordExplorerFailure(key, EXPLORER_RETRY_MS.error);
+    return;
+  }
+  if (response.status === 404 || response.status === 401 || response.status === 403) {
+    recordExplorerFailure(key, EXPLORER_RETRY_MS.notCached);
+  } else if (response.status === 429) {
+    recordExplorerFailure(key, EXPLORER_RETRY_MS.rateLimited);
+  } else {
+    recordExplorerFailure(key, EXPLORER_RETRY_MS.error);
+  }
+}
+
+async function pumpExplorerFetches(plies) {
+  if (explorerInFlight) return;
+  var index = nextRarityFetchIndex(plies, explorerLookup, explorerBlocked);
+  if (index < 0) return;
+  explorerInFlight = true;
+  try {
+    await fetchExplorerStats(plies[index].key);
+  } finally {
+    explorerInFlight = false;
+  }
+  renderMoveList();  // re-colors, and pumps the next fetch for the (possibly changed) current history
+}
+
+/*
+  The move list as [{ key, san }], each key being the position the move
+  was played from, replayed from baseFen.
+*/
+function buildRarityPlies() {
+  var replay = new Chess(normalizeFen(baseFen));
+  var hist = game.history();
+  var plies = [];
+  for (var i = 0; i < hist.length; i++) {
+    plies.push({ key: explorerPositionKey(replay.fen()), san: hist[i] });
+    replay.move(hist[i]);
+  }
+  return plies;
+}
+
 function render() {
   boardEl.innerHTML = '';
   renderCoords();
@@ -1178,6 +1395,9 @@ function render() {
 function renderMoveList() {
   moveListEl.innerHTML = '';
   var hist = game.history();
+  var plies = buildRarityPlies();  // TASK_620
+  var rarity = computeMoveRarity(plies, explorerLookup);
+  pumpExplorerFetches(plies);
   var startSpan = document.createElement('span');
   startSpan.textContent = 'Start position';
   startSpan.style.cursor = 'pointer';
@@ -1192,24 +1412,30 @@ function renderMoveList() {
     numSpan.textContent = num + '. ';
     numSpan.style.color = 'var(--text-secondary, #aaa)';
     moveListEl.appendChild(numSpan);
-    moveListEl.appendChild(makeMoveSpan(hist[i], i + 1));
+    moveListEl.appendChild(makeMoveSpan(hist[i], i + 1, rarity[i]));
     if (hist[i + 1]) {
       moveListEl.appendChild(document.createTextNode(' '));
-      moveListEl.appendChild(makeMoveSpan(hist[i + 1], i + 2));
+      moveListEl.appendChild(makeMoveSpan(hist[i + 1], i + 2, rarity[i + 1]));
     }
     moveListEl.appendChild(document.createTextNode('  '));
   }
 }
 
-function makeMoveSpan(san, ply) {
+function makeMoveSpan(san, ply, rarity) {
   var span = document.createElement('span');
   span.textContent = san;
   span.style.cursor = 'pointer';
   span.style.padding = '0 2px';
   span.style.borderRadius = '3px';
+  // TASK_620: rarity color, like the extension's move-list coloring
+  if (rarity && rarity.color) span.style.color = rarity.color;
+  var tip = rarityTooltip(rarity);
+  if (tip) span.title = tip;
   if (ply === viewPly) {
     span.style.background = 'var(--border-accent, #4a9eff)';
     span.style.color = '#fff';
+    // keep the rarity visible on the highlighted move too
+    if (rarity && rarity.color) span.style.boxShadow = 'inset 0 -3px 0 ' + rarity.color;
   }
   span.onclick = function() { goToPly(ply); };
   return span;
