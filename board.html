@@ -233,6 +233,14 @@ if (firebaseReady) {
   firebase.auth().onAuthStateChanged(function(user) {
     currentUser = user;
     updateAuthUI();
+    // TASK_620 (Codex review of #623): a newly signed-in player can now
+    // fill cache misses, so retry lookups that failed as not_cached while
+    // signed out. Guarded because this callback can fire before the
+    // Explorer state further down this script has initialized.
+    if (user && explorerFailures instanceof Map &&
+        clearExplorerFailuresOfKind(explorerFailures, 'notCached') > 0) {
+      renderMoveList();
+    }
   });
   if (authBtnEl) {
     authBtnEl.addEventListener('click', function() {
@@ -651,6 +659,27 @@ function nextRarityFetchIndex(plies, lookup, isBlocked) {
   }
   return -1;
 }
+/*
+  Failure bookkeeping for Explorer lookups (Codex review of #623). Each
+  failure remembers its kind so a board update or a sign-in can give
+  not_cached lookups a fresh set of retries without also erasing a 429 or
+  error backoff - otherwise an active game would re-request immediately,
+  bypassing both the delay and the attempt cap while the proxy is
+  rate-limited or down.
+*/
+function explorerFailureKindForStatus(status) {
+  if (status === 404 || status === 401 || status === 403) return 'notCached';
+  if (status === 429) return 'rateLimited';
+  return 'error';
+}
+
+function clearExplorerFailuresOfKind(failures, kind) {
+  var cleared = 0;
+  failures.forEach(function(failure, key) {
+    if (failure.kind === kind) { failures.delete(key); cleared += 1; }
+  });
+  return cleared;
+}
 /* TASK_620_MOVE_COLORS_END */
 
 function pushSharedState() {
@@ -684,8 +713,8 @@ function applyRemoteState(data) {
     selected = null;
     // TASK_620: a remote move usually means a player just filled the
     // Explorer cache for it, so give earlier not_cached lookups a fresh
-    // set of retries instead of leaving them exhausted for the session.
-    explorerFailures.clear();
+    // set of retries - but keep any 429/error backoff in place.
+    clearExplorerFailuresOfKind(explorerFailures, 'notCached');
     render();
     setSyncStatus('synced');
     return true;
@@ -1201,7 +1230,7 @@ var EXPLORER_MIN_SPACING_MS = 250;
 var EXPLORER_MAX_ATTEMPTS = 3;
 var EXPLORER_RETRY_MS = { notCached: 5000, rateLimited: 10000, error: 30000 };
 var explorerStats = new Map();     // positionKey -> trimmed stats
-var explorerFailures = new Map();  // positionKey -> { attempts, retryAt }
+var explorerFailures = new Map();  // positionKey -> { kind, attempts, retryAt }
 var explorerInFlight = false;
 var explorerRetryTimer = null;
 var explorerLastCallTime = 0;
@@ -1214,8 +1243,10 @@ function explorerBlocked(key) {
   return failure.attempts >= EXPLORER_MAX_ATTEMPTS || Date.now() < failure.retryAt;
 }
 
-function recordExplorerFailure(key, delayMs) {
-  var failure = explorerFailures.get(key) || { attempts: 0, retryAt: 0 };
+function recordExplorerFailure(key, kind) {
+  var delayMs = EXPLORER_RETRY_MS[kind];
+  var failure = explorerFailures.get(key) || { kind: kind, attempts: 0, retryAt: 0 };
+  failure.kind = kind;
   failure.attempts += 1;
   failure.retryAt = Date.now() + delayMs;
   explorerFailures.set(key, failure);
@@ -1242,7 +1273,7 @@ async function fetchExplorerStats(key) {
   try {
     response = await fetch(EXPLORER_PROXY_URL + '?fen=' + encodeURIComponent(key + ' 0 1'), { headers: await explorerAuthHeader() });
   } catch (e) {
-    recordExplorerFailure(key, EXPLORER_RETRY_MS.error);
+    recordExplorerFailure(key, 'error');
     return;
   }
   if (response.status === 200) {
@@ -1254,16 +1285,10 @@ async function fetchExplorerStats(key) {
         return;
       }
     } catch (e) { /* fall through to the error path */ }
-    recordExplorerFailure(key, EXPLORER_RETRY_MS.error);
+    recordExplorerFailure(key, 'error');
     return;
   }
-  if (response.status === 404 || response.status === 401 || response.status === 403) {
-    recordExplorerFailure(key, EXPLORER_RETRY_MS.notCached);
-  } else if (response.status === 429) {
-    recordExplorerFailure(key, EXPLORER_RETRY_MS.rateLimited);
-  } else {
-    recordExplorerFailure(key, EXPLORER_RETRY_MS.error);
-  }
+  recordExplorerFailure(key, explorerFailureKindForStatus(response.status));
 }
 
 async function pumpExplorerFetches(plies) {
