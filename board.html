@@ -233,6 +233,7 @@ if (firebaseReady) {
   firebase.auth().onAuthStateChanged(function(user) {
     currentUser = user;
     updateAuthUI();
+    attachRepertoire(user);  // TASK_629
     // TASK_620 (Codex review of #623): a newly signed-in player can now
     // fill cache misses, so retry lookups that failed as not_cached while
     // signed out. Guarded because this callback can fire before the
@@ -571,7 +572,8 @@ function uciToSan(fen, uciMove) {
   needs a friendly color and a repertoire - later iterations take the
   friendly color from the board orientation and converge on the
   extension's numbers. Until then this reads rarer than the extension
-  for the same line, never more common.
+  for the same line, never more common. TASK_629 adds the repertoire:
+  our own favorite moves stop costing their Explorer share (see below).
 
   Kept side-effect-free (no DOM/network/globals) so the Node-vm harness
   can test it directly - see skills/chess-coach/test/board-move-colors.test.js.
@@ -613,29 +615,73 @@ function explorerMoveShare(stats, san) {
 }
 
 /*
-  plies: [{ key, san }] - key is explorerPositionKey of the position the
-  move was played FROM. lookup(key) returns that position's stats, or
-  undefined when not known (yet). Returns one entry per ply:
-  - { state: 'colored', gamesInN, color }
+  TASK_629: repertoire tracking. A per-user set of "favorite" moves per
+  position (Firebase repertoire/<uid>, see infra/rules.json), recorded only
+  when the signed-in player actively makes a move for their own side on
+  this board - never from synced/viewed games or navigation. Our side is
+  the board orientation: unflipped White, flipped Black (#630 owns the
+  rest of that metric). A friendly ply matching one of k favorites costs
+  1/k instead of its Explorer share (an even split is the simple start);
+  every other ply multiplies in its Explorer share as before.
+
+  RTDB keys can't contain '/', so the positionKey's '/' become '_' (never
+  in a FEN). SAN keys drop +/#/?/! decorations, so '#' never reaches a key.
+*/
+function friendlyColorForOrientation(flipped) { return flipped ? 'b' : 'w'; }
+
+function repertoireStorageKey(positionKey) { return String(positionKey).replace(/\//g, '_'); }
+
+// data: the repertoire/<uid> snapshot value ({ storageKey: { san: ts } }).
+// Returns the favorite SANs (decorations stripped) at positionKey, or [].
+function repertoireFavorites(data, positionKey) {
+  var entry = data && data[repertoireStorageKey(positionKey)];
+  if (!entry || typeof entry !== 'object') return [];
+  return Object.keys(entry).map(stripSanDecorations);
+}
+
+// repertoire: { friendlyColor: 'w'|'b', favoritesFor(key) -> [san] } or
+// falsy (no signed-in repertoire). Returns k when the ply is a friendly
+// move among k favorites, else 0.
+function favoriteCount(ply, repertoire) {
+  if (!repertoire || ply.color !== repertoire.friendlyColor) return 0;
+  var favorites = repertoire.favoritesFor(ply.key) || [];
+  return favorites.indexOf(stripSanDecorations(ply.san)) === -1 ? 0 : favorites.length;
+}
+
+/*
+  plies: [{ key, san, color }] - key is explorerPositionKey of the position
+  the move was played FROM, color ('w'/'b') the side that played it.
+  lookup(key) returns that position's stats, or undefined when not known
+  (yet). repertoire: optional, see favoriteCount. Returns one entry per ply:
+  - { state: 'colored', gamesInN, color[, favorites: k] } - favorites set
+    when the ply was scored as one of k repertoire moves (no stats needed)
   - { state: 'offbook', color } - this move (or an earlier one) isn't in
     the Explorer data; everything after an off-book move stays off book
   - { state: 'unknown' } - stats for this ply or an earlier one aren't
     available, so the cumulative product can't be computed yet
 */
-function computeMoveRarity(plies, lookup) {
+function computeMoveRarity(plies, lookup, repertoire) {
   var result = [];
   var cumulative = 1;
   var status = 'ok';
   for (var i = 0; i < plies.length; i++) {
     if (status === 'offbook') { result.push({ state: 'offbook', color: RARITY_LEVEL_COLORS[4] }); continue; }
     if (status === 'unknown') { result.push({ state: 'unknown' }); continue; }
-    var stats = lookup(plies[i].key);
-    if (!stats) { status = 'unknown'; result.push({ state: 'unknown' }); continue; }
-    var share = explorerMoveShare(stats, plies[i].san);
-    if (!(share > 0)) { status = 'offbook'; result.push({ state: 'offbook', color: RARITY_LEVEL_COLORS[4] }); continue; }
+    var favorites = favoriteCount(plies[i], repertoire);
+    var share;
+    if (favorites > 0) {
+      share = 1 / favorites;
+    } else {
+      var stats = lookup(plies[i].key);
+      if (!stats) { status = 'unknown'; result.push({ state: 'unknown' }); continue; }
+      share = explorerMoveShare(stats, plies[i].san);
+      if (!(share > 0)) { status = 'offbook'; result.push({ state: 'offbook', color: RARITY_LEVEL_COLORS[4] }); continue; }
+    }
     cumulative *= share;
     var gamesInN = Math.max(1, Math.round(1 / cumulative));
-    result.push({ state: 'colored', gamesInN: gamesInN, color: rarityColorForGamesInN(gamesInN) });
+    var entry = { state: 'colored', gamesInN: gamesInN, color: rarityColorForGamesInN(gamesInN) };
+    if (favorites > 0) entry.favorites = favorites;
+    result.push(entry);
   }
   return result;
 }
@@ -643,13 +689,18 @@ function computeMoveRarity(plies, lookup) {
 function rarityTooltip(entry) {
   if (!entry || entry.state === 'unknown') return '';
   if (entry.state === 'offbook') return 'Off book - not in the Lichess Explorer (blitz/rapid, 1600-2000)';
-  return '1 in ' + entry.gamesInN.toLocaleString('en-US') + ' games reach this line';
+  var line = '1 in ' + entry.gamesInN.toLocaleString('en-US') + ' games reach this line';
+  if (entry.favorites === 1) return 'Your repertoire move - ' + line;
+  if (entry.favorites > 1) return 'One of your ' + entry.favorites + ' repertoire moves here - ' + line;
+  return line;
 }
 
 // First ply whose stats still need fetching (undefined), or -1. Stops at
-// an off-book ply: nothing after it needs stats.
-function nextRarityFetchIndex(plies, lookup, isBlocked) {
+// an off-book ply: nothing after it needs stats. Repertoire plies are
+// scored without stats, so they're skipped rather than fetched.
+function nextRarityFetchIndex(plies, lookup, isBlocked, repertoire) {
   for (var i = 0; i < plies.length; i++) {
+    if (favoriteCount(plies[i], repertoire) > 0) continue;
     var stats = lookup(plies[i].key);
     if (stats) {
       if (!(explorerMoveShare(stats, plies[i].san) > 0)) return -1;
@@ -832,7 +883,9 @@ function attemptMove(from, to) {
   var moves = game.moves({ square: from, verbose: true });
   var isLegal = moves.some(function(m) { return m.to === to; });
   if (!isLegal) return false;
-  game.move({ from: from, to: to, promotion: 'q' });
+  var keyBefore = explorerPositionKey(game.fen());  // TASK_629
+  var move = game.move({ from: from, to: to, promotion: 'q' });
+  if (move) recordRepertoireMove(keyBefore, move);
   return true;
 }
 
@@ -1237,6 +1290,55 @@ var explorerLastCallTime = 0;
 
 function explorerLookup(key) { return explorerStats.get(key); }
 
+/*
+  TASK_629: the signed-in player's repertoire (repertoire/<uid>), kept live
+  via a listener while signed in. Declared without initializers on
+  purpose: onAuthStateChanged may call attachRepertoire before this part
+  of the script has run, and an initializer would then wipe its state.
+*/
+var repertoireRef;
+var repertoireData;
+
+function attachRepertoire(user) {
+  if (repertoireRef) repertoireRef.off();
+  repertoireRef = null;
+  repertoireData = null;
+  if (user && firebaseReady) {
+    repertoireRef = firebase.database().ref('repertoire/' + user.uid);
+    repertoireRef.on('value', function(snapshot) {
+      repertoireData = snapshot.val() || {};
+      renderMoveList();
+    }, function(err) {
+      console.warn('Repertoire unavailable', err);
+    });
+  }
+  // Same guard as the explorerFailures one in the auth callback: the
+  // Explorer state may not exist yet on a very early auth callback.
+  if (explorerStats instanceof Map) renderMoveList();
+}
+
+// null when there's no signed-in repertoire (spectators, signed out,
+// still loading): coloring then scores every ply by its Explorer share.
+function currentRepertoire() {
+  if (!currentUser || !repertoireData) return null;
+  var data = repertoireData;
+  return {
+    friendlyColor: friendlyColorForOrientation(flipped),
+    favoritesFor: function(key) { return repertoireFavorites(data, key); },
+  };
+}
+
+// Only moves the signed-in player actively makes, for their own side.
+// Last write refreshes the timestamp; moves are never removed here.
+function recordRepertoireMove(positionKey, move) {
+  if (!firebaseReady || !currentUser) return;
+  if (move.color !== friendlyColorForOrientation(flipped)) return;
+  firebase.database()
+    .ref('repertoire/' + currentUser.uid + '/' + repertoireStorageKey(positionKey) + '/' + stripSanDecorations(move.san))
+    .set(firebase.database.ServerValue.TIMESTAMP)
+    .catch(function(err) { console.warn('Repertoire write failed', err); });
+}
+
 function explorerBlocked(key) {
   var failure = explorerFailures.get(key);
   if (!failure) return false;
@@ -1291,9 +1393,9 @@ async function fetchExplorerStats(key) {
   recordExplorerFailure(key, explorerFailureKindForStatus(response.status));
 }
 
-async function pumpExplorerFetches(plies) {
+async function pumpExplorerFetches(plies, repertoire) {
   if (explorerInFlight) return;
-  var index = nextRarityFetchIndex(plies, explorerLookup, explorerBlocked);
+  var index = nextRarityFetchIndex(plies, explorerLookup, explorerBlocked, repertoire);
   if (index < 0) return;
   explorerInFlight = true;
   try {
@@ -1305,15 +1407,15 @@ async function pumpExplorerFetches(plies) {
 }
 
 /*
-  The move list as [{ key, san }], each key being the position the move
-  was played from, replayed from baseFen.
+  The move list as [{ key, san, color }], each key being the position the
+  move was played from, replayed from baseFen.
 */
 function buildRarityPlies() {
   var replay = new Chess(normalizeFen(baseFen));
   var hist = game.history();
   var plies = [];
   for (var i = 0; i < hist.length; i++) {
-    plies.push({ key: explorerPositionKey(replay.fen()), san: hist[i] });
+    plies.push({ key: explorerPositionKey(replay.fen()), san: hist[i], color: replay.turn() });
     replay.move(hist[i]);
   }
   return plies;
@@ -1421,8 +1523,9 @@ function renderMoveList() {
   moveListEl.innerHTML = '';
   var hist = game.history();
   var plies = buildRarityPlies();  // TASK_620
-  var rarity = computeMoveRarity(plies, explorerLookup);
-  pumpExplorerFetches(plies);
+  var repertoire = currentRepertoire();  // TASK_629
+  var rarity = computeMoveRarity(plies, explorerLookup, repertoire);
+  pumpExplorerFetches(plies, repertoire);
   var startSpan = document.createElement('span');
   startSpan.textContent = 'Start position';
   startSpan.style.cursor = 'pointer';
