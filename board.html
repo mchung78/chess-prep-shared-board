@@ -571,9 +571,10 @@ function uciToSan(fen, uciMove) {
   only multiplies opponent moves (your own in-book moves are free), which
   needs a friendly color and a repertoire - later iterations take the
   friendly color from the board orientation and converge on the
-  extension's numbers. Until then this reads rarer than the extension
-  for the same line, never more common. TASK_629 adds the repertoire:
-  our own favorite moves stop costing their Explorer share (see below).
+  extension's numbers. TASK_629 added the repertoire and TASK_630 the
+  friendly color from the board orientation (see the perspective comment
+  below): opponent moves always count, our own moves are free or scored
+  against our repertoire.
 
   Kept side-effect-free (no DOM/network/globals) so the Node-vm harness
   can test it directly - see skills/chess-coach/test/board-move-colors.test.js.
@@ -639,48 +640,69 @@ function repertoireFavorites(data, positionKey) {
   return Object.keys(entry).map(stripSanDecorations);
 }
 
-// repertoire: { friendlyColor: 'w'|'b', favoritesFor(key) -> [san] } or
-// falsy (no signed-in repertoire). Returns k when the ply is a friendly
-// move among k favorites, else 0.
-function favoriteCount(ply, repertoire) {
-  if (!repertoire || ply.color !== repertoire.friendlyColor) return 0;
-  var favorites = repertoire.favoritesFor(ply.key) || [];
+/*
+  TASK_630: whose moves count. perspective = { friendlyColor: 'w'|'b',
+  favoritesFor(key) -> [san] | null favoritesFor }, or falsy for no
+  perspective at all (then every ply multiplies in, as in TASK_620).
+  - opponent plies: always their Explorer share
+  - our plies, no repertoire (signed out, spectator, still loading): free,
+    the extension's convention (lib/move-resolution.js)
+  - our plies with a repertoire (TASK_629): 1/k when one of k favorites,
+    else their Explorer share (leaving your prep costs probability)
+*/
+function favoriteCount(ply, perspective) {
+  if (!perspective || !perspective.favoritesFor || ply.color !== perspective.friendlyColor) return 0;
+  var favorites = perspective.favoritesFor(ply.key) || [];
   return favorites.indexOf(stripSanDecorations(ply.san)) === -1 ? 0 : favorites.length;
+}
+
+// { share, favorites } when the ply is scored without Explorer stats
+// (free: favorites 0; one of k favorites: share 1/k), else null.
+function fixedPlyShare(ply, perspective) {
+  if (!perspective || ply.color !== perspective.friendlyColor) return null;
+  if (!perspective.favoritesFor) return { share: 1, favorites: 0 };
+  var k = favoriteCount(ply, perspective);
+  return k > 0 ? { share: 1 / k, favorites: k } : null;
 }
 
 /*
   plies: [{ key, san, color }] - key is explorerPositionKey of the position
   the move was played FROM, color ('w'/'b') the side that played it.
   lookup(key) returns that position's stats, or undefined when not known
-  (yet). repertoire: optional, see favoriteCount. Returns one entry per ply:
-  - { state: 'colored', gamesInN, color[, favorites: k] } - favorites set
-    when the ply was scored as one of k repertoire moves (no stats needed)
+  (yet). perspective: optional, see above. Returns one entry per ply:
+  - { state: 'colored', gamesInN, color[, plyGamesInN][, free | favorites] }
+    gamesInN is the cumulative line; plyGamesInN this move alone at its
+    position (when stats are known and it's in them); free / favorites
+    mark our own moves scored without their Explorer share
   - { state: 'offbook', color } - this move (or an earlier one) isn't in
     the Explorer data; everything after an off-book move stays off book
   - { state: 'unknown' } - stats for this ply or an earlier one aren't
     available, so the cumulative product can't be computed yet
 */
-function computeMoveRarity(plies, lookup, repertoire) {
+function computeMoveRarity(plies, lookup, perspective) {
   var result = [];
   var cumulative = 1;
   var status = 'ok';
   for (var i = 0; i < plies.length; i++) {
     if (status === 'offbook') { result.push({ state: 'offbook', color: RARITY_LEVEL_COLORS[4] }); continue; }
     if (status === 'unknown') { result.push({ state: 'unknown' }); continue; }
-    var favorites = favoriteCount(plies[i], repertoire);
+    var fixed = fixedPlyShare(plies[i], perspective);
+    var stats = lookup(plies[i].key);
+    var explorerShare = stats ? explorerMoveShare(stats, plies[i].san) : 0;
     var share;
-    if (favorites > 0) {
-      share = 1 / favorites;
+    if (fixed) {
+      share = fixed.share;
     } else {
-      var stats = lookup(plies[i].key);
       if (!stats) { status = 'unknown'; result.push({ state: 'unknown' }); continue; }
-      share = explorerMoveShare(stats, plies[i].san);
-      if (!(share > 0)) { status = 'offbook'; result.push({ state: 'offbook', color: RARITY_LEVEL_COLORS[4] }); continue; }
+      if (!(explorerShare > 0)) { status = 'offbook'; result.push({ state: 'offbook', color: RARITY_LEVEL_COLORS[4] }); continue; }
+      share = explorerShare;
     }
     cumulative *= share;
     var gamesInN = Math.max(1, Math.round(1 / cumulative));
     var entry = { state: 'colored', gamesInN: gamesInN, color: rarityColorForGamesInN(gamesInN) };
-    if (favorites > 0) entry.favorites = favorites;
+    if (explorerShare > 0) entry.plyGamesInN = Math.max(1, Math.round(1 / explorerShare));
+    if (fixed && fixed.favorites > 0) entry.favorites = fixed.favorites;
+    if (fixed && fixed.favorites === 0) entry.free = true;
     result.push(entry);
   }
   return result;
@@ -689,26 +711,38 @@ function computeMoveRarity(plies, lookup, repertoire) {
 function rarityTooltip(entry) {
   if (!entry || entry.state === 'unknown') return '';
   if (entry.state === 'offbook') return 'Off book - not in the Lichess Explorer (blitz/rapid, 1600-2000)';
-  var line = '1 in ' + entry.gamesInN.toLocaleString('en-US') + ' games reach this line';
-  if (entry.favorites === 1) return 'Your repertoire move - ' + line;
-  if (entry.favorites > 1) return 'One of your ' + entry.favorites + ' repertoire moves here - ' + line;
-  return line;
+  var text = '1 in ' + entry.gamesInN.toLocaleString('en-US') + ' games reach this line';
+  if (entry.plyGamesInN) text += ' (this move: 1 in ' + entry.plyGamesInN.toLocaleString('en-US') + ' here)';
+  if (entry.free) return 'Your move - not counted. ' + text;
+  if (entry.favorites === 1) return 'Your repertoire move - ' + text;
+  if (entry.favorites > 1) return 'One of your ' + entry.favorites + ' repertoire moves here - ' + text;
+  return text;
 }
 
-// First ply whose stats still need fetching (undefined), or -1. Stops at
-// an off-book ply: nothing after it needs stats. Repertoire plies are
-// scored without stats, so they're skipped rather than fetched.
-function nextRarityFetchIndex(plies, lookup, isBlocked, repertoire) {
+/*
+  Next ply whose stats should be fetched, or -1. Plies the coloring needs
+  come first, walking from the start: stop at an off-book ply (nothing
+  after it needs stats) or a blocked key (retry pending/exhausted). Our
+  own fixed-share plies don't need stats to be colored - only for their
+  tooltip's per-move number - so they're fetched only once the coloring
+  has nothing else to wait for (TASK_630).
+*/
+function nextRarityFetchIndex(plies, lookup, isBlocked, perspective) {
+  var optional = -1;
   for (var i = 0; i < plies.length; i++) {
-    if (favoriteCount(plies[i], repertoire) > 0) continue;
     var stats = lookup(plies[i].key);
-    if (stats) {
-      if (!(explorerMoveShare(stats, plies[i].san) > 0)) return -1;
+    if (fixedPlyShare(plies[i], perspective)) {
+      if (!stats && optional === -1 && !isBlocked(plies[i].key)) optional = i;
       continue;
     }
-    return isBlocked(plies[i].key) ? -1 : i;
+    if (stats) {
+      if (!(explorerMoveShare(stats, plies[i].san) > 0)) return optional;
+      continue;
+    }
+    if (isBlocked(plies[i].key)) return optional;
+    return i;
   }
-  return -1;
+  return optional;
 }
 /*
   Failure bookkeeping for Explorer lookups (Codex review of #623). Each
@@ -1317,14 +1351,14 @@ function attachRepertoire(user) {
   if (explorerStats instanceof Map) renderMoveList();
 }
 
-// null when there's no signed-in repertoire (spectators, signed out,
-// still loading): coloring then scores every ply by its Explorer share.
-function currentRepertoire() {
-  if (!currentUser || !repertoireData) return null;
-  var data = repertoireData;
+// TASK_630: every viewer colors from their own orientation. favoritesFor
+// is null without a signed-in repertoire (spectators, signed out, still
+// loading), which makes our own moves free.
+function currentPerspective() {
+  var data = currentUser ? repertoireData : null;
   return {
     friendlyColor: friendlyColorForOrientation(flipped),
-    favoritesFor: function(key) { return repertoireFavorites(data, key); },
+    favoritesFor: data ? function(key) { return repertoireFavorites(data, key); } : null,
   };
 }
 
@@ -1393,9 +1427,9 @@ async function fetchExplorerStats(key) {
   recordExplorerFailure(key, explorerFailureKindForStatus(response.status));
 }
 
-async function pumpExplorerFetches(plies, repertoire) {
+async function pumpExplorerFetches(plies, perspective) {
   if (explorerInFlight) return;
-  var index = nextRarityFetchIndex(plies, explorerLookup, explorerBlocked, repertoire);
+  var index = nextRarityFetchIndex(plies, explorerLookup, explorerBlocked, perspective);
   if (index < 0) return;
   explorerInFlight = true;
   try {
@@ -1523,9 +1557,9 @@ function renderMoveList() {
   moveListEl.innerHTML = '';
   var hist = game.history();
   var plies = buildRarityPlies();  // TASK_620
-  var repertoire = currentRepertoire();  // TASK_629
-  var rarity = computeMoveRarity(plies, explorerLookup, repertoire);
-  pumpExplorerFetches(plies, repertoire);
+  var perspective = currentPerspective();  // TASK_629/630
+  var rarity = computeMoveRarity(plies, explorerLookup, perspective);
+  pumpExplorerFetches(plies, perspective);
   var startSpan = document.createElement('span');
   startSpan.textContent = 'Start position';
   startSpan.style.cursor = 'pointer';
