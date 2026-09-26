@@ -718,6 +718,21 @@ function sha1Hex(str) {
   return [h0, h1, h2, h3, h4].map(function(h) { return ('00000000' + (h >>> 0).toString(16)).slice(-8); }).join('');
 }
 
+/*
+  TASK_631 follow-up: the store's position key. chess.js writes an
+  en-passant square after EVERY double pawn push, even when no en-passant
+  capture is possible, so 1.Nf3 d5 2.d4 ("... d3") and 1.d4 d5 2.Nf3
+  ("... -") - the same position - got different keys and never matched.
+  Keep the square only when an en-passant capture is legal (FIDE's
+  same-position rule). Explorer lookup keys are unchanged: the Worker's
+  cache is keyed by them.
+*/
+function transpositionPositionKey(key, epCaptureLegal) {
+  var parts = String(key).split(' ');
+  if (parts.length === 4 && parts[3] !== '-' && !epCaptureLegal) parts[3] = '-';
+  return parts.join(' ');
+}
+
 function contributorIdFor(pathSan, friendlyColor) {
   return sha1Hex(pathSan + ':' + (friendlyColor === 'b' ? 'black' : 'white'));
 }
@@ -1652,6 +1667,10 @@ function buildRarityPlies() {
     var ply = { key: explorerPositionKey(replay.fen()), san: hist[i], color: replay.turn() };
     replay.move(hist[i]);
     ply.afterKey = explorerPositionKey(replay.fen());  // TASK_631
+    if (/ [a-h][36]$/.test(ply.afterKey)) {  // only after a double push
+      ply.afterKey = transpositionPositionKey(ply.afterKey,
+        replay.moves({ verbose: true }).some(function(m) { return m.flags.indexOf('e') !== -1; }));
+    }
     ply.pathSan = hist.slice(0, i + 1).join(' ');
     plies.push(ply);
   }
