@@ -634,10 +634,30 @@ function repertoireStorageKey(positionKey) { return String(positionKey).replace(
 
 // data: the repertoire/<uid> snapshot value ({ storageKey: { san: ts } }).
 // Returns the favorite SANs (decorations stripped) at positionKey, or [].
+/*
+  #647: favorites decay. Each favorite's stored value is when it was last
+  played (TASK_629). A favorite is ACTIVE only while its last play is within
+  FAVORITE_DECAY_DAYS of the NEWEST favorite in the same position - i.e. once
+  you've kept playing something else there and haven't played this move for
+  that long, it stops counting (toward k for the 1/k cost, and for Train).
+  Computed on read, nothing deleted: playing a decayed move again makes it
+  the newest, and it's back. The newest is always active, so a position with
+  favorites never ends up with none. A value that isn't a number (not
+  writable under the rules, but defensive) counts as active.
+*/
+var FAVORITE_DECAY_DAYS = 30;
+var FAVORITE_DECAY_MS = FAVORITE_DECAY_DAYS * 24 * 60 * 60 * 1000;
+
 function repertoireFavorites(data, positionKey) {
   var entry = data && data[repertoireStorageKey(positionKey)];
   if (!entry || typeof entry !== 'object') return [];
-  return Object.keys(entry).map(stripSanDecorations);
+  var sans = Object.keys(entry);
+  var newest = -Infinity;
+  sans.forEach(function(san) { if (typeof entry[san] === 'number' && entry[san] > newest) newest = entry[san]; });
+  return sans.filter(function(san) {
+    var playedAt = entry[san];
+    return typeof playedAt !== 'number' || newest - playedAt <= FAVORITE_DECAY_MS;
+  }).map(stripSanDecorations);
 }
 
 /*
