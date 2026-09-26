@@ -1104,11 +1104,29 @@ function pushSharedState() {
   });
 }
 
+function isSameSharedLine(data) {
+  try {
+    var local = serializeSharedState(game, baseFen, 0);
+    return local.baseFen === data.baseFen && local.currentFen === data.currentFen && local.movesSan === data.movesSan;
+  } catch (e) {
+    return false;
+  }
+}
+
 function applyRemoteState(data) {
   if (train) { train.pendingRemote = data; return; }  // #648: held until training stops
   try {
-    var wasAtLive = (viewPly === game.history().length);
     var decoded = decodeSharedState(data);
+    // An update that only restates the line this board already has - e.g.
+    // the server's echo of our own write, which fires again because the
+    // server timestamp replaces the optimistic one - changes nothing, so it
+    // must not reset the view or drop a piece the player has just selected
+    // (#650 PR 2: found by the emulator tests).
+    if (isSameSharedLine(data)) {
+      setSyncStatus('synced');
+      return true;
+    }
+    var wasAtLive = (viewPly === game.history().length);
     game = decoded.game;
     baseFen = decoded.baseFen;
     viewPly = nextViewPlyOnRemoteUpdate(viewPly, wasAtLive, game.history().length);
