@@ -33,7 +33,7 @@ var Chess=function(r){var u="b",s="w",l=-1,_="p",A="n",S="b",m="r",y="q",p="k",t
   Defined locally rather than assumed from a host stylesheet - confirmed
   2026-09-06 that when this file is served as a plain static page (e.g.
   present_files, outside the visualize:show_widget Artifact sandbox),
-  there is no host CSS supplying .sr-only or any --text-*/--border-*
+  there is no host CSS supplying .sr-only or any --text-* / --border-*
   custom properties, so the accessibility heading below rendered as
   large visible text and every var(--...) color fell back to browser
   default. Every var(--...) usage in this file now carries an explicit
@@ -60,7 +60,6 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 <button id="resetBtn">Reset</button>
 <button id="undoBtn">Undo</button>
 <button id="flipBtn">Flip board</button>
-<button id="discussBtn">Discuss with Claude ↗</button>
 </div>
 </div>
 <div style="flex:1; min-width:220px;">
@@ -72,10 +71,9 @@ Analysis mode
 </label>
 <span id="evalBadge" style="display:none; font-size:13px; font-weight:600; padding:2px 8px; border-radius:4px; background:var(--bg-secondary, #3a3a3c); border:1px solid #888;"></span>
 </div>
-<label style="font-size:13px; color:var(--text-secondary, #aaa); display:block; margin-bottom:4px;">Load FEN or positionKey</label>
+<label for="fenInput" style="font-size:13px; color:var(--text-secondary, #aaa); display:block; margin-bottom:4px;">FEN <span style="font-weight:normal;">- click to copy, paste (or type + Enter) to load</span></label>
 <div style="display:flex; gap:6px; margin-bottom:4px;">
-<input id="fenInput" type="text" placeholder="Full FEN or 4-field positionKey..." style="flex:1;">
-<button id="loadFenBtn">Load</button>
+<input id="fenInput" type="text" spellcheck="false" autocomplete="off" placeholder="Full FEN or 4-field positionKey" title="Shows the position on the board. Click to select it for copying; paste a FEN or positionKey to load it (Esc reverts)." style="flex:1; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px;">
 </div>
 <p id="fenError" style="font-size:13px; color:var(--text-danger, #f66); margin:0 0 12px; display:none;">That didn't parse. Check it and try again.</p>
 <label style="font-size:13px; color:var(--text-secondary, #aaa); display:block; margin-bottom:4px;">Moves <span id="syncStatus" style="font-weight:normal;"></span></label>
@@ -91,10 +89,6 @@ Analysis mode
 <span id="navStatus" style="font-size:12px; color:var(--text-secondary, #aaa);"></span>
 </div>
 <div id="moveList" style="font-size:14px; line-height:1.7; max-height:200px; overflow-y:auto; color:var(--text-primary, #eee);">Start position</div>
-<div id="discussBox" style="display:none; margin-top:12px;">
-<label style="font-size:13px; color:var(--text-secondary, #aaa); display:block; margin-bottom:4px;">Copy this and paste it into Claude (pre-selected - just press Ctrl/Cmd+C):</label>
-<textarea id="discussText" readonly rows="3" style="width:100%; box-sizing:border-box; font-size:13px; font-family:inherit; color:var(--text-primary, #eee); background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666); border-radius:4px; padding:6px; resize:vertical;"></textarea>
-</div>
 </div>
 </div>
 </div>
@@ -107,7 +101,7 @@ Analysis mode
   directly: a bare positionKey passed straight to the constructor
   silently fails to load in chess.js 0.10.3 (confirmed live 2026-09-06 -
   produced an empty board with no pieces, no error), which is exactly
-  why the Load-FEN button already normalizes first. This is the single
+  why the FEN field (TASK_646; formerly the Load-FEN button) already normalizes first. This is the single
   line to edit when preloading a position - don't touch the line below.
 */
 var INITIAL_FEN = '';
@@ -271,10 +265,9 @@ setSyncStatus(firebaseReady ? 'connecting' : 'local', firebaseReady ? '' : 'not 
   SAN move list is what lets other viewers see a real move list (and
   correct undo/turn state), not just a static final position. FEN is
   still stored alongside it - useful on its own (e.g. pasting into the
-  existing Load-FEN box) and as the fallback for the one case move
-  replay can't handle: a custom position loaded via that same Load-FEN
-  box has no move history to replay in the first place, exactly
-  mirroring the pre-existing local-only quirk noted at loadFenBtn below.
+  FEN field) and as the fallback for the one case move replay can't
+  handle: a custom position loaded via the FEN field (TASK_646; formerly
+  the Load-FEN box) has no move history to replay in the first place.
 */
 /* TASK_387_STATE_CODEC_START - kept pure so the deterministic Node tests can extract it. */
 var STATE_SCHEMA_VERSION = 1;
@@ -1028,6 +1021,22 @@ function squareId(file, rank) {
   return String.fromCharCode(97 + file) + rank;
 }
 
+/* TASK_646_FEN_FIELD_START */
+// A FEN or 4-field positionKey from the FEN field -> { fen } (full,
+// loadable) or { error } (message for the error line). Side-effect-free;
+// ChessCtor is chess.js's Chess, passed in so the Node test can supply it.
+function parseFenImport(raw, ChessCtor) {
+  var fields = String(raw == null ? '' : raw).trim().split(/\s+/).filter(Boolean);
+  if (fields.length === 0) return { error: 'Enter a FEN or positionKey first.' };
+  if (fields.length === 4) fields.push('0', '1');
+  var test = new ChessCtor();
+  if (fields.length !== 6 || !test.load(fields.join(' '))) {
+    return { error: "That didn't parse. Check it and try again." };
+  }
+  return { fen: test.fen() };
+}
+/* TASK_646_FEN_FIELD_END */
+
 function normalizeFen(value) {
   var fields = value.split(/\s+/).filter(Boolean);
   if (fields.length === 4) {
@@ -1711,6 +1720,7 @@ function render() {
   boardEl.innerHTML = '';
   renderCoords();
   var displayGame = buildViewGame();
+  syncFenField(displayGame.fen());  // TASK_646: the field shows the viewed position
   var board = displayGame.board();
   for (var r = 0; r < 8; r++) {
     for (var f = 0; f < 8; f++) {
@@ -1924,8 +1934,8 @@ document.getElementById('navLiveBtn').onclick = function() { goToPly(game.histor
 /*
   TASK_613: arrow-key/Home/End navigation, same shortcuts as
   lichess/chess.com's analysis boards. Ignored while focus is in a text
-  input (fenInput, discussText) so typing a FEN or selecting the
-  copy-to-Claude text doesn't also step through moves.
+  input (fenInput) so typing or selecting a FEN doesn't also step
+  through moves.
 */
 document.addEventListener('keydown', function(ev) {
   var tag = document.activeElement && document.activeElement.tagName;
@@ -1941,49 +1951,97 @@ document.getElementById('flipBtn').onclick = function() {
   render();
 };
 
-document.getElementById('loadFenBtn').onclick = function() {
-  var raw = fenInput.value.trim();
-  if (!raw) { fenError.textContent = 'Enter a FEN or positionKey first.'; fenError.style.display = 'block'; return; }
-  var value = normalizeFen(raw);
-  var test = new Chess();
-  var ok = test.load(value);
-  if (!ok) { fenError.textContent = "That didn't parse. Check it and try again."; fenError.style.display = 'block'; return; }
-  game = test;
-  baseFen = test.fen();
+/*
+  TASK_646: the FEN field imports and exports itself. It always shows the
+  FEN of the viewed position (export: focusing selects it all, so the
+  person's own Ctrl/Cmd+C copies it - a user-initiated copy works even in
+  the sandboxed chat preview, where scripted clipboard writes are
+  blocked). Pasting a FEN/positionKey loads it at once; a typed edit loads
+  on Enter; Escape or leaving the field reverts. While the person is
+  editing (dirty), board updates don't overwrite what they're typing.
+*/
+var fenDirty = false;
+
+function syncFenField(fen) {
+  if (fenDirty || !fenInput) return;
+  if (fenInput.value === fen) return;
+  fenInput.value = fen;
+  if (document.activeElement === fenInput) fenInput.select();
+}
+
+function showFenError(message) {
+  fenError.textContent = message;
+  fenError.style.display = 'block';
+}
+
+function revertFenField() {
+  fenDirty = false;
+  fenPastePending = false;
+  fenError.style.display = 'none';
+  syncFenField(buildViewGame().fen());
+}
+
+function importFenFromField() {
+  var parsed = parseFenImport(fenInput.value, Chess);
+  if (parsed.error) { showFenError(parsed.error); return false; }
+  var loaded = new Chess();
+  loaded.load(parsed.fen);
+  game = loaded;
+  baseFen = loaded.fen();
   selected = null;
   viewPly = 0;
+  fenDirty = false;
   fenError.style.display = 'none';
   render();
   pushSharedState();
-};
+  fenInput.select();
+  return true;
+}
 
-document.getElementById('discussBtn').onclick = function() {
-  var hist = game.history();
-  var moveText = hist.length ? hist.join(' ') : '(no moves yet)';
-  var message = 'Here is our shared board. Moves so far: ' + moveText + '. Current FEN: ' + game.fen() + '. What do you think?';
-  /*
-    sendPrompt is injected by the visualize:show_widget Artifact sandbox
-    only. Confirmed live 2026-09-06 that a plain served/previewed file
-    (present_files, or this file published/opened outside that sandbox)
-    has neither that global nor working Clipboard-API/window.prompt
-    fallbacks: the sandboxed preview iframe blocks clipboard-write via
-    Permissions-Policy AND ignores prompt()/alert()/confirm() outright
-    (no 'allow-modals'). The only thing guaranteed to work everywhere is
-    an in-page, pre-selected, read-only textarea the person copies from
-    with their own Ctrl/Cmd+C - that's a real user-initiated clipboard
-    action, not a scripted one, so it isn't subject to the same policy.
-  */
-  if (typeof sendPrompt === 'function') {
-    sendPrompt(message);
-    return;
-  }
-  var box = document.getElementById('discussBox');
-  var text = document.getElementById('discussText');
-  box.style.display = 'block';
-  text.value = message;
-  text.focus();
-  text.select();
-};
+// Select-all on focus, synchronously: the original deferred
+// (setTimeout) select lost to the click's own caret placement in Chromium
+// (found by a real-browser test - jsdom has no such mouse semantics;
+// browser-tests/tests/board-fen-field.spec.js pins it). Safari is known to
+// collapse a focus-time selection on the click's mouseup too, so that
+// mouseup is swallowed as well - untested here: only Chromium is available
+// to the browser tests. A later click inside the field places the caret.
+var fenFocusClick = false;
+fenInput.addEventListener('mousedown', function() { fenFocusClick = document.activeElement !== fenInput; });
+fenInput.addEventListener('focus', function() { if (!fenDirty) fenInput.select(); });
+fenInput.addEventListener('mouseup', function(ev) {
+  if (!fenFocusClick) return;
+  fenFocusClick = false;
+  if (!fenDirty) { ev.preventDefault(); fenInput.select(); }
+});
+// A paste imports from the `input` event it produces - fired
+// synchronously once the pasted text is in the field - rather than from a
+// deferred timer: a timer could fire after blur/Escape had already
+// reverted the field and "import" the restored FEN, replacing the shared
+// game for every viewer (Codex review of #649). inputType identifies a
+// paste in current browsers; fenPastePending covers any that don't set it.
+var fenPastePending = false;
+// A paste that inserts nothing (empty or blocked clipboard) fires no input
+// event, so the marker must not outlive it, or the next typed character
+// would import as a paste (Codex review of #649). A paste's own input event
+// fires in the same task as the paste event, after its handlers, and typing
+// always comes in a later task - so clear on the next task. Not a
+// microtask: that would run as soon as this handler returns, before the
+// text lands, and defeat the fallback.
+fenInput.addEventListener('paste', function() {
+  fenPastePending = true;
+  setTimeout(function() { fenPastePending = false; }, 0);
+});
+fenInput.addEventListener('input', function(ev) {
+  fenDirty = true;
+  var fromPaste = (ev && ev.inputType === 'insertFromPaste') || fenPastePending;
+  fenPastePending = false;
+  if (fromPaste) importFenFromField();  // load it if it parses, else keep it for fixing and say why
+});
+fenInput.addEventListener('keydown', function(ev) {
+  if (ev.key === 'Enter') { ev.preventDefault(); if (fenDirty) importFenFromField(); }  // nothing unsaved (e.g. a paste already loaded): no re-import
+  else if (ev.key === 'Escape') { ev.preventDefault(); revertFenField(); fenInput.select(); }
+});
+fenInput.addEventListener('blur', function() { fenPastePending = false; if (fenDirty) revertFenField(); });
 
 render();
 </script>
