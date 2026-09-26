@@ -60,6 +60,7 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 <button id="resetBtn">Reset</button>
 <button id="undoBtn">Undo</button>
 <button id="flipBtn">Flip board</button>
+<button id="trainBtn" aria-pressed="false" title="Drill your repertoire from the position shown. Your side is the board orientation.">Train</button>
 </div>
 </div>
 <div style="flex:1; min-width:220px;">
@@ -88,6 +89,7 @@ Analysis mode
 <button id="navLiveBtn" title="Jump to the current live position (End)" aria-label="Jump to live position">Live ▶|</button>
 <span id="navStatus" style="font-size:12px; color:var(--text-secondary, #aaa);"></span>
 </div>
+<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0 0 8px; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div></div>
 <div id="moveList" style="font-size:14px; line-height:1.7; max-height:200px; overflow-y:auto; color:var(--text-primary, #eee);">Start position</div>
 </div>
 </div>
@@ -122,6 +124,8 @@ var dragCtx = null;  // { fromSq, startX, startY, moved, ghostEl, hoverSq } whil
   and isAtLive() for why interactivity is gated on it.
 */
 var viewPly = 0;
+// #648: the running Train session, or null (see startTraining()).
+var train = null;
 var boardEl = document.getElementById('board');
 var boardPanelEl = document.getElementById('boardPanel');
 var ranksEl = document.getElementById('ranks');
@@ -226,6 +230,7 @@ if (firebaseReady) {
   if (authRowEl) authRowEl.style.display = 'flex';
   firebase.auth().onAuthStateChanged(function(user) {
     currentUser = user;
+    if (!user && train) stopTraining('Signed out, so training stopped.');  // #648
     updateAuthUI();
     attachRepertoire(user);  // TASK_629
     // TASK_620 (Codex review of #623): a newly signed-in player can now
@@ -909,7 +914,113 @@ function clearExplorerFailuresOfKind(failures, kind) {
 }
 /* TASK_620_MOVE_COLORS_END */
 
+/* TASK_648_TRAIN_START */
+/*
+  #648 Train mode - the pure parts (the session itself is further down).
+  Decisions (Michael, 2026-09-26, recorded on #648):
+  - your side is the board orientation; the viewed position is the root
+  - your move is correct when it's any ACTIVE favorite (#647)
+  - the opponent is auto-played, weighted by Explorer share, among replies
+    that lead into your prep; an uncovered reply is also played when its
+    share is >= gapMinShare (a "gap": whatever you play there becomes a
+    new favorite, and the line ends)
+  - hints are time-based like the extension's (chesstempo/hint-scheduler.js,
+    TASK_053/068/079): hintDelaySeconds normally; after a mistake in that
+    position within mistakeWindowDays, mistakeHintStepSeconds per day
+    (or part) since it, capped at mistakeHintDelayMaxSeconds
+  All tunables live here.
+*/
+var TRAIN_CONFIG = {
+  gapMinShare: 0.10,
+  hintDelaySeconds: 10,
+  mistakeHintStepSeconds: 0.5,
+  mistakeHintDelayMaxSeconds: 2,
+  mistakeWindowDays: 7,
+  opponentDelayMs: 700,
+  lineEndPauseMs: 1500,
+  maxLinePlies: 80,
+};
+
+function trainHintDelaySeconds(mistakeAt, now, cfg) {
+  if (typeof mistakeAt !== 'number' || !isFinite(mistakeAt)) return cfg.hintDelaySeconds;
+  var dayMs = 24 * 60 * 60 * 1000;
+  var age = now - mistakeAt;
+  if (age < 0 || age > cfg.mistakeWindowDays * dayMs) return cfg.hintDelaySeconds;
+  var tiered = cfg.mistakeHintStepSeconds * (Math.floor(age / dayMs) + 1);
+  return Math.min(tiered, cfg.mistakeHintDelayMaxSeconds);
+}
+
+// 'gap' when the position has no active favorite (the move you play
+// becomes one), else 'correct' or 'wrong'.
+function trainGrade(san, activeFavorites) {
+  if (!activeFavorites || activeFavorites.length === 0) return 'gap';
+  return activeFavorites.indexOf(stripSanDecorations(san)) === -1 ? 'wrong' : 'correct';
+}
+
+/*
+  The opponent's candidate replies. legal: [{ san, covered }] where covered
+  means the reply leads to a position with an active favorite. stats: the
+  Explorer stats of the position, or null when unavailable.
+  - covered replies weigh their Explorer share
+  - uncovered replies are gaps, played only at share >= cfg.gapMinShare
+  - with no usable weights (no stats, or prep the Explorer has never seen),
+    covered replies are played uniformly, so prep still gets drilled
+  Returns [{ san, weight, gap }] with weight > 0; [] ends the line.
+*/
+function trainOpponentChoices(legal, stats, cfg) {
+  var out = [];
+  legal.forEach(function(m) {
+    var share = stats ? explorerMoveShare(stats, m.san) : 0;
+    if (m.covered && share > 0) out.push({ san: m.san, weight: share, gap: false });
+    else if (!m.covered && share >= cfg.gapMinShare) out.push({ san: m.san, weight: share, gap: true });
+  });
+  if (out.some(function(c) { return !c.gap; })) return out;
+  var covered = legal.filter(function(m) { return m.covered; })
+    .map(function(m) { return { san: m.san, weight: 1, gap: false }; });
+  return covered.length ? covered : out;
+}
+
+// Weighted choice; rnd in [0, 1).
+function trainPick(choices, rnd) {
+  var total = choices.reduce(function(t, c) { return t + c.weight; }, 0);
+  var x = rnd * total;
+  for (var i = 0; i < choices.length; i++) {
+    x -= choices[i].weight;
+    if (x < 0) return choices[i];
+  }
+  return choices[choices.length - 1] || null;
+}
+
+// The active favorite to hint: the most recently played one.
+function newestActiveFavorite(data, positionKey) {
+  var active = repertoireFavorites(data, positionKey);
+  var entry = (data && data[repertoireStorageKey(positionKey)]) || {};
+  var best = null;
+  var bestAt = -Infinity;
+  Object.keys(entry).forEach(function(san) {
+    if (active.indexOf(stripSanDecorations(san)) === -1) return;
+    var at = typeof entry[san] === 'number' ? entry[san] : Infinity;
+    if (best === null || at > bestAt) { best = stripSanDecorations(san); bestAt = at; }
+  });
+  return best;
+}
+
+// "Lines 3 \u00b7 7/9 right first time (78%)" - first time means no hint and no
+// mistake. The separator is escaped: this file has no <meta charset> (it's
+// also a widget fragment), so a raw non-ASCII literal breaks wherever it's
+// served without a UTF-8 header.
+function trainSummaryText(stats) {
+  var parts = ['Lines ' + stats.lines];
+  if (stats.quizzed > 0) {
+    parts.push(stats.firstTry + '/' + stats.quizzed + ' right first time (' + Math.round(100 * stats.firstTry / stats.quizzed) + '%)');
+  }
+  if (stats.missed.length) parts.push('missed: ' + stats.missed.join(', '));
+  return parts.join(' \u00b7 ');
+}
+/* TASK_648_TRAIN_END */
+
 function pushSharedState() {
+  if (train) return;  // #648: training is private - nothing reaches the shared board
   if (!firebaseReady || !boardRef) return;
   var payload;
   try {
@@ -931,6 +1042,7 @@ function pushSharedState() {
 }
 
 function applyRemoteState(data) {
+  if (train) { train.pendingRemote = data; return; }  // #648: held until training stops
   try {
     var wasAtLive = (viewPly === game.history().length);
     var decoded = decodeSharedState(data);
@@ -1072,6 +1184,7 @@ function renderCoords() {
 }
 
 function attemptMove(from, to) {
+  if (train) return trainOnUserMove(from, to);  // #648
   var moves = game.moves({ square: from, verbose: true });
   var isLegal = moves.some(function(m) { return m.to === to; });
   if (!isLegal) return false;
@@ -1229,6 +1342,7 @@ function buildViewGame() {
 }
 
 function goToPly(ply) {
+  if (train) return;  // #648: the trainer owns the board while it runs
   viewPly = clampViewPly(ply, game.history().length);
   selected = null;
   render();
@@ -1445,13 +1559,22 @@ function scheduleEval(fen) {
   evalDebounceTimer = setTimeout(function() { runEval(fen); }, ENGINE_DEBOUNCE_MS);
 }
 
+function cancelEval() {
+  clearTimeout(evalDebounceTimer);
+  evalDebounceTimer = null;
+  evalDebounceFen = null;
+  evalActiveFen = null;
+  if (stockfishWorker) {
+    try { stockfishWorker.terminate(); } catch (e) { /* ignore */ }
+    stockfishWorker = null;
+  }
+}
+
 if (analysisModeCheckbox) {
   analysisModeCheckbox.addEventListener('change', function() {
     analysisMode = analysisModeCheckbox.checked;
     try { localStorage.setItem('chessPrepBoard.analysisMode', analysisMode ? '1' : '0'); } catch (e) { /* ignore */ }
-    clearTimeout(evalDebounceTimer);
-    evalDebounceFen = null;
-    evalActiveFen = null;
+    cancelEval();
     if (analysisMode) {
       scheduleEval(buildViewGame().fen());
     } else if (evalBadgeEl) {
@@ -1773,6 +1896,10 @@ function render() {
       if (selected === sq && !(dragCtx && dragCtx.moved)) {
         cell.style.boxShadow = 'inset 0 0 0 2px var(--border-accent, #4a9eff)';
       }
+      if (train && train.hintSquare === sq) {  // #648: ring the piece to move, in the position's rarity color
+        cell.style.boxShadow = 'inset 0 0 0 4px ' + train.hintColor;
+        cell.dataset.hint = 'true';
+      }
       cell.onclick = (function(sq) { return function() { onSquareClick(sq); }; })(sq);
       boardEl.appendChild(cell);
     }
@@ -1804,7 +1931,7 @@ function render() {
     (isAtLive() ? '' : ' (viewing move ' + viewPly + ' of ' + game.history().length + ')');
   renderMoveList();
   renderNavControls();
-  if (analysisMode) scheduleEval(displayGame.fen());  // TASK_614: the position being VIEWED, not necessarily the live tip
+  if (analysisMode && !train) scheduleEval(displayGame.fen());  // TASK_614: evaluate the VIEWED position, except during a drill
 }
 
 /*
@@ -1882,6 +2009,7 @@ function renderNavControls() {
   navBackBtn.disabled = (viewPly === 0);
   navForwardBtn.disabled = (viewPly === histLength);
   navLiveBtn.style.display = isAtLive() ? 'none' : '';
+  if (train) { navFirstBtn.disabled = navBackBtn.disabled = navForwardBtn.disabled = true; }  // #648
   if (navStatusEl) {
     navStatusEl.textContent = isAtLive() ? '' : 'viewing move ' + viewPly + ' of ' + histLength;
   }
@@ -1949,6 +2077,267 @@ document.addEventListener('keydown', function(ev) {
 document.getElementById('flipBtn').onclick = function() {
   flipped = !flipped;
   render();
+};
+
+/*
+  #648 Train mode: the session. The pure rules are in the TASK_648_TRAIN
+  block above; this part drives the board.
+  - Needs a signed-in player with their repertoire loaded.
+  - Private: `game` is swapped for a private copy of the line up to the
+    viewed position (the root). pushSharedState() is a no-op while `train`
+    is set, incoming shared updates are held in train.pendingRemote, and
+    the shared game is put back (then the held update applied) on stop.
+  - Keeping the real line up to the root (not a bare root FEN) keeps the
+    move list's probabilities absolute, the same as outside training.
+  - Only correct moves and gap fills are recorded as favorites; wrong
+    moves never are. Mistakes are kept per session (the Firebase SRS and
+    mistake store is #648's second PR).
+*/
+var trainBtn = document.getElementById('trainBtn');
+var trainPanel = document.getElementById('trainPanel');
+var trainMessageEl = document.getElementById('trainMessage');
+var trainStatsEl = document.getElementById('trainStats');
+
+function activeFavoritesAt(chess) {
+  return repertoireFavorites(repertoireData, samePositionKey(chess));
+}
+
+// The Firebase listener catches up asynchronously; keep the session's view
+// of the repertoire current right away.
+function noteRepertoireMoveLocally(positionKey, san) {
+  if (!repertoireData) return;
+  var sk = repertoireStorageKey(positionKey);
+  var entry = Object.assign({}, repertoireData[sk]);
+  entry[stripSanDecorations(san)] = Date.now();
+  repertoireData[sk] = entry;
+}
+
+function trainLineText() {
+  var hist = game.history();
+  var replay = new Chess(normalizeFen(baseFen));
+  var parts = [];
+  for (var i = 0; i < hist.length; i++) {
+    var num = replay.fen().split(' ')[5];
+    if (replay.turn() === 'w') parts.push(num + '.' + hist[i]);
+    else parts.push(i === 0 ? num + '...' + hist[i] : hist[i]);
+    replay.move(hist[i]);
+  }
+  return parts.length ? parts.join(' ') : 'start';
+}
+
+function setTrainMessage(message) {
+  trainPanel.style.display = '';
+  trainMessageEl.textContent = message;
+  if (train) trainStatsEl.textContent = trainSummaryText(train.stats);
+}
+
+function updateTrainUI() {
+  var on = !!train;
+  trainBtn.textContent = on ? 'Stop training' : 'Train';
+  trainBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  ['resetBtn', 'undoBtn', 'flipBtn', 'analysisModeCheckbox'].forEach(function(id) { document.getElementById(id).disabled = on; });
+  if (fenInput) fenInput.disabled = on;
+}
+
+function startTraining() {
+  if (train) return;
+  if (!currentUser || !repertoireData) {
+    setTrainMessage('Sign in to train: Train drills the repertoire you build by playing your moves on this board.');
+    trainStatsEl.textContent = '';
+    return;
+  }
+  var saved = { baseFen: baseFen, history: game.history(), viewPly: viewPly };
+  game = new Chess(normalizeFen(baseFen));
+  for (var i = 0; i < viewPly; i++) game.move(saved.history[i]);
+  train = {
+    color: friendlyColorForOrientation(flipped),
+    saved: saved,
+    rootPly: viewPly,
+    lineId: 0,
+    busy: false,
+    gapPending: false,
+    turn: null,
+    hintSquare: null,
+    hintColor: null,
+    hintTimer: null,
+    opponentTimer: null,
+    lineTimer: null,
+    mistakesAt: new Map(),
+    stats: { lines: 0, quizzed: 0, firstTry: 0, missed: [] },
+    pendingRemote: undefined,
+  };
+  selected = null;
+  viewPly = game.history().length;
+  cancelEval();
+  if (evalBadgeEl) evalBadgeEl.style.display = 'none';
+  updateTrainUI();
+  render();
+  trainStep();
+}
+
+function stopTraining(message) {
+  var t = train;
+  if (!t) return;
+  train = null;
+  clearTimeout(t.hintTimer);
+  clearTimeout(t.opponentTimer);
+  clearTimeout(t.lineTimer);
+  baseFen = t.saved.baseFen;
+  game = new Chess(normalizeFen(baseFen));
+  t.saved.history.forEach(function(san) { game.move(san); });
+  viewPly = t.saved.viewPly;
+  selected = null;
+  trainPanel.style.display = '';
+  trainMessageEl.textContent = message || 'Training stopped.';
+  trainStatsEl.textContent = 'Session: ' + trainSummaryText(t.stats);
+  updateTrainUI();
+  render();
+  if (t.pendingRemote !== undefined) applyRemoteState(t.pendingRemote);
+}
+
+// Decide what happens in the current position.
+function trainStep() {
+  var t = train;
+  if (!t) return;
+  clearTimeout(t.hintTimer);
+  t.hintSquare = null;
+  var plies = game.history().length - t.rootPly;
+  if (game.game_over() || plies >= TRAIN_CONFIG.maxLinePlies) return trainEndLine('Line complete.');
+  if (game.turn() === t.color) {
+    if (!t.gapPending && activeFavoritesAt(game).length === 0) return trainEndLine('End of your prep here.');
+    t.turn = { hinted: false, counted: false };
+    setTrainMessage(t.gapPending
+      ? 'Not in your repertoire yet: play the move you want to keep.'
+      : 'Your move.');
+    trainScheduleHint();
+    return;
+  }
+  t.busy = true;
+  setTrainMessage('Opponent to move...');
+  trainOpponentMove(t, t.lineId);
+}
+
+async function trainOpponentMove(t, lineId) {
+  var key = explorerPositionKey(game.fen());
+  if (!explorerStats.has(key) && !explorerBlocked(key)) await fetchExplorerStats(key);
+  if (train !== t || t.lineId !== lineId) return;
+  var legal = game.moves({ verbose: true }).map(function(m) {
+    var probe = new Chess(game.fen());
+    probe.move(m.san);
+    return { san: m.san, covered: activeFavoritesAt(probe).length > 0 };
+  });
+  var choices = trainOpponentChoices(legal, explorerStats.get(key) || null, TRAIN_CONFIG);
+  if (!choices.length) { t.busy = false; return trainEndLine('End of your prep here.'); }
+  var pick = trainPick(choices, Math.random());
+  t.opponentTimer = setTimeout(function() {
+    if (train !== t || t.lineId !== lineId) return;
+    game.move(pick.san);
+    t.gapPending = pick.gap;
+    t.busy = false;
+    viewPly = game.history().length;
+    render();
+    trainStep();
+  }, TRAIN_CONFIG.opponentDelayMs);
+}
+
+function trainEndLine(message) {
+  var t = train;
+  if (game.history().length === t.rootPly) {
+    stopTraining('Nothing to train from this position yet: there are no repertoire moves here. Play your moves on the board (signed in) to build it.');
+    return;
+  }
+  t.stats.lines++;
+  t.lineId++;
+  t.busy = true;
+  clearTimeout(t.hintTimer);
+  t.hintSquare = null;
+  setTrainMessage(message + ' Next line...');
+  var lineId = t.lineId;
+  t.lineTimer = setTimeout(function() {
+    if (train !== t || t.lineId !== lineId) return;
+    while (game.history().length > t.rootPly) game.undo();
+    t.gapPending = false;
+    t.busy = false;
+    viewPly = game.history().length;
+    render();
+    trainStep();
+  }, TRAIN_CONFIG.lineEndPauseMs);
+}
+
+function trainHintColor() {
+  var rarity = computeMoveRarity(buildRarityPlies(), explorerLookup, currentPerspective());
+  var last = rarity[rarity.length - 1];
+  return (last && last.color) || RARITY_LEVEL_COLORS[1];
+}
+
+function trainScheduleHint() {
+  var t = train;
+  clearTimeout(t.hintTimer);
+  t.hintSquare = null;
+  var key = samePositionKey(game);
+  var delay = trainHintDelaySeconds(t.mistakesAt.get(key), Date.now(), TRAIN_CONFIG);
+  var lineId = t.lineId;
+  var ply = game.history().length;
+  t.hintTimer = setTimeout(function() {
+    if (train !== t || t.lineId !== lineId || game.history().length !== ply) return;
+    var san = newestActiveFavorite(repertoireData, key);
+    var probe = new Chess(game.fen());
+    var move = san && probe.move(san);
+    if (!move) return;
+    t.hintSquare = move.from;
+    t.hintColor = trainHintColor();
+    if (t.turn) t.turn.hinted = true;
+    render();
+  }, delay * 1000);
+}
+
+// A move from the board while training (attemptMove's replacement).
+function trainOnUserMove(from, to) {
+  var t = train;
+  if (t.busy || game.turn() !== t.color) return false;
+  if (!game.moves({ square: from, verbose: true }).some(function(m) { return m.to === to; })) return false;
+  var keyBefore = samePositionKey(game);
+  var favorites = repertoireFavorites(repertoireData, keyBefore);
+  var lineBefore = trainLineText();
+  var move = game.move({ from: from, to: to, promotion: 'q' });
+  var grade = trainGrade(move.san, t.gapPending ? [] : favorites);
+  if (grade === 'wrong') {
+    game.undo();
+    t.mistakesAt.set(keyBefore, Date.now());
+    if (!t.turn.counted) {
+      t.turn.counted = true;
+      t.stats.quizzed++;
+      var missed = lineBefore + ' (' + favorites.join('/') + ')';
+      if (t.stats.missed.indexOf(missed) === -1) t.stats.missed.push(missed);
+    }
+    setTrainMessage(move.san + " isn't your repertoire move here. Try again.");
+    trainScheduleHint();
+    return true;
+  }
+  recordRepertoireMove(keyBefore, move);
+  noteRepertoireMoveLocally(keyBefore, move.san);
+  if (grade === 'gap') {
+    t.gapPending = false;
+    trainEndLine(move.san + ' added to your repertoire.');
+    return true;
+  }
+  if (!t.turn.counted) {
+    t.turn.counted = true;
+    t.stats.quizzed++;
+    if (!t.turn.hinted) t.stats.firstTry++;
+    else {
+      var hinted = lineBefore + ' (' + favorites.join('/') + ')';
+      if (t.stats.missed.indexOf(hinted) === -1) t.stats.missed.push(hinted);
+    }
+  }
+  viewPly = game.history().length;
+  trainStep();
+  return true;
+}
+
+trainBtn.onclick = function() {
+  if (train) stopTraining();
+  else startTraining();
 };
 
 /*
