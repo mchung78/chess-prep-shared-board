@@ -666,16 +666,112 @@ function fixedPlyShare(ply, perspective) {
 }
 
 /*
-  plies: [{ key, san, color }] - key is explorerPositionKey of the position
-  the move was played FROM, color ('w'/'b') the side that played it.
+  TASK_631: transposition store (per-user Firebase transpositions/<uid>/
+  <w|b>/<posKey>/<contributorId> = p), ported from the extension's
+  lib/transposition-store.js + lib/move-resolution.js. For each position
+  AFTER a ply it keeps every seen move order's own line probability p
+  (decision (a): the board's own value, repertoire costs included), keyed
+  by the extension's contributor id: SHA-1 hex of
+  "<SAN moves joined by ' '>:<white|black>" (lib/fen-utils.js).
+  - colored ply: the color uses the union 1 - prod(1 - p) of this line's
+    own value and every OTHER stored path, while this line's own pure
+    value is what carries forward (TASK_073: paths never contaminate each
+    other's contributions)
+  - Explorer miss (off book on this move order): if other paths reached
+    the position, their union is used and carried forward - back in book
+  - only lines scored from their own data contribute (never a recovered
+    ply), like the extension's directMatch
+  The union is the extension's heuristic (paths aren't independent
+  events), kept for parity. perspective.transpositionsFor(afterKey) returns
+  { contributorId: p } or undefined while not loaded; absent (null) means
+  no store at all (signed out, or a non-standard start position).
+*/
+var TRANSPOSITION_MAX_CONTRIBUTORS = 64;
+
+// Minimal synchronous SHA-1 (hex) over UTF-8, so contributor ids match the
+// extension's crypto.subtle digest without making scoring async.
+function sha1Hex(str) {
+  var bytes = [];
+  var utf8 = unescape(encodeURIComponent(String(str)));
+  for (var i = 0; i < utf8.length; i++) bytes.push(utf8.charCodeAt(i));
+  var bitLen = bytes.length * 8;
+  bytes.push(0x80);
+  while (bytes.length % 64 !== 56) bytes.push(0);
+  for (var s = 56; s >= 0; s -= 8) bytes.push(s >= 32 ? Math.floor(bitLen / Math.pow(2, s)) & 0xff : (bitLen >>> s) & 0xff);
+  var h0 = 0x67452301, h1 = 0xEFCDAB89, h2 = 0x98BADCFE, h3 = 0x10325476, h4 = 0xC3D2E1F0;
+  var w = new Array(80);
+  for (var off = 0; off < bytes.length; off += 64) {
+    for (var t = 0; t < 16; t++) w[t] = (bytes[off + 4 * t] << 24) | (bytes[off + 4 * t + 1] << 16) | (bytes[off + 4 * t + 2] << 8) | bytes[off + 4 * t + 3];
+    for (t = 16; t < 80; t++) { var x = w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16]; w[t] = (x << 1) | (x >>> 31); }
+    var a = h0, b = h1, c = h2, d = h3, e = h4;
+    for (t = 0; t < 80; t++) {
+      var f, k;
+      if (t < 20) { f = (b & c) | (~b & d); k = 0x5A827999; }
+      else if (t < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+      else if (t < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+      else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+      var temp = (((a << 5) | (a >>> 27)) + f + e + k + w[t]) | 0;
+      e = d; d = c; c = (b << 30) | (b >>> 2); b = a; a = temp;
+    }
+    h0 = (h0 + a) | 0; h1 = (h1 + b) | 0; h2 = (h2 + c) | 0; h3 = (h3 + d) | 0; h4 = (h4 + e) | 0;
+  }
+  return [h0, h1, h2, h3, h4].map(function(h) { return ('00000000' + (h >>> 0).toString(16)).slice(-8); }).join('');
+}
+
+function contributorIdFor(pathSan, friendlyColor) {
+  return sha1Hex(pathSan + ':' + (friendlyColor === 'b' ? 'black' : 'white'));
+}
+
+function unionProbability(ps) {
+  var none = 1;
+  for (var i = 0; i < ps.length; i++) none *= (1 - ps[i]);
+  return 1 - none;
+}
+
+function usesTranspositions(ply, perspective) {
+  return !!(perspective && perspective.transpositionsFor && ply.afterKey && typeof ply.pathSan === 'string');
+}
+
+// Stored probabilities of OTHER move orders reaching ply.afterKey
+// ([] while not loaded or none), plus this path's contributor id.
+function otherPaths(ply, perspective) {
+  var cid = contributorIdFor(ply.pathSan, perspective.friendlyColor);
+  var entry = perspective.transpositionsFor(ply.afterKey);
+  var ps = [];
+  if (entry && typeof entry === 'object') {
+    Object.keys(entry).forEach(function(id) {
+      var p = entry[id];
+      if (id !== cid && typeof p === 'number' && p > 0 && p <= 1) ps.push(p);
+    });
+  }
+  return { cid: cid, ps: ps };
+}
+
+// An Explorer miss another move order already reached: { p, paths }, else null.
+function transpositionRecovery(ply, perspective) {
+  if (!usesTranspositions(ply, perspective)) return null;
+  var others = otherPaths(ply, perspective);
+  if (others.ps.length === 0) return null;
+  return { p: unionProbability(others.ps), paths: others.ps.length };
+}
+
+/*
+  plies: [{ key, san, color[, afterKey, pathSan] }] - key is
+  explorerPositionKey of the position the move was played FROM, color
+  ('w'/'b') the side that played it, afterKey the position after it and
+  pathSan the SAN moves up to and including it (TASK_631).
   lookup(key) returns that position's stats, or undefined when not known
   (yet). perspective: optional, see above. Returns one entry per ply:
   - { state: 'colored', gamesInN, color[, plyGamesInN][, free | favorites] }
     gamesInN is the cumulative line; plyGamesInN this move alone at its
     position (when stats are known and it's in them); free / favorites
     mark our own moves scored without their Explorer share
+  - colored entries may add paths (move orders counted in the color, when
+    more than one), transposition (reached only via other move orders -
+    TASK_631) and contribution ({ afterKey, cid, p } for the store)
   - { state: 'offbook', color } - this move (or an earlier one) isn't in
-    the Explorer data; everything after an off-book move stays off book
+    the Explorer data and no other move order reached the position;
+    everything after an off-book move stays off book
   - { state: 'unknown' } - stats for this ply or an earlier one aren't
     available, so the cumulative product can't be computed yet
 */
@@ -694,15 +790,32 @@ function computeMoveRarity(plies, lookup, perspective) {
       share = fixed.share;
     } else {
       if (!stats) { status = 'unknown'; result.push({ state: 'unknown' }); continue; }
-      if (!(explorerShare > 0)) { status = 'offbook'; result.push({ state: 'offbook', color: RARITY_LEVEL_COLORS[4] }); continue; }
+      if (!(explorerShare > 0)) {
+        var recovered = transpositionRecovery(plies[i], perspective);  // TASK_631
+        if (!recovered) { status = 'offbook'; result.push({ state: 'offbook', color: RARITY_LEVEL_COLORS[4] }); continue; }
+        cumulative = recovered.p;
+        var recoveredN = Math.max(1, Math.round(1 / cumulative));
+        result.push({ state: 'colored', gamesInN: recoveredN, color: rarityColorForGamesInN(recoveredN), transposition: recovered.paths });
+        continue;
+      }
       share = explorerShare;
     }
     cumulative *= share;
-    var gamesInN = Math.max(1, Math.round(1 / cumulative));
+    var display = cumulative;
+    var paths = 1;
+    var contribution = null;
+    if (usesTranspositions(plies[i], perspective)) {  // TASK_631
+      var others = otherPaths(plies[i], perspective);
+      if (others.ps.length > 0) { display = unionProbability([cumulative].concat(others.ps)); paths = others.ps.length + 1; }
+      contribution = { afterKey: plies[i].afterKey, cid: others.cid, p: cumulative };
+    }
+    var gamesInN = Math.max(1, Math.round(1 / display));
     var entry = { state: 'colored', gamesInN: gamesInN, color: rarityColorForGamesInN(gamesInN) };
     if (explorerShare > 0) entry.plyGamesInN = Math.max(1, Math.round(1 / explorerShare));
     if (fixed && fixed.favorites > 0) entry.favorites = fixed.favorites;
     if (fixed && fixed.favorites === 0) entry.free = true;
+    if (paths > 1) entry.paths = paths;
+    if (contribution) entry.contribution = contribution;
     result.push(entry);
   }
   return result;
@@ -711,7 +824,8 @@ function computeMoveRarity(plies, lookup, perspective) {
 function rarityTooltip(entry) {
   if (!entry || entry.state === 'unknown') return '';
   if (entry.state === 'offbook') return 'Off book - not in the Lichess Explorer (blitz/rapid, 1600-2000)';
-  var text = '1 in ' + entry.gamesInN.toLocaleString('en-US') + ' games reach this line';
+  if (entry.transposition) return 'Not in the Explorer on this move order - 1 in ' + entry.gamesInN.toLocaleString('en-US') + ' games reach this position by ' + (entry.transposition === 1 ? 'another move order' : entry.transposition + ' other move orders');
+  var text = '1 in ' + entry.gamesInN.toLocaleString('en-US') + ' games reach ' + (entry.paths ? 'this position (' + entry.paths + ' move orders)' : 'this line');
   if (entry.plyGamesInN) text += ' (this move: 1 in ' + entry.plyGamesInN.toLocaleString('en-US') + ' here)';
   if (entry.free) return 'Your move - not counted. ' + text;
   if (entry.favorites === 1) return 'Your repertoire move - ' + text;
@@ -736,7 +850,7 @@ function nextRarityFetchIndex(plies, lookup, isBlocked, perspective) {
       continue;
     }
     if (stats) {
-      if (!(explorerMoveShare(stats, plies[i].san) > 0)) return optional;
+      if (!(explorerMoveShare(stats, plies[i].san) > 0) && !transpositionRecovery(plies[i], perspective)) return optional;
       continue;
     }
     if (isBlocked(plies[i].key)) return optional;
@@ -1334,6 +1448,7 @@ var repertoireRef;
 var repertoireData;
 
 function attachRepertoire(user) {
+  resetTranspositions();  // TASK_631: per sign-in cache
   if (repertoireRef) repertoireRef.off();
   repertoireRef = null;
   repertoireData = null;
@@ -1356,10 +1471,95 @@ function attachRepertoire(user) {
 // loading), which makes our own moves free.
 function currentPerspective() {
   var data = currentUser ? repertoireData : null;
+  var color = friendlyColorForOrientation(flipped);
   return {
-    friendlyColor: friendlyColorForOrientation(flipped),
+    friendlyColor: color,
     favoritesFor: data ? function(key) { return repertoireFavorites(data, key); } : null,
+    transpositionsFor: transpositionsAvailable() ? function(afterKey) { return transpositionEntry(color, afterKey); } : null,
   };
+}
+
+/*
+  TASK_631: the signed-in player's transposition store, read on demand
+  (one get per position the move list needs - the subtree grows without
+  bound, so no listener on it) and cached per sign-in. Only used when the
+  line starts from the standard start position: a line from a custom FEN
+  has probabilities relative to that FEN, which can't be mixed with the
+  rest. Declared without initializers for the same early-auth-callback
+  reason as the repertoire above.
+*/
+var transpositionCache;         // '<w|b>|<posKey>' -> { cid: p } (loaded)
+var transpositionPending;       // keys being fetched
+var transpositionWritesOff;     // set after a permission-denied write
+var transpositionRenderTimer;
+var STANDARD_START_KEY = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -';
+
+function resetTranspositions() {
+  transpositionCache = new Map();
+  transpositionPending = new Set();
+  transpositionWritesOff = false;
+}
+
+function transpositionsAvailable() {
+  return !!(firebaseReady && currentUser && transpositionCache instanceof Map &&
+    explorerPositionKey(normalizeFen(baseFen)) === STANDARD_START_KEY);
+}
+
+function transpositionPath(color, afterKey) {
+  return 'transpositions/' + currentUser.uid + '/' + color + '/' + repertoireStorageKey(afterKey);
+}
+
+function transpositionEntry(color, afterKey) {
+  return transpositionCache.get(color + '|' + afterKey);
+}
+
+function scheduleTranspositionRender() {
+  if (transpositionRenderTimer) return;
+  transpositionRenderTimer = setTimeout(function() { transpositionRenderTimer = null; renderMoveList(); }, 50);
+}
+
+function loadTranspositions(plies, color) {
+  if (!transpositionsAvailable()) return;
+  var uid = currentUser.uid;
+  plies.forEach(function(ply) {
+    var k = color + '|' + ply.afterKey;
+    if (transpositionCache.has(k) || transpositionPending.has(k)) return;
+    transpositionPending.add(k);
+    var cache = transpositionCache;
+    firebase.database().ref(transpositionPath(color, ply.afterKey)).once('value').then(function(snapshot) {
+      if (cache !== transpositionCache || !currentUser || currentUser.uid !== uid) return;  // signed out/switched meanwhile
+      cache.set(k, snapshot.val() || {});
+      scheduleTranspositionRender();
+    }, function(err) {
+      if (cache !== transpositionCache) return;
+      cache.set(k, {});  // treat as empty; don't retry in a loop
+      console.warn('Transposition store unavailable', err);
+    }).then(function() { transpositionPending.delete(k); });
+  });
+}
+
+// Decision (i): every line the board shows feeds the store, but only
+// values that changed are written, as one multi-path update per render.
+function writeTranspositions(rarity, color) {
+  if (!transpositionsAvailable() || transpositionWritesOff) return;
+  var updates = {};
+  var count = 0;
+  rarity.forEach(function(entry) {
+    var c = entry && entry.contribution;
+    if (!c) return;
+    var stored = transpositionEntry(color, c.afterKey);
+    if (!stored) return;  // not loaded yet - write once we know what's there
+    if (stored[c.cid] === c.p) return;
+    if (!(c.cid in stored) && Object.keys(stored).length >= TRANSPOSITION_MAX_CONTRIBUTORS) return;
+    stored[c.cid] = c.p;  // optimistic: renders don't re-send it
+    updates[repertoireStorageKey(c.afterKey) + '/' + c.cid] = c.p;
+    count++;
+  });
+  if (!count) return;
+  firebase.database().ref('transpositions/' + currentUser.uid + '/' + color).update(updates).catch(function(err) {
+    if (err && (err.code === 'PERMISSION_DENIED' || /permission_denied/i.test(err.message || ''))) transpositionWritesOff = true;  // not an authorized player
+    console.warn('Transposition store write failed', err);
+  });
 }
 
 // Only moves the signed-in player actively makes, for their own side.
@@ -1449,8 +1649,11 @@ function buildRarityPlies() {
   var hist = game.history();
   var plies = [];
   for (var i = 0; i < hist.length; i++) {
-    plies.push({ key: explorerPositionKey(replay.fen()), san: hist[i], color: replay.turn() });
+    var ply = { key: explorerPositionKey(replay.fen()), san: hist[i], color: replay.turn() };
     replay.move(hist[i]);
+    ply.afterKey = explorerPositionKey(replay.fen());  // TASK_631
+    ply.pathSan = hist.slice(0, i + 1).join(' ');
+    plies.push(ply);
   }
   return plies;
 }
@@ -1560,6 +1763,10 @@ function renderMoveList() {
   var perspective = currentPerspective();  // TASK_629/630
   var rarity = computeMoveRarity(plies, explorerLookup, perspective);
   pumpExplorerFetches(plies, perspective);
+  if (perspective.transpositionsFor) {  // TASK_631
+    loadTranspositions(plies, perspective.friendlyColor);
+    writeTranspositions(rarity, perspective.friendlyColor);
+  }
   var startSpan = document.createElement('span');
   startSpan.textContent = 'Start position';
   startSpan.style.cursor = 'pointer';
