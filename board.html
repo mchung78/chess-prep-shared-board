@@ -1017,6 +1017,69 @@ function trainSummaryText(stats) {
   if (stats.missed.length) parts.push('missed: ' + stats.missed.join(', '));
   return parts.join(' \u00b7 ');
 }
+
+/*
+  #648 PR 2: spaced repetition. One card per position where it's your move,
+  stored at training/<uid>/<w|b>/<posKey> = { due, interval (days), lapses,
+  lastMistake?, path } (rules: infra/rules.json). path is the SAN line from
+  the standard start position, so a card can be replayed; cards are only
+  written for lines that start there (like the transposition store).
+  Grading (#648): correct with no hint -> interval x 2.5 (min 1 day);
+  correct after a hint -> interval x 1.2; wrong -> 1 day, lapses + 1.
+*/
+var SRS_CONFIG = {
+  correctFactor: 2.5,
+  hintedFactor: 1.2,
+  minCorrectDays: 1,
+  wrongDays: 1,
+  maxIntervalDays: 365,
+};
+var SRS_DAY_MS = 24 * 60 * 60 * 1000;
+
+// result: 'correct' | 'hinted' | 'wrong'. card: the stored card or null.
+function srsNextCard(card, result, now, path, cfg) {
+  var interval = card && typeof card.interval === 'number' ? card.interval : 0;
+  var lapses = card && typeof card.lapses === 'number' ? card.lapses : 0;
+  var next = { lapses: lapses, path: path };
+  if (card && typeof card.lastMistake === 'number') next.lastMistake = card.lastMistake;
+  if (result === 'wrong') {
+    interval = cfg.wrongDays;
+    next.lapses = lapses + 1;
+    next.lastMistake = now;
+  } else if (result === 'hinted') {
+    interval = interval * cfg.hintedFactor;
+  } else {
+    interval = Math.max(cfg.minCorrectDays, interval * cfg.correctFactor);
+  }
+  next.interval = Math.min(cfg.maxIntervalDays, Math.round(interval * 1000) / 1000);
+  next.due = now + next.interval * SRS_DAY_MS;
+  return next;
+}
+
+/*
+  The line to drill next: among due cards whose path starts with the root
+  line (rootPath, space-joined SAN, '' for the start) and goes past it, the
+  one with the highest overdue-days x reach, where reach(path) is how likely
+  you are to get there (1 when unknown). Overdue days start at 1 on the due
+  date, so a just-due card still counts. Returns the card's key, or null.
+*/
+function srsPickTarget(cards, now, rootPath, reach) {
+  var best = null;
+  var bestScore = -Infinity;
+  Object.keys(cards || {}).forEach(function(key) {
+    var c = cards[key];
+    if (!c || typeof c.due !== 'number' || c.due > now || typeof c.path !== 'string') return;
+    if (rootPath) {
+      if (c.path.indexOf(rootPath + ' ') !== 0) return;
+    } else if (!c.path) return;
+    var score = ((now - c.due) / SRS_DAY_MS + 1) * reach(c.path);
+    if (score > bestScore || (score === bestScore && best !== null && c.due < cards[best].due)) {
+      best = key;
+      bestScore = score;
+    }
+  });
+  return best;
+}
 /* TASK_648_TRAIN_END */
 
 function pushSharedState() {
@@ -1383,6 +1446,7 @@ var evalDebounceFen = null;       // the fen a pending/active eval run is for - 
 var evalActiveFen = null;         // the fen the CURRENTLY DISPLAYED badge belongs to - stale-result guard once a fetch/search resolves
 var evalLastApiCallTime = 0;
 var stockfishWorker = null;       // the in-flight local worker, if any (so it can be torn down if superseded)
+var stockfishCancel = null;       // settles the in-flight local search through its own finish() - see cancelEval
 var stockfishAvailable = true;    // flips false after the engine script fails to load once - stop retrying it every Cloud Eval miss for the rest of the session
 
 try {
@@ -1482,8 +1546,11 @@ function runLocalStockfish(fen) {
       clearTimeout(hardTimeout);
       try { worker.terminate(); } catch (e) { /* ignore */ }
       if (stockfishWorker === worker) stockfishWorker = null;
+      if (stockfishCancel === cancel) stockfishCancel = null;
       resolve(result);
     }
+    function cancel() { finish(null); }
+    stockfishCancel = cancel;
 
     hardTimeout = setTimeout(function() {
       try { worker.postMessage('stop'); } catch (e) { /* ignore */ }
@@ -1564,10 +1631,10 @@ function cancelEval() {
   evalDebounceTimer = null;
   evalDebounceFen = null;
   evalActiveFen = null;
-  if (stockfishWorker) {
-    try { stockfishWorker.terminate(); } catch (e) { /* ignore */ }
-    stockfishWorker = null;
-  }
+  // Settle the in-flight search through its own finish(): terminating the
+  // worker directly left its badge-refresh interval and hard timeout
+  // running and its promise pending forever (#648 follow-up).
+  if (stockfishCancel) stockfishCancel();
 }
 
 if (analysisModeCheckbox) {
@@ -2139,6 +2206,68 @@ function updateTrainUI() {
   if (fenInput) fenInput.disabled = on;
 }
 
+// #648 PR 2: the spaced-repetition store needs a signed-in player and a
+// line from the standard start (card paths are replayed from there).
+function srsAvailable() {
+  return !!(firebaseReady && currentUser &&
+    explorerPositionKey(normalizeFen(baseFen)) === STANDARD_START_KEY);
+}
+
+function trainLoadCards(t) {
+  if (!srsAvailable()) return Promise.resolve();
+  return firebase.database().ref('training/' + currentUser.uid + '/' + t.color).once('value')
+    .then(function(snapshot) { t.cards = (snapshot && snapshot.val()) || {}; })
+    .catch(function(err) { console.warn('Training schedule unavailable', err); });
+}
+
+function trainSaveCard(t, positionKey, result, path) {
+  var sk = repertoireStorageKey(positionKey);
+  var now = Date.now();
+  var card = srsNextCard(t.cards[sk] || null, result, now, path, SRS_CONFIG);
+  t.cards[sk] = card;
+  if (!srsAvailable()) return;
+  var stored = Object.assign({}, card);
+  // the rules require lastMistake <= server time: use the server's clock
+  if (result === 'wrong') stored.lastMistake = firebase.database.ServerValue.TIMESTAMP;
+  firebase.database().ref('training/' + currentUser.uid + '/' + t.color + '/' + sk).set(stored)
+    .catch(function(err) { console.warn('Training schedule write failed', err); });
+}
+
+// How likely you are to reach the end of path from the root: the product of
+// the opponent's Explorer shares past the root, 1 where stats aren't cached.
+function trainReach(t, path) {
+  var moves = path ? path.split(' ') : [];
+  var replay = new Chess(normalizeFen(baseFen));
+  var p = 1;
+  for (var i = 0; i < moves.length; i++) {
+    if (i >= t.rootPly && replay.turn() !== t.color) {
+      var stats = explorerStats.get(explorerPositionKey(replay.fen()));
+      if (stats) p *= explorerMoveShare(stats, moves[i]);
+    }
+    if (!replay.move(moves[i])) return 0;
+  }
+  return p;
+}
+
+// At each line start: aim at the most overdue card under the root, if any.
+function trainChooseTarget(t) {
+  t.target = null;
+  if (!t.cards) return;
+  var key = srsPickTarget(t.cards, Date.now(), game.history().join(' '), function(path) { return trainReach(t, path); });
+  if (key) t.target = t.cards[key].path.split(' ');
+}
+
+// The target's next move, while this line is still following it.
+function trainTargetMove(t) {
+  if (!t.target) return null;
+  var hist = game.history();
+  if (hist.length >= t.target.length) { t.target = null; return null; }
+  for (var i = 0; i < hist.length; i++) {
+    if (hist[i] !== t.target[i]) { t.target = null; return null; }
+  }
+  return t.target[hist.length];
+}
+
 function startTraining() {
   if (train) return;
   if (!currentUser || !repertoireData) {
@@ -2163,6 +2292,8 @@ function startTraining() {
     opponentTimer: null,
     lineTimer: null,
     mistakesAt: new Map(),
+    cards: {},
+    target: null,
     stats: { lines: 0, quizzed: 0, firstTry: 0, missed: [] },
     pendingRemote: undefined,
   };
@@ -2172,7 +2303,13 @@ function startTraining() {
   if (evalBadgeEl) evalBadgeEl.style.display = 'none';
   updateTrainUI();
   render();
-  trainStep();
+  setTrainMessage('Loading your schedule...');
+  var t = train;
+  trainLoadCards(t).then(function() {
+    if (train !== t) return;
+    trainChooseTarget(t);
+    trainStep();
+  });
 }
 
 function stopTraining(message) {
@@ -2218,6 +2355,18 @@ function trainStep() {
 }
 
 async function trainOpponentMove(t, lineId) {
+  var targetMove = trainTargetMove(t);
+  if (targetMove && game.moves().indexOf(targetMove) !== -1) {
+    t.opponentTimer = setTimeout(function() {
+      if (train !== t || t.lineId !== lineId) return;
+      game.move(targetMove);
+      t.busy = false;
+      viewPly = game.history().length;
+      render();
+      trainStep();
+    }, TRAIN_CONFIG.opponentDelayMs);
+    return;
+  }
   var key = explorerPositionKey(game.fen());
   if (!explorerStats.has(key) && !explorerBlocked(key)) await fetchExplorerStats(key);
   if (train !== t || t.lineId !== lineId) return;
@@ -2257,6 +2406,7 @@ function trainEndLine(message) {
     if (train !== t || t.lineId !== lineId) return;
     while (game.history().length > t.rootPly) game.undo();
     t.gapPending = false;
+    trainChooseTarget(t);
     t.busy = false;
     viewPly = game.history().length;
     render();
@@ -2275,7 +2425,11 @@ function trainScheduleHint() {
   clearTimeout(t.hintTimer);
   t.hintSquare = null;
   var key = samePositionKey(game);
-  var delay = trainHintDelaySeconds(t.mistakesAt.get(key), Date.now(), TRAIN_CONFIG);
+  var card = t.cards[repertoireStorageKey(key)];
+  var stored = card && typeof card.lastMistake === 'number' ? card.lastMistake : undefined;
+  var session = t.mistakesAt.get(key);
+  var mistakeAt = stored === undefined ? session : session === undefined ? stored : Math.max(stored, session);
+  var delay = trainHintDelaySeconds(mistakeAt, Date.now(), TRAIN_CONFIG);
   var lineId = t.lineId;
   var ply = game.history().length;
   t.hintTimer = setTimeout(function() {
@@ -2299,6 +2453,7 @@ function trainOnUserMove(from, to) {
   var keyBefore = samePositionKey(game);
   var favorites = repertoireFavorites(repertoireData, keyBefore);
   var lineBefore = trainLineText();
+  var pathBefore = game.history().join(' ');
   var move = game.move({ from: from, to: to, promotion: 'q' });
   var grade = trainGrade(move.san, t.gapPending ? [] : favorites);
   if (grade === 'wrong') {
@@ -2307,6 +2462,7 @@ function trainOnUserMove(from, to) {
     if (!t.turn.counted) {
       t.turn.counted = true;
       t.stats.quizzed++;
+      trainSaveCard(t, keyBefore, 'wrong', pathBefore);
       var missed = lineBefore + ' (' + favorites.join('/') + ')';
       if (t.stats.missed.indexOf(missed) === -1) t.stats.missed.push(missed);
     }
@@ -2318,12 +2474,14 @@ function trainOnUserMove(from, to) {
   noteRepertoireMoveLocally(keyBefore, move.san);
   if (grade === 'gap') {
     t.gapPending = false;
+    trainSaveCard(t, keyBefore, 'correct', pathBefore);  // a new favorite: first review tomorrow
     trainEndLine(move.san + ' added to your repertoire.');
     return true;
   }
   if (!t.turn.counted) {
     t.turn.counted = true;
     t.stats.quizzed++;
+    trainSaveCard(t, keyBefore, t.turn.hinted ? 'hinted' : 'correct', pathBefore);
     if (!t.turn.hinted) t.stats.firstTry++;
     else {
       var hinted = lineBefore + ' (' + favorites.join('/') + ')';
