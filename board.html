@@ -652,7 +652,7 @@ function repertoireFavorites(data, positionKey) {
 */
 function favoriteCount(ply, perspective) {
   if (!perspective || !perspective.favoritesFor || ply.color !== perspective.friendlyColor) return 0;
-  var favorites = perspective.favoritesFor(ply.key) || [];
+  var favorites = perspective.favoritesFor(ply.posKey || ply.key) || [];  // posKey: e.p.-normalized (see samePositionKey)
   return favorites.indexOf(stripSanDecorations(ply.san)) === -1 ? 0 : favorites.length;
 }
 
@@ -1046,7 +1046,7 @@ function attemptMove(from, to) {
   var moves = game.moves({ square: from, verbose: true });
   var isLegal = moves.some(function(m) { return m.to === to; });
   if (!isLegal) return false;
-  var keyBefore = explorerPositionKey(game.fen());  // TASK_629
+  var keyBefore = samePositionKey(game);  // TASK_629 (e.p.-normalized)
   var move = game.move({ from: from, to: to, promotion: 'q' });
   if (move) recordRepertoireMove(keyBefore, move);
   return true;
@@ -1659,18 +1659,28 @@ async function pumpExplorerFetches(plies, perspective) {
   The move list as [{ key, san, color }], each key being the position the
   move was played from, replayed from baseFen.
 */
+/*
+  Key for per-user position data (repertoire - TASK_629, transposition store
+  - TASK_631): the Explorer key with a phantom en-passant square dropped
+  (transpositionPositionKey), so two move orders reaching the same position
+  share one key. Explorer lookups keep explorerPositionKey: the Worker's
+  cache is keyed by it.
+*/
+function samePositionKey(chess) {
+  var key = explorerPositionKey(chess.fen());
+  if (!/ [a-h][36]$/.test(key)) return key;  // only after a double push
+  return transpositionPositionKey(key,
+    chess.moves({ verbose: true }).some(function(m) { return m.flags.indexOf('e') !== -1; }));
+}
+
 function buildRarityPlies() {
   var replay = new Chess(normalizeFen(baseFen));
   var hist = game.history();
   var plies = [];
   for (var i = 0; i < hist.length; i++) {
-    var ply = { key: explorerPositionKey(replay.fen()), san: hist[i], color: replay.turn() };
+    var ply = { key: explorerPositionKey(replay.fen()), posKey: samePositionKey(replay), san: hist[i], color: replay.turn() };
     replay.move(hist[i]);
-    ply.afterKey = explorerPositionKey(replay.fen());  // TASK_631
-    if (/ [a-h][36]$/.test(ply.afterKey)) {  // only after a double push
-      ply.afterKey = transpositionPositionKey(ply.afterKey,
-        replay.moves({ verbose: true }).some(function(m) { return m.flags.indexOf('e') !== -1; }));
-    }
+    ply.afterKey = samePositionKey(replay);  // TASK_631
     ply.pathSan = hist.slice(0, i + 1).join(' ');
     plies.push(ply);
   }
