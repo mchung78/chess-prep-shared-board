@@ -90,6 +90,8 @@ Analysis mode
 <span id="navStatus" style="font-size:12px; color:var(--text-secondary, #aaa);"></span>
 </div>
 <div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0 0 8px; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div></div>
+<div id="repertoireNotice" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0 0 8px; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"></div>
+<button id="removeRepertoireBtn" style="display:none; margin:0 0 8px; font-size:12px;">Remove from repertoire</button>
 <div id="moveList" style="font-size:14px; line-height:1.7; max-height:200px; overflow-y:auto; color:var(--text-primary, #eee);">Start position</div>
 <details id="historyPanel" style="display:none; margin-top:12px; font-size:13px;">
 <summary style="cursor:pointer; color:var(--text-secondary, #aaa);">History <span id="historyCount"></span></summary>
@@ -1071,12 +1073,13 @@ function srsNextCard(card, result, now, path, cfg) {
   you are to get there (1 when unknown). Overdue days start at 1 on the due
   date, so a just-due card still counts. Returns the card's key, or null.
 */
-function srsPickTarget(cards, now, rootPath, reach) {
+function srsPickTarget(cards, now, rootPath, reach, pathLive) {
   var best = null;
   var bestScore = -Infinity;
   Object.keys(cards || {}).forEach(function(key) {
     var c = cards[key];
     if (!c || typeof c.due !== 'number' || c.due > now || typeof c.path !== 'string') return;
+    if (pathLive && !pathLive(c.path)) return;
     if (rootPath) {
       if (c.path.indexOf(rootPath + ' ') !== 0) return;
     } else if (!c.path) return;
@@ -1500,8 +1503,9 @@ function attemptMove(from, to) {
   var isLegal = moves.some(function(m) { return m.to === to; });
   if (!isLegal) return false;
   var keyBefore = samePositionKey(game);  // TASK_629 (e.p.-normalized)
+  var fenBefore = game.fen();
   var move = game.move({ from: from, to: to, promotion: 'q' });
-  if (move) recordRepertoireMove(keyBefore, move);
+  if (move) guardAndRecordRepertoireMove(keyBefore, fenBefore, move, false);
   return true;
 }
 
@@ -1696,6 +1700,89 @@ var evalLastApiCallTime = 0;
 var stockfishWorker = null;       // the in-flight local worker, if any (so it can be torn down if superseded)
 var stockfishCancel = null;       // settles the in-flight local search through its own finish() - see cancelEval
 var stockfishAvailable = true;    // flips false after the engine script fails to load once - stop retrying it every Cloud Eval miss for the rest of the session
+
+/* TASK_665_REPERTOIRE_GUARD_START */
+var REPERTOIRE_GUARD = { weakMoveCp: 50, multiPv: 5, localDepth: 16, localTimeMs: 2000 };
+var guardEvalCache = new Map();   // "multiPv|fen" -> pvs, null for unavailable
+var guardStockfishWorkers = new Set(); // deliberately separate from the badge's cancellation slot
+
+function trimCloudMultiPvResponse(data, limit) {
+  if (!data || !Array.isArray(data.pvs)) return null;
+  var pvs = data.pvs.slice(0, limit).map(function(pv) {
+    var move = pv && String(pv.moves || '').split(/\s+/)[0];
+    if (!move || (typeof pv.cp !== 'number' && typeof pv.mate !== 'number')) return null;
+    return { cp: typeof pv.cp === 'number' ? pv.cp : null, mate: typeof pv.mate === 'number' ? pv.mate : null, move: move };
+  }).filter(Boolean);
+  return pvs.length ? pvs : null;
+}
+
+function repertoireGuardScore(cp, mate, mover) {
+  var score = typeof mate === 'number' ? (mate > 0 ? 1000 : -1000) : Math.max(-1000, Math.min(1000, cp));
+  return mover === 'b' ? -score : score; // Cloud/local values supplied here are White-relative
+}
+
+function repertoireGuardLoss(best, played, mover) {
+  return repertoireGuardScore(best.cp, best.mate, mover) - repertoireGuardScore(played.cp, played.mate, mover);
+}
+
+async function fetchGuardCloudEval(fen) {
+  var cacheKey = REPERTOIRE_GUARD.multiPv + '|' + fen;
+  if (guardEvalCache.has(cacheKey)) return guardEvalCache.get(cacheKey);
+  var wait = ENGINE_API_DELAY_MS - (Date.now() - evalLastApiCallTime);
+  if (wait > 0) await new Promise(function(resolve) { setTimeout(resolve, wait); });
+  evalLastApiCallTime = Date.now();
+  try {
+    var response = await fetch(LICHESS_CLOUD_EVAL_URL + '?fen=' + encodeURIComponent(fen) + '&multiPv=' + REPERTOIRE_GUARD.multiPv);
+    if (!response.ok) return null;
+    var pvs = trimCloudMultiPvResponse(await response.json(), REPERTOIRE_GUARD.multiPv);
+    guardEvalCache.set(cacheKey, pvs);
+    return pvs;
+  } catch (e) { return null; }
+}
+
+function runGuardLocalEval(fen) {
+  return new Promise(function(resolve) {
+    var worker;
+    try { worker = new Worker(STOCKFISH_SCRIPT_PATH); } catch (e) { resolve(null); return; }
+    guardStockfishWorkers.add(worker);
+    var latest = null, settled = false;
+    function finish(value) {
+      if (settled) return; settled = true; clearTimeout(timer);
+      guardStockfishWorkers.delete(worker); try { worker.terminate(); } catch (e) {} resolve(value);
+    }
+    var timer = setTimeout(function() { finish(null); }, REPERTOIRE_GUARD.localTimeMs + STOCKFISH_HARD_TIMEOUT_BUFFER_MS);
+    worker.onmessage = function(ev) {
+      var line = typeof ev.data === 'string' ? ev.data : '';
+      if (line.indexOf('info') === 0) latest = parseUciScoreLine(line) || latest;
+      var best = parseUciBestmoveLine(line);
+      if (best) {
+        if (!latest) return finish(null);
+        if (fenSideToMove(fen) === 'b') { if (latest.cp !== null) latest.cp = -latest.cp; if (latest.mate !== null) latest.mate = -latest.mate; }
+        finish({ cp: latest.cp, mate: latest.mate, move: best });
+      }
+    };
+    worker.onerror = function() { finish(null); };
+    worker.postMessage('uci'); worker.postMessage('isready'); worker.postMessage('position fen ' + fen);
+    worker.postMessage('go depth ' + REPERTOIRE_GUARD.localDepth + ' movetime ' + REPERTOIRE_GUARD.localTimeMs);
+  });
+}
+
+async function evaluateRepertoireMove(fenBefore, move) {
+  var uci = move.from + move.to + (move.promotion || '');
+  var before = await fetchGuardCloudEval(fenBefore);
+  var best = before && before[0];
+  var played = before && before.filter(function(pv) { return pv.move === uci; })[0];
+  var afterGame = new Chess(fenBefore); afterGame.move({ from: move.from, to: move.to, promotion: move.promotion || 'q' });
+  if (!played) {
+    var after = await fetchGuardCloudEval(afterGame.fen());
+    if (after && after[0]) played = after[0];
+  }
+  if (!best) best = await runGuardLocalEval(fenBefore);
+  if (!played) played = await runGuardLocalEval(afterGame.fen());
+  if (!best || !played) return null;
+  return { loss: repertoireGuardLoss(best, played, move.color), bestSan: uciToSan(fenBefore, best.move) || best.move };
+}
+/* TASK_665_REPERTOIRE_GUARD_END */
 
 try {
   analysisMode = localStorage.getItem('chessPrepBoard.analysisMode') === '1';
@@ -2055,6 +2142,47 @@ function recordRepertoireMove(positionKey, move) {
     .catch(function(err) { console.warn('Repertoire write failed', err); });
 }
 
+function repertoireMoveStored(positionKey, san) {
+  var entry = repertoireData && repertoireData[repertoireStorageKey(positionKey)];
+  return !!(entry && Object.prototype.hasOwnProperty.call(entry, stripSanDecorations(san)));
+}
+
+function hideRepertoireNotice() {
+  var el = document.getElementById('repertoireNotice');
+  el.innerHTML = ''; el.style.display = 'none';
+}
+
+function setRepertoireNotice(text, keep) {
+  var el = document.getElementById('repertoireNotice');
+  el.innerHTML = ''; el.style.display = '';
+  el.appendChild(document.createTextNode(text));
+  if (keep) { var button = document.createElement('button'); button.textContent = 'Keep anyway'; button.style.marginLeft = '8px'; button.onclick = keep; el.appendChild(button); }
+}
+
+async function guardAndRecordRepertoireMove(positionKey, fenBefore, move, trainGap) {
+  if (!firebaseReady || !currentUser || move.color !== friendlyColorForOrientation(flipped)) return;
+  if (repertoireMoveStored(positionKey, move.san)) { recordRepertoireMove(positionKey, move); noteRepertoireMoveLocally(positionKey, move.san); return; }
+  var result = await evaluateRepertoireMove(fenBefore, move);
+  if (!result) { recordRepertoireMove(positionKey, move); noteRepertoireMoveLocally(positionKey, move.san); setRepertoireNotice('Added (couldn\'t check it with the engine).'); return; }
+  if (result.loss < REPERTOIRE_GUARD.weakMoveCp) { recordRepertoireMove(positionKey, move); noteRepertoireMoveLocally(positionKey, move.san); return; }
+  var amount = (result.loss / 100).toFixed(1);
+  setRepertoireNotice((trainGap ? '' : 'Not added to your repertoire: ') + stripSanDecorations(move.san) + ' is ' + amount + ' worse than ' + result.bestSan + '.', function() {
+    recordRepertoireMove(positionKey, move); noteRepertoireMoveLocally(positionKey, move.san);
+  });
+}
+
+function removeViewedRepertoireMove() {
+  var info = viewedRepertoireMove();
+  if (!info || !confirm('Remove ' + info.san + ' from your repertoire here?')) return;
+  var entry = repertoireData[info.sk];
+  delete entry[info.san];
+  if (!Object.keys(entry).length) delete repertoireData[info.sk];
+  var updates = {}; updates['repertoire/' + currentUser.uid + '/' + info.sk + '/' + info.san] = null;
+  if (!repertoireData[info.sk]) updates['training/' + currentUser.uid + '/' + info.color + '/' + info.sk] = null;
+  firebase.database().ref().update(updates).catch(function(err) { console.warn('Repertoire remove failed', err); });
+  render();
+}
+
 function explorerBlocked(key) {
   var failure = explorerFailures.get(key);
   if (!failure) return false;
@@ -2259,6 +2387,7 @@ function render() {
 */
 function renderMoveList() {
   moveListEl.innerHTML = '';
+  renderRemoveRepertoireButton();
   var hist = game.history();
   var plies = buildRarityPlies();  // TASK_620
   var perspective = currentPerspective();  // TASK_629/630
@@ -2290,6 +2419,24 @@ function renderMoveList() {
     moveListEl.appendChild(document.createTextNode('  '));
   }
 }
+
+function viewedRepertoireMove() {
+  if (train || !currentUser || !repertoireData || viewPly < 1) return null;
+  var replay = new Chess(normalizeFen(baseFen));
+  var hist = game.history();
+  for (var i = 0; i < viewPly - 1; i++) if (!replay.move(hist[i])) return null;
+  var color = replay.turn();
+  if (color !== friendlyColorForOrientation(flipped)) return null;
+  var key = samePositionKey(replay), sk = repertoireStorageKey(key), san = stripSanDecorations(hist[viewPly - 1]);
+  var entry = repertoireData[sk];
+  return entry && Object.prototype.hasOwnProperty.call(entry, san) ? { key: key, sk: sk, san: san, color: color } : null;
+}
+
+function renderRemoveRepertoireButton() {
+  var button = document.getElementById('removeRepertoireBtn');
+  button.style.display = viewedRepertoireMove() ? '' : 'none';
+}
+document.getElementById('removeRepertoireBtn').onclick = removeViewedRepertoireMove;
 
 function makeMoveSpan(san, ply, rarity) {
   var span = document.createElement('span');
@@ -2497,11 +2644,21 @@ function trainReach(t, path) {
   return p;
 }
 
+function trainPathLive(t, path) {
+  var replay = new Chess(normalizeFen(baseFen));
+  var moves = path ? path.split(' ') : [];
+  for (var i = 0; i < moves.length; i++) {
+    if (replay.turn() === t.color && repertoireFavorites(repertoireData, samePositionKey(replay)).indexOf(stripSanDecorations(moves[i])) === -1) return false;
+    if (!replay.move(moves[i])) return false;
+  }
+  return true;
+}
+
 // At each line start: aim at the most overdue card under the root, if any.
 function trainChooseTarget(t) {
   t.target = null;
   if (!t.cards) return;
-  var key = srsPickTarget(t.cards, Date.now(), game.history().join(' '), function(path) { return trainReach(t, path); });
+  var key = srsPickTarget(t.cards, Date.now(), game.history().join(' '), function(path) { return trainReach(t, path); }, function(path) { return trainPathLive(t, path); });
   if (key) t.target = t.cards[key].path.split(' ');
 }
 
@@ -2702,6 +2859,7 @@ function trainOnUserMove(from, to) {
   var favorites = repertoireFavorites(repertoireData, keyBefore);
   var lineBefore = trainLineText();
   var pathBefore = game.history().join(' ');
+  var fenBefore = game.fen();
   var move = game.move({ from: from, to: to, promotion: 'q' });
   var grade = trainGrade(move.san, t.gapPending ? [] : favorites);
   if (grade === 'wrong') {
@@ -2718,14 +2876,39 @@ function trainOnUserMove(from, to) {
     trainScheduleHint();
     return true;
   }
-  recordRepertoireMove(keyBefore, move);
-  noteRepertoireMoveLocally(keyBefore, move.san);
   if (grade === 'gap') {
-    t.gapPending = false;
-    trainSaveCard(t, keyBefore, 'correct', pathBefore);  // a new favorite: first review tomorrow
-    trainEndLine(move.san + ' added to your repertoire.');
+    t.busy = true;
+    setTrainMessage('Checking…');
+    // A rejected check (not just an unavailable eval) must not leave Train stuck busy: fail open.
+    evaluateRepertoireMove(fenBefore, move).catch(function() { return null; }).then(function(result) {
+      if (train !== t) return;
+      function keep() {
+        hideRepertoireNotice();
+        recordRepertoireMove(keyBefore, move); noteRepertoireMoveLocally(keyBefore, move.san);
+        t.gapPending = false; trainSaveCard(t, keyBefore, 'correct', pathBefore);
+        trainEndLine(move.san + ' added to your repertoire.');
+      }
+      if (!result || result.loss < REPERTOIRE_GUARD.weakMoveCp) {
+        keep();
+        if (!result) setRepertoireNotice('Added (couldn\'t check it with the engine).');
+        return;
+      }
+      game.undo(); viewPly = game.history().length; t.busy = false; render();
+      var amount = (result.loss / 100).toFixed(1);
+      setTrainMessage(move.san + ' is ' + amount + ' worse than ' + result.bestSan + '. Try another move.');
+      setRepertoireNotice('Weak move was not added.', function() {
+        // Only while this gap is still open: the same session, idle, at the same position.
+        // A stale button (another move since, the line over, training stopped) must not
+        // replay the move into whatever position the board holds now.
+        if (train !== t || t.busy || game.fen() !== fenBefore) { hideRepertoireNotice(); return; }
+        game.move(move.san); viewPly = game.history().length; keep();
+      });
+      trainScheduleHint();
+    });
     return true;
   }
+  recordRepertoireMove(keyBefore, move);
+  noteRepertoireMoveLocally(keyBefore, move.san);
   if (!t.turn.counted) {
     t.turn.counted = true;
     t.stats.quizzed++;
