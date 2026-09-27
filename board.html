@@ -92,6 +92,10 @@ Analysis mode
 <span id="navStatus" style="font-size:12px; color:var(--text-secondary, #aaa);"></span>
 </div>
 <div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0 0 8px; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div></div>
+<details id="missedPanel" style="display:none; margin:0 0 8px; font-size:13px;">
+<summary style="cursor:pointer; color:var(--text-secondary, #aaa);">Missed <span id="missedCount"></span></summary>
+<ol id="missedList" style="list-style:none; padding:0; margin:0; max-height:200px; overflow-y:auto;"></ol>
+</details>
 <div id="repertoireNotice" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0 0 8px; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"></div>
 <button id="removeRepertoireBtn" style="display:none; margin:0 0 8px; font-size:12px;">Remove from repertoire</button>
 <div id="moveList" style="font-size:14px; line-height:1.7; max-height:200px; overflow-y:auto; color:var(--text-primary, #eee);">Start position</div>
@@ -1027,7 +1031,7 @@ function trainSummaryText(stats) {
   if (stats.quizzed > 0) {
     parts.push(stats.firstTry + '/' + stats.quizzed + ' right first time (' + Math.round(100 * stats.firstTry / stats.quizzed) + '%)');
   }
-  if (stats.missed.length) parts.push('missed: ' + stats.missed.join(', '));
+  if (stats.missed.length) parts.push(stats.missed.length + ' missed');  // #675: details in the Missed list
   return parts.join(' \u00b7 ');
 }
 
@@ -2855,12 +2859,54 @@ function setTrainMessage(message) {
   if (train) trainStatsEl.textContent = trainSummaryText(train.stats);
 }
 
+/*
+  #675: missed positions, as a count in the stats line plus a collapsible
+  list styled like History. Entries are data ({ text, expected, baseFen,
+  movesSan }), deduped per session. While training they are disabled; after
+  Stop a click loads that line as the shared game through History's own
+  restore path, so the replaced game is archived and the jump can be undone.
+  The list outlives Stop and is cleared when the next session starts.
+*/
+var lastTrainMissed = [];
+
+function trainNoteMiss(t, lineText, movesSan, expected) {
+  for (var i = 0; i < t.stats.missed.length; i++) if (t.stats.missed[i].text === lineText) return;
+  t.stats.missed.push({ text: lineText, expected: expected.slice(), baseFen: baseFen, movesSan: movesSan });
+  renderMissedPanel();
+}
+
+function renderMissedPanel() {
+  var panel = document.getElementById('missedPanel');
+  if (!panel) return;
+  var entries = train ? train.stats.missed : lastTrainMissed;
+  document.getElementById('missedCount').textContent = entries.length ? '(' + entries.length + ')' : '';
+  panel.style.display = entries.length ? '' : 'none';
+  var list = document.getElementById('missedList');
+  list.textContent = '';
+  entries.forEach(function(e) {
+    var li = document.createElement('li');
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'missed-entry';
+    btn.textContent = e.text + ' \u2192 ' + e.expected.join('/');
+    btn.disabled = !!train;
+    btn.title = train ? 'Stop training to jump here' : 'Load this line as the shared game (the current one is kept in History)';
+    btn.addEventListener('click', function() {
+      if (train) return;
+      restoreHistoryEntry({ baseFen: e.baseFen, movesSan: e.movesSan });
+    });
+    li.appendChild(btn);
+    list.appendChild(li);
+  });
+}
+
 function updateTrainUI() {
   var on = !!train;
   trainBtn.textContent = on ? 'Stop training' : 'Train';
   trainBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
   ['resetBtn', 'undoBtn', 'flipBtn', 'analysisModeCheckbox'].forEach(function(id) { document.getElementById(id).disabled = on; });
   if (fenInput) fenInput.disabled = on;
+  renderMissedPanel();  // #675: entries enable/disable with training
 }
 
 // #648 PR 2: the spaced-repetition store needs a signed-in player and a
@@ -2976,7 +3022,7 @@ function startTraining() {
     target: null,
     stats: { lines: 0, quizzed: 0, firstTry: 0, missed: [] },
     pendingRemote: undefined,
-  };
+  };  // #675: its empty stats.missed is what the Missed list shows now
   selected = null;
   viewPly = game.history().length;
   cancelEval();
@@ -3007,6 +3053,7 @@ function stopTraining(message) {
   trainPanel.style.display = '';
   trainMessageEl.textContent = message || 'Training stopped.';
   trainStatsEl.textContent = 'Session: ' + trainSummaryText(t.stats);
+  lastTrainMissed = t.stats.missed;  // #675: kept after Stop, jumpable now
   updateTrainUI();
   render();
   if (t.pendingRemote !== undefined) applyRemoteState(t.pendingRemote);
@@ -3136,6 +3183,7 @@ function trainOnUserMove(from, to) {
   var keyBefore = samePositionKey(game);
   var favorites = repertoireFavorites(repertoireData, keyBefore);
   var lineBefore = trainLineText();
+  var movesBefore = game.history().join(' ');  // #675: the line to jump back to
   // Stripped SAN: the training rules' path regex rejects +/# decorations
   // (#668 - previously a card saved across a check was silently rejected).
   var pathBefore = game.history().map(stripSanDecorations).join(' ');
@@ -3149,8 +3197,7 @@ function trainOnUserMove(from, to) {
       t.turn.counted = true;
       t.stats.quizzed++;
       trainSaveCard(t, keyBefore, 'wrong', pathBefore);
-      var missed = lineBefore + ' (' + favorites.join('/') + ')';
-      if (t.stats.missed.indexOf(missed) === -1) t.stats.missed.push(missed);
+      trainNoteMiss(t, lineBefore, movesBefore, favorites);
     }
     setTrainMessage(move.san + " isn't your repertoire move here. Try again.");
     trainScheduleHint();
@@ -3195,8 +3242,7 @@ function trainOnUserMove(from, to) {
     trainSaveCard(t, keyBefore, t.turn.hinted ? 'hinted' : 'correct', pathBefore);
     if (!t.turn.hinted) t.stats.firstTry++;
     else {
-      var hinted = lineBefore + ' (' + favorites.join('/') + ')';
-      if (t.stats.missed.indexOf(hinted) === -1) t.stats.missed.push(hinted);
+      trainNoteMiss(t, lineBefore, movesBefore, favorites);
     }
   }
   viewPly = game.history().length;
