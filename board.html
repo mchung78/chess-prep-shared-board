@@ -956,6 +956,7 @@ var TRAIN_CONFIG = {
   opponentDelayMs: 700,
   lineEndPauseMs: 1500,
   maxLinePlies: 80,
+  lastMistakeToleranceMs: 60 * 1000,  // #678: server/client clock skew on lastMistake
 };
 
 function trainHintDelaySeconds(mistakeAt, now, cfg) {
@@ -1071,6 +1072,22 @@ function srsNextCard(card, result, now, path, cfg) {
   next.interval = Math.min(cfg.maxIntervalDays, Math.round(interval * 1000) / 1000);
   next.due = now + next.interval * SRS_DAY_MS;
   return next;
+}
+
+/*
+  #678: a position you answered correctly and that is not due yet is not
+  asked again - Train plays your move there for you. card: the stored card
+  or null. The last review happened at due - interval days; it was a mistake
+  when lastMistake is at or after it (within cfg.lastMistakeToleranceMs, for
+  the server-time stamp). No card (never trained), a due card, or a last
+  review that went wrong -> asked.
+*/
+function trainSkipsPosition(card, now, cfg) {
+  if (!card || typeof card.due !== 'number' || typeof card.interval !== 'number') return false;
+  if (card.due <= now) return false;
+  if (typeof card.lastMistake !== 'number') return true;
+  var reviewedAt = card.due - card.interval * SRS_DAY_MS;
+  return card.lastMistake < reviewedAt - cfg.lastMistakeToleranceMs;
 }
 
 /*
@@ -2978,6 +2995,35 @@ function trainChooseTarget(t) {
     function(path) { return trainPathLive(t, path); },
     function(sk) { return trainGameMistakeBoost(t.color, sk); });
   if (key) t.target = t.cards[key].path.split(' ');
+  // #678: with a target, positions you know and that aren't due are played
+  // for you; with none, every position is asked (extra practice).
+  t.hadTarget = !!t.target;
+}
+
+// #678: asked although you know it and it isn't due - only when nothing
+// under the root is due, so say so.
+function trainIsExtraPractice(t) {
+  if (t.hadTarget || t.gapPending) return false;
+  var card = t.cards[repertoireStorageKey(samePositionKey(game))];
+  return !!card && typeof card.due === 'number' && card.due > Date.now();
+}
+
+// #678: your move at a position you know and that isn't due - the target
+// line's move, or null (not heading to a target: the line should end).
+function trainKnownMove(t) {
+  var san = trainLegalSan(trainTargetMove(t));
+  if (!san) return null;
+  return activeFavoritesAt(game).indexOf(stripSanDecorations(san)) !== -1 ? san : null;
+}
+
+// The legal SAN matching a stored one, or null. Card paths are stored
+// without +/# (#668) while game.moves() keeps them, so compare stripped.
+function trainLegalSan(san) {
+  if (!san) return null;
+  var want = stripSanDecorations(san);
+  var legal = game.moves();
+  for (var i = 0; i < legal.length; i++) if (stripSanDecorations(legal[i]) === want) return legal[i];
+  return null;
 }
 
 // The target's next move, while this line is still following it.
@@ -3020,6 +3066,7 @@ function startTraining() {
     mistakesAt: new Map(),
     cards: {},
     target: null,
+    hadTarget: false,
     stats: { lines: 0, quizzed: 0, firstTry: 0, missed: [] },
     pendingRemote: undefined,
   };  // #675: its empty stats.missed is what the Missed list shows now
@@ -3070,12 +3117,30 @@ function trainStep() {
   if (game.turn() === t.color) {
     var atGameMistake = !t.gapPending && activeFavoritesAt(game).length === 0 && trainAtTargetEnd(t);
     if (!t.gapPending && !atGameMistake && activeFavoritesAt(game).length === 0) return trainEndLine('End of your prep here.');
+    if (!t.gapPending && !atGameMistake && t.hadTarget &&
+        trainSkipsPosition(t.cards[repertoireStorageKey(samePositionKey(game))], Date.now(), TRAIN_CONFIG)) {
+      var known = trainKnownMove(t);
+      if (!known) return trainEndLine('Line complete.');
+      t.busy = true;
+      setTrainMessage('Playing your known moves...');
+      var lineId = t.lineId;
+      t.opponentTimer = setTimeout(function() {
+        if (train !== t || t.lineId !== lineId) return;
+        game.move(known);
+        t.busy = false;
+        viewPly = game.history().length;
+        render();
+        trainStep();
+      }, TRAIN_CONFIG.opponentDelayMs);
+      return;
+    }
     if (atGameMistake) t.gapPending = true;  // #668: a game mistake with no favorite - your move fills the gap (the guard applies)
     t.turn = { hinted: false, counted: false };
     var note = trainGameMistakeNote(t);
     setTrainMessage((t.gapPending
       ? (atGameMistake ? 'Not in your repertoire - you went wrong here in a game.' : 'Not in your repertoire yet: play the move you want to keep.')
-      : 'Your move.') + (note ? ' ' + note : ''));
+      : 'Your move.') + (note ? ' ' + note : '') +
+      (trainIsExtraPractice(t) ? ' Nothing due here - extra practice.' : ''));
     trainScheduleHint();
     return;
   }
@@ -3085,8 +3150,8 @@ function trainStep() {
 }
 
 async function trainOpponentMove(t, lineId) {
-  var targetMove = trainTargetMove(t);
-  if (targetMove && game.moves().indexOf(targetMove) !== -1) {
+  var targetMove = trainLegalSan(trainTargetMove(t));  // #678: also through a check
+  if (targetMove) {
     t.opponentTimer = setTimeout(function() {
       if (train !== t || t.lineId !== lineId) return;
       game.move(targetMove);
