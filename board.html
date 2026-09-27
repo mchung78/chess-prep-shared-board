@@ -61,6 +61,7 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 <button id="undoBtn">Undo</button>
 <button id="flipBtn">Flip board</button>
 <button id="trainBtn" aria-pressed="false" title="Drill your repertoire from the position shown. Your side is the board orientation.">Train</button>
+  <button id="linkLichessBtn" style="display:none;" title="Link your Lichess account: Train drills the opening mistakes from your recent games.">Link Lichess</button>
 </div>
 <div id="repertoireStats" style="display:none; margin-top:6px; font-size:12px; color:var(--text-secondary, #aaa); white-space:pre-wrap;" title="Learned: answered cleanly on a review after its first day, with no miss since. Due: scheduled for review now."></div>
 </div>
@@ -90,7 +91,7 @@ Analysis mode
 <button id="navLiveBtn" title="Jump to the current live position (End)" aria-label="Jump to live position">Live ▶|</button>
 <span id="navStatus" style="font-size:12px; color:var(--text-secondary, #aaa);"></span>
 </div>
-<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0 0 8px; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div></div>
+<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0 0 8px; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div></div>
 <div id="repertoireNotice" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0 0 8px; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"></div>
 <button id="removeRepertoireBtn" style="display:none; margin:0 0 8px; font-size:12px;">Remove from repertoire</button>
 <div id="moveList" style="font-size:14px; line-height:1.7; max-height:200px; overflow-y:auto; color:var(--text-primary, #eee);">Start position</div>
@@ -243,6 +244,7 @@ if (firebaseReady) {
     if (!user && train) stopTraining('Signed out, so training stopped.');  // #648
     updateAuthUI();
     attachRepertoire(user);  // TASK_629
+    attachGameMistakes(user);  // #668: per-uid Lichess link + sync cursor
     if (user) pruneExpiredHistory();  // TASK_651
     // TASK_620 (Codex review of #623): a newly signed-in player can now
     // fill cache misses, so retry lookups that failed as not_cached while
@@ -1068,13 +1070,32 @@ function srsNextCard(card, result, now, path, cfg) {
 }
 
 /*
+  #668: a Lichess game mistake is a failed review of that position - the
+  same 'wrong' row srsNextCard produces - but stamped with the game's own
+  lastMoveAt (<= server time, so the rules accept it) and due immediately,
+  so it counts as overdue since the game. Returns null when a stored card
+  already covers this game (its lastMistake is not older than the game's
+  time), so the same game is never counted twice, even when two browsers
+  sync it.
+*/
+function gameMistakeCard(card, gameTime, path, cfg) {
+  if (card && typeof card.lastMistake === 'number' && card.lastMistake >= gameTime) return null;
+  var lapses = card && typeof card.lapses === 'number' ? card.lapses : 0;
+  return { lapses: lapses + 1, lastMistake: gameTime, interval: cfg.wrongDays, due: gameTime, path: path };
+}
+
+/*
   The line to drill next: among due cards whose path starts with the root
   line (rootPath, space-joined SAN, '' for the start) and goes past it, the
   one with the highest overdue-days x reach, where reach(path) is how likely
   you are to get there (1 when unknown). Overdue days start at 1 on the due
-  date, so a just-due card still counts. Returns the card's key, or null.
+  date, so a just-due card still counts. boost(key) (#668) multiplies the
+  score - a Lichess game mistake counts 5x and a plain repertoire deviation
+  2x until Train next asks that position, so they are highly prioritized
+  without always being first: a far more overdue plain card can still win.
+  Returns the card's key, or null.
 */
-function srsPickTarget(cards, now, rootPath, reach, pathLive) {
+function srsPickTarget(cards, now, rootPath, reach, pathLive, boost) {
   var best = null;
   var bestScore = -Infinity;
   Object.keys(cards || {}).forEach(function(key) {
@@ -1084,7 +1105,7 @@ function srsPickTarget(cards, now, rootPath, reach, pathLive) {
     if (rootPath) {
       if (c.path.indexOf(rootPath + ' ') !== 0) return;
     } else if (!c.path) return;
-    var score = ((now - c.due) / SRS_DAY_MS + 1) * reach(c.path);
+    var score = ((now - c.due) / SRS_DAY_MS + 1) * reach(c.path) * (boost ? boost(key) : 1);
     if (score > bestScore || (score === bestScore && best !== null && c.due < cards[best].due)) {
       best = key;
       bestScore = score;
@@ -1130,6 +1151,175 @@ function repertoireStatsText(stats, firstColour) {
   }).join('   ');
 }
 /* TASK_648_TRAIN_END */
+
+/*
+  TASK_668: drill the opening mistakes from your Lichess games. This block
+  holds the pure rules; the sync + UI glue sits with the Train session code
+  further down. A game gives at most one target: my first move (within the
+  first GAME_MISTAKES.maxPly plies) that is not an active favorite. Either
+  the position had favorites (a repertoire deviation, always counted) or it
+  had none (a book mistake, only when my move lost >= mistakeCp).
+  Kept pure so skills/chess-coach/test/board-game-mistakes.test.js can
+  extract it - sameKey (the board's samePositionKey) and ChessImpl are
+  injected, and the repertoire helpers come from the TASK_620 block.
+*/
+/* TASK_668_GAME_MISTAKES_START */
+var GAME_MISTAKES = {
+  maxPly: 20,           // my first 10 moves (a named constant - decision 4)
+  mistakeCp: 100,        // a loss at or above this counts as a mistake
+  mistakeBoost: 5,       // srsPickTarget score multiplier for a mistake (decision 2)
+  deviationBoost: 2,     // ... for a plain repertoire deviation
+  firstSyncGames: 100,   // the first sync scans the last N games (decision 5)
+  minSyncMinutes: 60,   // at most one sync per N minutes
+  recordLimit: 200,      // local game-target records kept per player
+};
+
+// analysis[i] is Lichess's eval AFTER ply i, from White's side:
+// { eval: cp } | { mate: n }. The eval before ply 0 is not included.
+// Clamp with #665's convention: +/-1000 cp, mate = +/-1000.
+function gameMistakeClamp(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  if (typeof entry.mate === 'number') return entry.mate > 0 ? 1000 : -1000;
+  if (typeof entry.eval === 'number') return Math.max(-1000, Math.min(1000, entry.eval));
+  return null;
+}
+
+// My loss in centipawns for my move at ply `ply`, from the game's own
+// server analysis: clamp(eval before my move) - clamp(eval after my move),
+// converted to my side. null when the analysis cannot measure it (ply 0,
+// missing or eval-less entries) - the caller then falls back to the engine.
+function gameAnalysisLoss(analysis, ply, myColor) {
+  if (!Array.isArray(analysis) || typeof ply !== 'number' || ply < 1) return null;
+  var before = gameMistakeClamp(analysis[ply - 1]);
+  var after = gameMistakeClamp(analysis[ply]);
+  if (before === null || after === null) return null;
+  var sign = myColor === 'b' ? -1 : 1;
+  // best is on MY move's entry (Lichess attaches it to the judged move, as
+  // the UCI to play instead), not on the entry before it.
+  return { loss: sign * (before - after), best: analysis[ply].best || null };
+}
+/* TASK_668_GAME_MISTAKES_PART2 */
+
+// Scan one Lichess game (the export's NDJSON object). Returns one of:
+//   { status: 'skip' }   non-standard, custom start, or not my game
+//   { status: 'invalid' } a move does not replay - external input, drop it
+//   { status: 'clean' }  replayed fine; every move of mine in the window
+//                        was an active favorite
+//   { status: 'candidate', myColor, ply, path, playedSan, kind, key,
+//     fenBefore, lossCp, best }
+// kind is 'repertoire' (favorites existed) or 'book' (none did). path is
+// the stripped SAN up to the position before my move - stripped because
+// the training rules' path regex rejects +/# decorations.
+function gameMistakeScan(game, username, data, ChessImpl, sameKey, cfg) {
+  if (!game || typeof game !== 'object') return { status: 'skip' };
+  if (game.variant !== 'standard' || game.initialFen) return { status: 'skip' };
+  var wanted = String(username || '').toLowerCase();
+  var players = game.players || {};
+  function userId(side) {
+    var u = players[side] && players[side].user;
+    return u ? String(u.id || '').toLowerCase() : '';
+  }
+  var myColor = null;
+  if (wanted && userId('white') === wanted) myColor = 'w';
+  else if (wanted && userId('black') === wanted) myColor = 'b';
+  if (!myColor) return { status: 'skip' };
+  var tokens = typeof game.moves === 'string' ? game.moves.trim().split(/\s+/).filter(Boolean) : [];
+  if (!tokens.length) return { status: 'skip' };
+  // Validate every move before using anything from this game.
+  var replay = new ChessImpl();
+  var sans = [];
+  for (var i = 0; i < tokens.length; i++) {
+    var move = replay.move(tokens[i]);
+    if (!move) return { status: 'invalid' };
+    sans.push(stripSanDecorations(move.san));
+  }
+  var probe = new ChessImpl();
+  for (var p = 0; p < sans.length; p++) {
+    if (probe.turn() === myColor && p < cfg.maxPly) {
+      var key = sameKey(probe);
+      var favorites = repertoireFavorites(data, key);
+      if (favorites.indexOf(sans[p]) === -1) {
+        var measured = gameAnalysisLoss(game.analysis, p, myColor);
+        return {
+          status: 'candidate',
+          myColor: myColor,
+          ply: p,
+          path: sans.slice(0, p).join(' '),
+          playedSan: sans[p],
+          kind: favorites.length ? 'repertoire' : 'book',
+          key: key,
+          fenBefore: probe.fen(),
+          lossCp: measured ? measured.loss : null,
+          best: measured ? measured.best : null,
+        };
+      }
+    }
+    if (!probe.move(sans[p])) return { status: 'invalid' };
+  }
+  return { status: 'clean' };
+}
+
+// Does the candidate count, and at what priority tier (decision 3)?
+//   'mistake'   lost >= mistakeCp (repertoire or book)
+//   'deviation' a repertoire move off my prep, below mistakeCp (or unmeasured)
+//   null        a book candidate that is not a mistake, or that could not
+//               be checked - treated as clean, never guessed
+function gameMistakeTier(kind, loss, cfg) {
+  if (kind === 'repertoire') {
+    return typeof loss === 'number' && loss >= cfg.mistakeCp ? 'mistake' : 'deviation';
+  }
+  if (typeof loss !== 'number') return null;
+  return loss >= cfg.mistakeCp ? 'mistake' : null;
+}
+
+// The local record of a game target (browser storage, per uid - decision 1).
+// loss/best are whatever the measurement found (analysis or engine).
+function gameMistakeRecord(game, scan, tier, loss, bestSan) {
+  var other = scan.myColor === 'w' ? 'black' : 'white';
+  var opponent = game.players && game.players[other] && game.players[other].user;
+  var record = {
+    gameId: game.id || null,
+    opponent: (opponent && (opponent.name || opponent.id)) || 'anonymous',
+    date: typeof game.lastMoveAt === 'number' ? game.lastMoveAt : (game.createdAt || 0),
+    played: scan.playedSan,
+    tier: tier,
+    drilled: false,
+  };
+  if (typeof loss === 'number') record.lossCp = loss;
+  if (bestSan) record.best = bestSan;
+  return record;
+}
+
+// Keep at most limit records, dropping the oldest by game date.
+function gameMistakePruneRecords(targets, limit) {
+  var keys = Object.keys(targets || {});
+  if (keys.length <= limit) return;
+  keys.sort(function(a, b) { return (targets[a].date || 0) - (targets[b].date || 0); });
+  for (var i = 0; i < keys.length - limit; i++) delete targets[keys[i]];
+}
+
+// "vs DrNykterstein, 2026-09-26: you played Bc4 here (-1.6, best Nf3)."
+// The minus sign is \u2212: this file has no <meta charset>, so a raw
+// non-ASCII literal breaks wherever it's served without a UTF-8 header.
+function gameMistakeMessage(record) {
+  if (!record || typeof record !== 'object') return null;
+  var parts = ['vs ' + record.opponent + ', ' + new Date(record.date).toISOString().slice(0, 10) +
+    ': you played ' + record.played + ' here'];
+  if (typeof record.lossCp === 'number') {
+    var amount = (Math.abs(record.lossCp) / 100).toFixed(1);
+    parts.push('(' + (record.lossCp < 0 ? '+' : '\u2212') + amount + (record.best ? ', best ' + record.best : '') + ')');
+  }
+  return parts.join(' ') + '.';
+}
+
+// "Lichess: 14 new games checked, 3 opening mistakes added to training (1 couldn't be checked)."
+function gameMistakeSummaryText(counts) {
+  var text = 'Lichess: ' + counts.games + ' new game' + (counts.games === 1 ? '' : 's') + ' checked, ' +
+    counts.added + ' opening mistake' + (counts.added === 1 ? '' : 's') + ' added to training';
+  if (counts.unchecked) text += ' (' + counts.unchecked + ' couldn\'t be checked)';
+  return text + '.';
+}
+/* TASK_668_GAME_MISTAKES_END */
 
 /*
   TASK_651: 90-day history of shared-board lines. Any write that does not
@@ -1742,6 +1932,7 @@ var stockfishAvailable = true;    // flips false after the engine script fails t
 /* TASK_665_REPERTOIRE_GUARD_START */
 var REPERTOIRE_GUARD = { weakMoveCp: 50, multiPv: 5, localDepth: 16, localTimeMs: 2000 };
 var guardEvalCache = new Map();   // "multiPv|fen" -> pvs, null for unavailable
+var guardRateLimited = false;     // set when Cloud Eval answers 429, so TASK_668's sync can stop and retry later
 var guardStockfishWorkers = new Set(); // deliberately separate from the badge's cancellation slot
 
 function trimCloudMultiPvResponse(data, limit) {
@@ -1771,7 +1962,10 @@ async function fetchGuardCloudEval(fen) {
   evalLastApiCallTime = Date.now();
   try {
     var response = await fetch(LICHESS_CLOUD_EVAL_URL + '?fen=' + encodeURIComponent(fen) + '&multiPv=' + REPERTOIRE_GUARD.multiPv);
-    if (!response.ok) return null;
+    if (!response.ok) {
+      if (response.status === 429) guardRateLimited = true;
+      return null;
+    }
     var pvs = trimCloudMultiPvResponse(await response.json(), REPERTOIRE_GUARD.multiPv);
     guardEvalCache.set(cacheKey, pvs);
     return pvs;
@@ -2065,6 +2259,7 @@ function attachRepertoire(user) {
     repertoireRef = firebase.database().ref('repertoire/' + user.uid);
     repertoireRef.on('value', function(snapshot) {
       repertoireData = snapshot.val() || {};
+      maybeSyncGameMistakes();  // #668: the game scan runs against the repertoire, so sync once it has loaded
       renderMoveList();  // also renders the #667 stats line
     }, function(err) {
       console.warn('Repertoire unavailable', err);
@@ -2730,7 +2925,12 @@ function trainPathLive(t, path) {
 function trainChooseTarget(t) {
   t.target = null;
   if (!t.cards) return;
-  var key = srsPickTarget(t.cards, Date.now(), game.history().join(' '), function(path) { return trainReach(t, path); }, function(path) { return trainPathLive(t, path); });
+  // Stripped SAN on both sides: card paths are stored stripped (#668 - the
+  // rules' path regex rejects +/#), and the board's history keeps them.
+  var key = srsPickTarget(t.cards, Date.now(), game.history().map(stripSanDecorations).join(' '),
+    function(path) { return trainReach(t, path); },
+    function(path) { return trainPathLive(t, path); },
+    function(sk) { return trainGameMistakeBoost(t.color, sk); });
   if (key) t.target = t.cards[key].path.split(' ');
 }
 
@@ -2740,7 +2940,9 @@ function trainTargetMove(t) {
   var hist = game.history();
   if (hist.length >= t.target.length) { t.target = null; return null; }
   for (var i = 0; i < hist.length; i++) {
-    if (hist[i] !== t.target[i]) { t.target = null; return null; }
+    // Compare stripped on both sides (#668): game-mistake cards store
+    // stripped SAN, the board's history keeps +/# decorations.
+    if (stripSanDecorations(hist[i]) !== stripSanDecorations(t.target[i])) { t.target = null; return null; }
   }
   return t.target[hist.length];
 }
@@ -2752,6 +2954,7 @@ function startTraining() {
     trainStatsEl.textContent = '';
     return;
   }
+  maybeSyncGameMistakes();  // #668: background, never blocks the session
   var saved = { baseFen: baseFen, history: game.history(), viewPly: viewPly };
   game = new Chess(normalizeFen(baseFen));
   for (var i = 0; i < viewPly; i++) game.move(saved.history[i]);
@@ -2818,11 +3021,14 @@ function trainStep() {
   var plies = game.history().length - t.rootPly;
   if (game.game_over() || plies >= TRAIN_CONFIG.maxLinePlies) return trainEndLine('Line complete.');
   if (game.turn() === t.color) {
-    if (!t.gapPending && activeFavoritesAt(game).length === 0) return trainEndLine('End of your prep here.');
+    var atGameMistake = !t.gapPending && activeFavoritesAt(game).length === 0 && trainAtTargetEnd(t);
+    if (!t.gapPending && !atGameMistake && activeFavoritesAt(game).length === 0) return trainEndLine('End of your prep here.');
+    if (atGameMistake) t.gapPending = true;  // #668: a game mistake with no favorite - your move fills the gap (the guard applies)
     t.turn = { hinted: false, counted: false };
-    setTrainMessage(t.gapPending
-      ? 'Not in your repertoire yet: play the move you want to keep.'
-      : 'Your move.');
+    var note = trainGameMistakeNote(t);
+    setTrainMessage((t.gapPending
+      ? (atGameMistake ? 'Not in your repertoire - you went wrong here in a game.' : 'Not in your repertoire yet: play the move you want to keep.')
+      : 'Your move.') + (note ? ' ' + note : ''));
     trainScheduleHint();
     return;
   }
@@ -2930,7 +3136,9 @@ function trainOnUserMove(from, to) {
   var keyBefore = samePositionKey(game);
   var favorites = repertoireFavorites(repertoireData, keyBefore);
   var lineBefore = trainLineText();
-  var pathBefore = game.history().join(' ');
+  // Stripped SAN: the training rules' path regex rejects +/# decorations
+  // (#668 - previously a card saved across a check was silently rejected).
+  var pathBefore = game.history().map(stripSanDecorations).join(' ');
   var fenBefore = game.fen();
   var move = game.move({ from: from, to: to, promotion: 'q' });
   var grade = trainGrade(move.san, t.gapPending ? [] : favorites);
@@ -3000,6 +3208,224 @@ trainBtn.onclick = function() {
   if (train) stopTraining();
   else startTraining();
 };
+
+/*
+  #668: the Lichess game-mistake sync. The pure rules are in the
+  TASK_668_GAME_MISTAKES block; this part fetches the recent games, measures
+  losses with the game's own server analysis or #665's evaluator (at most
+  one engine lookup per game), and writes the lapsed SRS card plus the local
+  target record. The username and sync cursor live in the browser's storage,
+  per signed-in player (decision 1) - no new Firebase path. Signed-out
+  players get nothing shown and nothing fetched.
+*/
+var linkLichessBtn = document.getElementById('linkLichessBtn');
+var trainLichessEl = document.getElementById('trainLichess');
+var gameMistakesState = null;   // per sign-in: { username, since, lastSyncAt, targets }
+var gameMistakesSyncing = false;
+
+function gameMistakesStorageKey(uid) { return 'chessPrepBoard.gameMistakes.' + uid; }
+
+function attachGameMistakes(user) {
+  gameMistakesState = null;
+  if (user) {
+    gameMistakesState = {};
+    try {
+      var stored = JSON.parse(localStorage.getItem(gameMistakesStorageKey(user.uid)) || 'null');
+      if (stored && typeof stored === 'object') gameMistakesState = stored;
+    } catch (e) { /* unreadable or corrupt - start fresh */ }
+    if (!gameMistakesState.targets || typeof gameMistakesState.targets !== 'object') gameMistakesState.targets = {};
+  }
+  updateLinkLichessUI();
+}
+
+function saveGameMistakesState() {
+  if (!currentUser || !gameMistakesState) return;
+  try {
+    localStorage.setItem(gameMistakesStorageKey(currentUser.uid), JSON.stringify(gameMistakesState));
+  } catch (e) { /* private browsing - the session still works, nothing persists */ }
+}
+
+function updateLinkLichessUI() {
+  if (!linkLichessBtn) return;
+  linkLichessBtn.style.display = currentUser ? '' : 'none';
+  linkLichessBtn.title = (currentUser && gameMistakesState && gameMistakesState.username)
+    ? 'Lichess: ' + gameMistakesState.username + '. Click to change or unlink.'
+    : 'Link your Lichess account: Train drills the opening mistakes from your recent games.';
+}
+
+if (linkLichessBtn) {
+  linkLichessBtn.addEventListener('click', function() {
+    if (!currentUser) return;
+    var current = (gameMistakesState && gameMistakesState.username) || '';
+    var name = null;
+    try { name = prompt('Your Lichess username (leave empty to unlink):', current); } catch (e) { /* sandboxed prompt */ }
+    if (name === null) return;  // cancelled
+    name = String(name).trim();
+    if (!gameMistakesState) gameMistakesState = { targets: {} };
+    if (name === current) { maybeSyncGameMistakes(); return; }
+    // A different (or removed) account starts its history from scratch.
+    if (name) gameMistakesState.username = name;
+    else delete gameMistakesState.username;
+    delete gameMistakesState.since;
+    gameMistakesState.targets = {};
+    saveGameMistakesState();
+    updateLinkLichessUI();
+    if (name) maybeSyncGameMistakes();
+  });
+}
+
+// Sync after sign-in once the repertoire has loaded, and when Train starts -
+// at most once per GAME_MISTAKES.minSyncMinutes, in the background.
+function maybeSyncGameMistakes() {
+  if (!currentUser || !repertoireData || !firebaseReady || !gameMistakesState || !gameMistakesState.username) return;
+  if (gameMistakesState.lastSyncAt && Date.now() - gameMistakesState.lastSyncAt < GAME_MISTAKES.minSyncMinutes * 60 * 1000) return;
+  if (gameMistakesSyncing) return;
+  gameMistakesSyncing = true;
+  syncGameMistakes().catch(function(err) { console.warn('Lichess game sync failed', err); })
+    .then(function() { gameMistakesSyncing = false; });
+}
+// The loss of the candidate's move, when the game's own analysis could not
+// measure it: one evaluateRepertoireMove call (#665's evaluator shares the
+// guard's caches and ENGINE_API_DELAY_MS spacing).
+async function gameMistakeMeasure(scan) {
+  var replay = new Chess(scan.fenBefore);
+  var move = replay.move(scan.playedSan);
+  if (!move) return null;
+  var result = await evaluateRepertoireMove(scan.fenBefore, {
+    from: move.from, to: move.to, promotion: move.promotion, color: scan.myColor,
+  });
+  return result ? { loss: result.loss, best: result.bestSan } : null;
+}
+
+function showGameMistakeSummary(counts) {
+  if (!trainLichessEl || !counts.games) return;
+  trainPanel.style.display = '';
+  trainLichessEl.style.display = '';
+  trainLichessEl.textContent = gameMistakeSummaryText(counts);
+}
+async function syncGameMistakes() {
+  var st = gameMistakesState;
+  var uid = currentUser && currentUser.uid;
+  if (!st || !st.username || !uid || !repertoireData) return { games: 0, added: 0, unchecked: 0 };
+  st.lastSyncAt = Date.now();  // set first, so a crash doesn't loop the sync
+  saveGameMistakesState();
+  var counts = { games: 0, added: 0, unchecked: 0 };
+  var url = 'https://lichess.org/api/games/user/' + encodeURIComponent(st.username) +
+    '?max=' + GAME_MISTAKES.firstSyncGames + '&moves=true&evals=true&opening=false&clocks=false' +
+    (st.since ? '&since=' + st.since : '');
+  var response = null;
+  try { response = await fetch(url, { headers: { 'Accept': 'application/x-ndjson' } }); } catch (e) { return counts; }
+  if (!response || !response.ok) return counts;
+  var games = [];
+  try {
+    String(await response.text()).split('\n').forEach(function(line) {
+      line = line.trim();
+      if (!line) return;
+      try { games.push(JSON.parse(line)); } catch (e) { /* skip a malformed line */ }
+    });
+  } catch (e) { return counts; }
+  games.sort(function(a, b) { return ((a && a.createdAt) || 0) - ((b && b.createdAt) || 0); });  // oldest first: the cursor only moves forward
+  var lastScannedAt = null;
+  var cardCache = {};  // myColour -> Promise of the stored cards map
+  function storedCards(color) {
+    if (!cardCache[color]) {
+      cardCache[color] = firebase.database().ref('training/' + uid + '/' + color).once('value')
+        .then(function(snapshot) { return (snapshot && snapshot.val()) || {}; })
+        .catch(function() { return {}; });
+    }
+    return cardCache[color];
+  }
+  guardRateLimited = false;
+  for (var i = 0; i < games.length; i++) {
+    var g = games[i];
+    if (!g || typeof g !== 'object' || typeof g.createdAt !== 'number') continue;
+    var scan = gameMistakeScan(g, st.username, repertoireData, Chess, samePositionKey, GAME_MISTAKES);
+    if (scan.status !== 'candidate') {
+      counts.games++;
+      lastScannedAt = g.createdAt;
+      continue;
+    }
+    var loss = null, bestSan = null;
+    if (typeof scan.lossCp === 'number') {
+      loss = scan.lossCp;
+      bestSan = scan.best ? (uciToSan(scan.fenBefore, scan.best) || scan.best) : null;
+    } else {
+      var measured = await gameMistakeMeasure(scan);
+      if (measured) { loss = measured.loss; bestSan = measured.best; }
+    }
+    if (guardRateLimited) break;  // Lichess is throttling: stop, cursor stays put, retry next sync
+    var tier = gameMistakeTier(scan.kind, loss, GAME_MISTAKES);
+    if (!tier) {
+      if (scan.kind === 'book' && loss === null) counts.unchecked++;
+      counts.games++;
+      lastScannedAt = g.createdAt;
+      continue;
+    }
+    var gameTime = typeof g.lastMoveAt === 'number' ? g.lastMoveAt : g.createdAt;
+    var sk = repertoireStorageKey(scan.key);
+    var cards = await storedCards(scan.myColor);
+    var existing = (train && train.color === scan.myColor && train.cards && train.cards[sk]) || cards[sk] || null;
+    var card = gameMistakeCard(existing, gameTime, scan.path, SRS_CONFIG);
+    if (card) {
+      try {
+        await firebase.database().ref('training/' + uid + '/' + scan.myColor + '/' + sk).set(card);
+      } catch (err) {
+        console.warn('Game mistake card write failed', err);
+        break;  // not retried past this game; the cursor stays put
+      }
+      cards[sk] = card;
+      if (train && train.color === scan.myColor && train.cards) train.cards[sk] = card;  // a running session picks it up on its next line
+      st.targets[scan.myColor + '|' + sk] = gameMistakeRecord(g, scan, tier, loss, bestSan);
+      gameMistakePruneRecords(st.targets, GAME_MISTAKES.recordLimit);
+      counts.added++;
+    }
+    counts.games++;
+    lastScannedAt = g.createdAt;
+  }
+  if (lastScannedAt !== null) st.since = lastScannedAt + 1;
+  saveGameMistakesState();
+  showGameMistakeSummary(counts);
+  return counts;
+}
+// Has the line just reached the end of its target path (the card's position,
+// mine to move at)? No stored metadata: any target that ends where I have
+// no favorite is treated as a game-mistake gap fill.
+function trainAtTargetEnd(t) {
+  if (!t.target) return false;
+  var hist = game.history();
+  if (hist.length < t.target.length) return false;
+  for (var i = 0; i < t.target.length; i++) {
+    if (stripSanDecorations(hist[i]) !== stripSanDecorations(t.target[i])) return false;
+  }
+  return true;
+}
+
+// Score boost for a game-mistake target (decision 2): a mistake outranks a
+// deviation, and both outrank an ordinary card - until Train next asks the
+// position, which ends the boost (any result).
+function trainGameMistakeBoost(color, sk) {
+  var rec = gameMistakesState && gameMistakesState.targets && gameMistakesState.targets[color + '|' + sk];
+  if (!rec || rec.drilled) return 1;
+  return rec.tier === 'mistake' ? GAME_MISTAKES.mistakeBoost : GAME_MISTAKES.deviationBoost;
+}
+
+// Marks the record drilled the first time Train asks the position, and
+// returns its message until then ("vs <opponent>, <date>: you played X
+// here (-1.6, best Y)."). Another browser without the record still has the
+// lapsed card - the position is drilled there too, just without the note.
+function trainGameMistakeNote(t) {
+  if (!gameMistakesState || !gameMistakesState.targets) return null;
+  var rec = gameMistakesState.targets[t.color + '|' + repertoireStorageKey(samePositionKey(game))];
+  if (!rec) return null;
+  var message = rec.drilled ? null : gameMistakeMessage(rec);
+  if (!rec.drilled) {
+    rec.drilled = true;
+    saveGameMistakesState();
+  }
+  return message;
+}
+
+updateLinkLichessUI();
 
 /*
   TASK_646: the FEN field imports and exports itself. It always shows the
