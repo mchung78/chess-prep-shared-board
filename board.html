@@ -91,6 +91,11 @@ Analysis mode
 </div>
 <div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0 0 8px; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div></div>
 <div id="moveList" style="font-size:14px; line-height:1.7; max-height:200px; overflow-y:auto; color:var(--text-primary, #eee);">Start position</div>
+<details id="historyPanel" style="display:none; margin-top:12px; font-size:13px;">
+<summary style="cursor:pointer; color:var(--text-secondary, #aaa);">History <span id="historyCount"></span></summary>
+<p style="margin:4px 0; font-size:12px; color:var(--text-secondary, #aaa);">Lines cleared from the shared board in the last 90 days. Click one to load it; the current game is kept here too.</p>
+<ol id="historyList" style="list-style:none; padding:0; margin:0; max-height:200px; overflow-y:auto;"></ol>
+</details>
 </div>
 </div>
 </div>
@@ -194,11 +199,13 @@ var firebaseConfig = {
   appId: "1:785376461633:web:d9d86f5562c7fd36aa57c0"
 };
 var boardRef = null;
+var boardRootRef = null;  // TASK_651: multi-path updates (state + history + startedAt)
 var firebaseReady = false;
 try {
   if (firebaseConfig.apiKey !== 'REPLACE_ME') {
     firebase.initializeApp(firebaseConfig);
-    boardRef = firebase.database().ref('board/state');
+    boardRootRef = firebase.database().ref('board');
+    boardRef = boardRootRef.child('state');
     firebaseReady = true;
   }
 } catch (e) {
@@ -233,6 +240,7 @@ if (firebaseReady) {
     if (!user && train) stopTraining('Signed out, so training stopped.');  // #648
     updateAuthUI();
     attachRepertoire(user);  // TASK_629
+    if (user) pruneExpiredHistory();  // TASK_651
     // TASK_620 (Codex review of #623): a newly signed-in player can now
     // fill cache misses, so retry lookups that failed as not_cached while
     // signed out. Guarded because this callback can fire before the
@@ -1082,6 +1090,103 @@ function srsPickTarget(cards, now, rootPath, reach) {
 }
 /* TASK_648_TRAIN_END */
 
+/*
+  TASK_651: 90-day history of shared-board lines. Any write that does not
+  simply extend the line board/state holds (Reset, FEN import, Undo, a new
+  move after undoing, restoring an entry) archives that old line first, in
+  the same multi-path update, so a clear is never saved without its archive;
+  infra/rules.json checks the archive equals the state being replaced.
+  Kept pure so skills/chess-coach/test/board-history.test.js can extract it.
+*/
+/* TASK_651_HISTORY_START */
+// A default, not a hard delete: entries past it may be pruned. Must match
+// the rules' deletion floor for board/history (7776000000 ms in infra/rules.json).
+var HISTORY_RETENTION_DAYS = 90;
+// Lines shorter than this from the standard start aren't worth keeping. A
+// custom position (FEN import) is kept even with no moves.
+var HISTORY_MIN_PLIES = 2;
+var HISTORY_DAY_MS = 24 * 60 * 60 * 1000;
+
+function sanTokens(movesSan) {
+  return movesSan ? movesSan.split(' ') : [];
+}
+
+// Is `shorter` the same line as, or the start of, `longer` (whole moves)?
+function isLinePrefix(shorter, longer) {
+  var a = sanTokens(shorter);
+  var b = sanTokens(longer);
+  if (a.length > b.length) return false;
+  for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+// Should `line` ({baseFen, movesSan}) be archived, given the entries
+// already archived ({id: {baseFen, movesSan, ...}})? Not if it is trivial,
+// or if an archived line on the same base already contains it (#651
+// decision 1: an undo/redo cycle must not archive the same line repeatedly).
+function isLineWorthArchiving(line, entries, standardFen) {
+  if (!line || typeof line.baseFen !== 'string' || typeof line.movesSan !== 'string') return false;
+  if (line.baseFen === standardFen && sanTokens(line.movesSan).length < HISTORY_MIN_PLIES) return false;
+  return !Object.keys(entries || {}).some(function(id) {
+    var e = entries[id];
+    return e && e.baseFen === line.baseFen && typeof e.movesSan === 'string' && isLinePrefix(line.movesSan, e.movesSan);
+  });
+}
+
+/*
+  What a write of `next` over the shared line `prev` (null when the board
+  was empty) must also do: archive prev, and/or start a new game (stamp
+  board/startedAt). Extending the line does neither. A new game is a
+  different base, or back to no moves (Reset); undoing or branching keeps
+  the same game going.
+*/
+function planSharedWrite(prev, next, entries, standardFen) {
+  if (!prev) return { archive: false, newGame: true };
+  var sameBase = prev.baseFen === next.baseFen;
+  if (sameBase && isLinePrefix(prev.movesSan, next.movesSan)) return { archive: false, newGame: false };
+  return {
+    archive: isLineWorthArchiving(prev, entries, standardFen),
+    newGame: !sameBase || next.movesSan === ''
+  };
+}
+
+// Entries safely past retention, by server time; a day's margin absorbs
+// clock differences, so a prune the rules would refuse is never attempted.
+function expiredHistoryIds(entries, serverNow, retentionDays) {
+  var cutoff = serverNow - (retentionDays + 1) * HISTORY_DAY_MS;
+  return Object.keys(entries || {}).filter(function(id) {
+    var e = entries[id];
+    return e && typeof e.clearedAt === 'number' && e.clearedAt < cutoff;
+  });
+}
+
+// Newest cleared first.
+function sortedHistory(entries) {
+  return Object.keys(entries || {}).map(function(id) {
+    return Object.assign({ id: id }, entries[id]);
+  }).filter(function(e) {
+    return typeof e.baseFen === 'string' && typeof e.movesSan === 'string' && typeof e.clearedAt === 'number';
+  }).sort(function(a, b) { return b.clearedAt - a.clearedAt; });
+}
+
+// "1. e4 e5 2. Nf3 Nc6 ..." - the first few moves, numbered from the base.
+function historyOpening(entry, maxPlies) {
+  var tokens = sanTokens(entry.movesSan);
+  if (!tokens.length) return 'Position only';
+  var fields = entry.baseFen.split(' ');
+  var moveNo = parseInt(fields[5], 10) || 1;
+  var white = fields[1] !== 'b';
+  var out = [];
+  var shown = tokens.slice(0, maxPlies);
+  shown.forEach(function(san, i) {
+    if (white) out.push(moveNo + '. ' + san);
+    else { out.push(i === 0 ? moveNo + '... ' + san : san); moveNo++; }
+    white = !white;
+  });
+  return out.join(' ') + (tokens.length > maxPlies ? ' \u2026' : '');
+}
+/* TASK_651_HISTORY_END */
+
 function pushSharedState() {
   if (train) return;  // #648: training is private - nothing reaches the shared board
   if (!firebaseReady || !boardRef) return;
@@ -1092,8 +1197,29 @@ function pushSharedState() {
     setSyncStatus('error', e.message);
     return;
   }
-  boardRef.set(payload).then(function() {
+  // TASK_651: archive the line being replaced, atomically with the new state.
+  var plan = planSharedWrite(sharedLine, payload, historyEntries, STANDARD_COMPARABLE_FEN);
+  var write;
+  if (!plan.archive && !plan.newGame) {
+    write = boardRef.set(payload);
+  } else {
+    var updates = { state: payload };
+    if (plan.newGame) updates.startedAt = firebase.database.ServerValue.TIMESTAMP;
+    if (plan.archive) {
+      var entry = {
+        baseFen: sharedLine.baseFen,
+        movesSan: sharedLine.movesSan,
+        clearedAt: firebase.database.ServerValue.TIMESTAMP,
+        clearedBy: currentUser ? currentUser.uid : ''
+      };
+      if (typeof sharedStartedAt === 'number') entry.activeFrom = sharedStartedAt;
+      updates['history/' + boardRootRef.child('history').push().key] = entry;
+    }
+    write = boardRootRef.update(updates);
+  }
+  write.then(function() {
     if (listenerHealthy) setSyncStatus('synced');
+    pruneExpiredHistory();  // TASK_651: this write proves we're an authorized writer
   }).catch(function(err) {
     var isPermissionDenied = err && (err.code === 'PERMISSION_DENIED' || /permission_denied/i.test(err.message || ''));
     if (isPermissionDenied) {
@@ -1148,10 +1274,114 @@ if (firebaseReady) {
   boardRef.on('value', function(snapshot) {
     listenerHealthy = true;
     var value = snapshot.val();
+    sharedLine = (value && typeof value.baseFen === 'string' && typeof value.movesSan === 'string')
+      ? { baseFen: value.baseFen, movesSan: value.movesSan } : null;  // TASK_651: what a replace archives
     if (value !== null) applyRemoteState(value);
   }, function() {
     listenerHealthy = false;
     setSyncStatus('error', 'read failed');
+  });
+}
+
+/*
+  TASK_651: shared-board history. sharedLine is the line board/state holds
+  (set by the listener above, optimistic local writes included), which is
+  what a replacing write archives; sharedStartedAt is when it started.
+*/
+var sharedLine = null;
+var sharedStartedAt = null;
+var historyEntries = {};
+var STANDARD_COMPARABLE_FEN = comparableFen(new Chess());
+var serverTimeOffset = 0;
+var historyPruned = false;
+
+function pruneExpiredHistory() {
+  if (historyPruned || !currentUser || !boardRootRef) return;
+  var ids = expiredHistoryIds(historyEntries, Date.now() + serverTimeOffset, HISTORY_RETENTION_DAYS);
+  if (!ids.length) return;
+  // Once per page load once it works; each delete stands alone, so a refused
+  // one blocks nothing. Refused (e.g. not an authorized writer): try again
+  // after the next successful shared write.
+  historyPruned = true;
+  ids.forEach(function(id) {
+    boardRootRef.child('history/' + id).remove().catch(function() { historyPruned = false; });
+  });
+}
+
+function formatHistoryTime(ms) {
+  var d = new Date(ms);
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+    d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+}
+
+function renderHistory() {
+  var list = document.getElementById('historyList');
+  var count = document.getElementById('historyCount');
+  if (!list) return;
+  var entries = sortedHistory(historyEntries);
+  count.textContent = entries.length ? '(' + entries.length + ')' : '';
+  list.textContent = '';
+  if (!entries.length) {
+    var empty = document.createElement('li');
+    empty.textContent = 'Nothing cleared yet.';
+    empty.style.color = 'var(--text-secondary, #aaa)';
+    list.appendChild(empty);
+    return;
+  }
+  entries.forEach(function(e) {
+    var li = document.createElement('li');
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'history-entry';
+    btn.dataset.id = e.id;
+    btn.title = 'Load this line as the shared game (the current one is kept in history)';
+    var plies = sanTokens(e.movesSan).length;
+    var when = (typeof e.activeFrom === 'number' ? formatHistoryTime(e.activeFrom) + ' \u2013 ' : 'until ') + formatHistoryTime(e.clearedAt);
+    btn.textContent = historyOpening(e, 6) + ' \u00b7 ' + plies + (plies === 1 ? ' ply' : ' plies') + ' \u00b7 ' + when;
+    btn.addEventListener('click', function() { restoreHistoryEntry(e); });
+    li.appendChild(btn);
+    list.appendChild(li);
+  });
+}
+
+// Load an archived line as the shared game. The push archives the current
+// game first, so a restore can itself be undone from the list.
+function restoreHistoryEntry(e) {
+  if (train) return;
+  var loaded;
+  try {
+    loaded = decodeSharedState({ schemaVersion: STATE_SCHEMA_VERSION, baseFen: e.baseFen, currentFen: replayFen(e), movesSan: e.movesSan, updatedAt: 0 });
+  } catch (err) {
+    setSyncStatus('error', 'history entry is invalid');
+    return;
+  }
+  game = loaded.game;
+  baseFen = loaded.baseFen;
+  selected = null;
+  viewPly = game.history().length;
+  render();
+  pushSharedState();
+}
+
+function replayFen(e) {
+  var g = new Chess(normalizeFen(e.baseFen));
+  sanTokens(e.movesSan).forEach(function(san) { g.move(san); });
+  return g.fen();
+}
+
+if (firebaseReady) {
+  document.getElementById('historyPanel').style.display = '';
+  boardRootRef.child('startedAt').on('value', function(snapshot) {
+    var v = snapshot.val();
+    sharedStartedAt = typeof v === 'number' ? v : null;
+  });
+  boardRootRef.child('history').on('value', function(snapshot) {
+    historyEntries = snapshot.val() || {};
+    renderHistory();
+    pruneExpiredHistory();
+  });
+  firebase.database().ref('.info/serverTimeOffset').on('value', function(snapshot) {
+    serverTimeOffset = snapshot.val() || 0;
   });
 }
 
