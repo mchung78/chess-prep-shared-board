@@ -62,6 +62,7 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 <button id="flipBtn">Flip board</button>
 <button id="trainBtn" aria-pressed="false" title="Drill your repertoire from the position shown. Your side is the board orientation.">Train</button>
 </div>
+<div id="repertoireStats" style="display:none; margin-top:6px; font-size:12px; color:var(--text-secondary, #aaa); white-space:pre-wrap;" title="Learned: answered cleanly on a review after its first day, with no miss since. Due: scheduled for review now."></div>
 </div>
 <div style="flex:1; min-width:220px;">
 <p id="turnLabel" style="font-size:14px; color:var(--text-secondary, #aaa); margin:0 0 12px;">White to move</p>
@@ -1091,6 +1092,43 @@ function srsPickTarget(cards, now, rootPath, reach, pathLive) {
   });
   return best;
 }
+/*
+  #667: repertoire statistics, per colour. total = positions where it's that
+  colour's move with at least one active favorite (several favorites at one
+  position count once, like the one-card-per-position SRS store); learned =
+  those whose card has interval >= learnedMinIntervalDays (with SRS_CONFIG:
+  answered cleanly on a review after its first day, no miss since); due =
+  those whose card is due. A card whose position has no active favorite is
+  ignored, so learned and due are always subsets of total.
+*/
+var REPERTOIRE_STATS = { learnedMinIntervalDays: 2 };
+
+function repertoireStats(repData, cardsByColour, now, cfg) {
+  var out = { w: { total: 0, learned: 0, due: 0 }, b: { total: 0, learned: 0, due: 0 } };
+  Object.keys(repData || {}).forEach(function(sk) {
+    var colour = String(sk).split(' ')[1];
+    if (colour !== 'w' && colour !== 'b') return;
+    if (!repertoireFavorites(repData, sk).length) return;
+    var s = out[colour];
+    s.total++;
+    var cards = cardsByColour && cardsByColour[colour];
+    var card = cards && cards[sk];
+    if (!card) return;
+    if (typeof card.interval === 'number' && card.interval >= cfg.learnedMinIntervalDays) s.learned++;
+    if (typeof card.due === 'number' && card.due <= now) s.due++;
+  });
+  return out;
+}
+
+// firstColour: the viewer's side, shown first. \u00b7 = middle dot (see the
+// charset note in TASK_648's doc).
+function repertoireStatsText(stats, firstColour) {
+  var order = firstColour === 'b' ? ['b', 'w'] : ['w', 'b'];
+  return 'Repertoire  ' + order.map(function(c) {
+    var s = stats[c];
+    return (c === 'w' ? 'White ' : 'Black ') + s.learned + '/' + s.total + ' learned \u00b7 ' + s.due + ' due';
+  }).join('   ');
+}
 /* TASK_648_TRAIN_END */
 
 /*
@@ -2015,9 +2053,11 @@ function explorerLookup(key) { return explorerStats.get(key); }
 */
 var repertoireRef;
 var repertoireData;
+var statsCards;  // #667: training/<uid> ({ w: {...}, b: {...} }), read once per sign-in
 
 function attachRepertoire(user) {
   resetTranspositions();  // TASK_631: per sign-in cache
+  loadStatsCards(user);  // #667
   if (repertoireRef) repertoireRef.off();
   repertoireRef = null;
   repertoireData = null;
@@ -2025,7 +2065,7 @@ function attachRepertoire(user) {
     repertoireRef = firebase.database().ref('repertoire/' + user.uid);
     repertoireRef.on('value', function(snapshot) {
       repertoireData = snapshot.val() || {};
-      renderMoveList();
+      renderMoveList();  // also renders the #667 stats line
     }, function(err) {
       console.warn('Repertoire unavailable', err);
     });
@@ -2034,6 +2074,32 @@ function attachRepertoire(user) {
   // Explorer state may not exist yet on a very early auth callback.
   if (explorerStats instanceof Map) renderMoveList();
 }
+
+// #667: the training cards behind the stats line. One owner read; Train keeps
+// it current through trainSaveCard. A failed read shows totals with nothing
+// learned rather than hiding the line.
+function loadStatsCards(user) {
+  statsCards = null;
+  if (!user || !firebaseReady) return;
+  firebase.database().ref('training/' + user.uid).once('value').then(function(snapshot) {
+    if (!currentUser || currentUser.uid !== user.uid) return;  // signed out/switched meanwhile
+    statsCards = (snapshot && snapshot.val()) || {};
+    renderRepertoireStats();
+  }).catch(function(err) {
+    console.warn('Training cards unavailable for stats', err);
+    if (currentUser && currentUser.uid === user.uid) { statsCards = {}; renderRepertoireStats(); }
+  });
+}
+
+function renderRepertoireStats() {
+  var el = document.getElementById('repertoireStats');
+  if (!el || !REPERTOIRE_STATS) return;  // an early auth callback can beat the config's initializer
+  if (!currentUser || !repertoireData) { el.style.display = 'none'; el.textContent = ''; return; }
+  var stats = repertoireStats(repertoireData, statsCards || {}, Date.now(), REPERTOIRE_STATS);
+  el.textContent = repertoireStatsText(stats, friendlyColorForOrientation(flipped));
+  el.style.display = '';
+}
+setInterval(renderRepertoireStats, 60 * 1000);  // due counts move with the clock
 
 // TASK_630: every viewer colors from their own orientation. favoritesFor
 // is null without a signed-in repertoire (spectators, signed out, still
@@ -2387,6 +2453,7 @@ function render() {
 */
 function renderMoveList() {
   moveListEl.innerHTML = '';
+  renderRepertoireStats();  // #667
   renderRemoveRepertoireButton();
   var hist = game.history();
   var plies = buildRarityPlies();  // TASK_620
@@ -2621,6 +2688,11 @@ function trainSaveCard(t, positionKey, result, path) {
   var card = srsNextCard(t.cards[sk] || null, result, now, path, SRS_CONFIG);
   t.cards[sk] = card;
   if (!srsAvailable()) return;
+  if (statsCards) {  // #667: keep the stats line current as you train
+    statsCards[t.color] = statsCards[t.color] || {};
+    statsCards[t.color][sk] = card;
+    renderRepertoireStats();
+  }
   var stored = Object.assign({}, card);
   // the rules require lastMistake <= server time: use the server's clock
   if (result === 'wrong') stored.lastMistake = firebase.database.ServerValue.TIMESTAMP;
