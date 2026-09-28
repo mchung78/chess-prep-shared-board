@@ -636,8 +636,8 @@ function explorerMoveShare(stats, san) {
   when the signed-in player actively makes a move for their own side on
   this board - never from synced/viewed games or navigation. Our side is
   the board orientation: unflipped White, flipped Black (#630 owns the
-  rest of that metric). A friendly ply matching one of k favorites costs
-  1/k instead of its Explorer share (an even split is the simple start);
+  rest of that metric). A friendly ply matching any favorite is free (share
+  1), however many favorites the position has (#640, 2026-09-27: was 1/k);
   every other ply multiplies in its Explorer share as before.
 
   RTDB keys can't contain '/', so the positionKey's '/' become '_' (never
@@ -654,7 +654,7 @@ function repertoireStorageKey(positionKey) { return String(positionKey).replace(
   played (TASK_629). A favorite is ACTIVE only while its last play is within
   FAVORITE_DECAY_DAYS of the NEWEST favorite in the same position - i.e. once
   you've kept playing something else there and haven't played this move for
-  that long, it stops counting (toward k for the 1/k cost, and for Train).
+  that long, it stops counting (as a free repertoire move, and for Train).
   Computed on read, nothing deleted: playing a decayed move again makes it
   the newest, and it's back. The newest is always active, so a position with
   favorites never ends up with none. A value that isn't a number (not
@@ -682,8 +682,9 @@ function repertoireFavorites(data, positionKey) {
   - opponent plies: always their Explorer share
   - our plies, no repertoire (signed out, spectator, still loading): free,
     the extension's convention (lib/move-resolution.js)
-  - our plies with a repertoire (TASK_629): 1/k when one of k favorites,
-    else their Explorer share (leaving your prep costs probability)
+  - our plies with a repertoire (TASK_629): free when one of the position's
+    favorites, however many there are (#640), else their Explorer share
+    (leaving your prep costs probability)
 */
 function favoriteCount(ply, perspective) {
   if (!perspective || !perspective.favoritesFor || ply.color !== perspective.friendlyColor) return 0;
@@ -692,12 +693,13 @@ function favoriteCount(ply, perspective) {
 }
 
 // { share, favorites } when the ply is scored without Explorer stats
-// (free: favorites 0; one of k favorites: share 1/k), else null.
+// (free, no repertoire: favorites 0; one of k favorites: also share 1, #640;
+// favorites: k is kept for the tooltip), else null.
 function fixedPlyShare(ply, perspective) {
   if (!perspective || ply.color !== perspective.friendlyColor) return null;
   if (!perspective.favoritesFor) return { share: 1, favorites: 0 };
   var k = favoriteCount(ply, perspective);
-  return k > 0 ? { share: 1 / k, favorites: k } : null;
+  return k > 0 ? { share: 1, favorites: k } : null;
 }
 
 /*
