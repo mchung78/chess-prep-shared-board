@@ -104,6 +104,7 @@ Analysis mode
 <p style="margin:4px 0; font-size:12px; color:var(--text-secondary, #aaa);">Lines cleared from the shared board in the last 90 days. Click one to load it; the current game is kept here too.</p>
 <ol id="historyList" style="list-style:none; padding:0; margin:0; max-height:200px; overflow-y:auto;"></ol>
 </details>
+<p id="buildStamp" style="margin:12px 0 0; font-size:11px; color:var(--text-muted, #999);"></p>
 </div>
 </div>
 </div>
@@ -119,6 +120,14 @@ Analysis mode
   why the FEN field (TASK_646; formerly the Load-FEN button) already normalizes first. This is the single
   line to edit when preloading a position - don't touch the line below.
 */
+/*
+  #693: the deployed version. The Deploy workflow's sync step
+  (.github/scripts/sync_shared_board.py) replaces the next line with the
+  chess-prep commit and its time - keep it exactly as written.
+*/
+var BOARD_BUILD = "657b442 \u00b7 2026-09-29 00:16 UTC";
+document.getElementById('buildStamp').textContent =
+  BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
 var game = INITIAL_FEN ? new Chess(normalizeFen(INITIAL_FEN)) : new Chess();
 var STANDARD_FEN = new Chess().fen();
@@ -139,6 +148,8 @@ var dragCtx = null;  // { fromSq, startX, startY, moved, ghostEl, hoverSq } whil
 var viewPly = 0;
 // #648: the running Train session, or null (see startTraining()).
 var train = null;
+// #689: the move the next render() slides into place (see playAnimatedMove()).
+var pendingMoveAnimation = null;
 var boardEl = document.getElementById('board');
 var boardPanelEl = document.getElementById('boardPanel');
 var ranksEl = document.getElementById('ranks');
@@ -166,9 +177,29 @@ function calculateSquareSize(containerWidth, availableHeight) {
 }
 /* TASK_467_BOARD_RESIZE_END */
 
+/*
+  TASK_691: the height budget is measured, not assumed. It used to be
+  innerHeight - boardTop - 64, a guess at what sits under the grid (file
+  labels, button row, page padding) that went stale once the repertoire
+  stats line (#667) was added below the buttons, giving a scrollbar at
+  ordinary window sizes. Everything below the grid inside #boardPanel, the
+  page wrapper's bottom padding, and the grid's own frame (its border: 0.5px
+  renders as a whole device pixel on each side) are independent of the
+  square size (the labels use a fixed font), so measuring them at the
+  current size is exact.
+  Changes to that content (the stats line appearing, wrapping) resize
+  #boardPanel, which the ResizeObserver below already watches.
+*/
 function resizeBoard() {
   if (!boardPanelEl || !boardEl) return;
-  var availableHeight = window.innerHeight - boardEl.getBoundingClientRect().top - 64;
+  var boardRect = boardEl.getBoundingClientRect();
+  var below = boardPanelEl.getBoundingClientRect().bottom - boardRect.bottom;
+  var layoutEl = document.getElementById('boardLayout');
+  var wrapper = (layoutEl && layoutEl.parentElement) || document.body;
+  below += parseFloat(getComputedStyle(wrapper).paddingBottom) || 0;
+  var tracks = parseFloat(getComputedStyle(boardEl).gridTemplateRows) * 8;
+  var frame = tracks > 0 ? boardRect.height - tracks : 0;
+  var availableHeight = window.innerHeight - boardRect.top - Math.ceil(below + frame);
   var squareSize = calculateSquareSize(boardPanelEl.clientWidth, availableHeight);
   document.documentElement.style.setProperty('--square-size', squareSize + 'px');
 }
@@ -399,6 +430,34 @@ function nextViewPlyOnRemoteUpdate(currentPly, wasAtLive, newHistoryLength) {
   return clampViewPly(currentPly, newHistoryLength);
 }
 /* TASK_613_VIEW_NAV_END */
+
+/* TASK_689_ANIMATION_START */
+/*
+  #689: a single move played after a delay (Train's auto-played moves)
+  slides its piece instead of jumping. Full redraws (load, navigation,
+  reset, remote sync) stay instant - only callers that request it animate.
+*/
+var PIECE_ANIMATION_MS = 180;
+
+// The pieces a chess.js verbose move slides: the mover, plus the rook
+// when castling ('k' / 'q' flags). [{ from, to }]
+function pieceAnimationSegments(move) {
+  if (!move || !move.from || !move.to) return [];
+  var segments = [{ from: move.from, to: move.to }];
+  var flags = move.flags || '';
+  var rank = move.to.charAt(1);
+  if (flags.indexOf('k') !== -1) segments.push({ from: 'h' + rank, to: 'f' + rank });
+  else if (flags.indexOf('q') !== -1) segments.push({ from: 'a' + rank, to: 'd' + rank });
+  return segments;
+}
+
+// Where a captured piece stood: the destination, except en passant.
+function capturedPieceSquare(move) {
+  if (!move || !move.captured) return null;
+  if ((move.flags || '').indexOf('e') !== -1) return move.to.charAt(0) + move.from.charAt(1);
+  return move.to;
+}
+/* TASK_689_ANIMATION_END */
 
 /*
   TASK_614: analysis-mode engine eval - Lichess Cloud Eval primary,
@@ -2566,6 +2625,67 @@ function buildRarityPlies() {
   return plies;
 }
 
+/*
+  #689: play a move on the live game and have the next render() slide it
+  into place. Use only where a move follows a pause (Train's auto-played
+  moves); everything else keeps the instant redraw.
+*/
+function playAnimatedMove(san) {
+  var move = game.move(san);
+  if (move) pendingMoveAnimation = move;
+  return move;
+}
+
+function prefersReducedMotion() {
+  return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+}
+
+// The board was just redrawn in the position after `move`: start each moved
+// piece back on its origin square and slide it home.
+function animateMoveOnBoard(move) {
+  if (PIECE_ANIMATION_MS <= 0 || prefersReducedMotion()) return;
+  var captureSq = capturedPieceSquare(move);
+  if (captureSq) {
+    var captureCell = boardEl.querySelector('[data-square="' + captureSq + '"]');
+    if (captureCell) {  // the captured piece stays put until the capturer lands on it
+      var ghost = document.createElement('span');
+      ghost.dataset.capturedGhost = 'true';
+      ghost.innerHTML = pieceSvg({ type: move.captured, color: move.color === 'w' ? 'b' : 'w' });
+      ghost.style.position = 'absolute';
+      ghost.style.inset = '0';
+      ghost.style.display = 'flex';
+      ghost.style.alignItems = 'center';
+      ghost.style.justifyContent = 'center';
+      ghost.style.pointerEvents = 'none';
+      captureCell.insertBefore(ghost, captureCell.firstChild);
+      setTimeout(function() { if (ghost.parentNode) ghost.parentNode.removeChild(ghost); }, PIECE_ANIMATION_MS);
+    }
+  }
+  pieceAnimationSegments(move).forEach(function(seg) {
+    var fromCell = boardEl.querySelector('[data-square="' + seg.from + '"]');
+    var toCell = boardEl.querySelector('[data-square="' + seg.to + '"]');
+    var piece = toCell && toCell.querySelector('span[data-from-square]');
+    if (!fromCell || !piece) return;
+    var a = fromCell.getBoundingClientRect();
+    var b = toCell.getBoundingClientRect();
+    var dx = a.left - b.left, dy = a.top - b.top;
+    if (!dx && !dy) return;
+    piece.dataset.animating = 'true';
+    piece.style.position = 'relative';
+    piece.style.zIndex = '3';
+    piece.style.transition = 'none';
+    piece.style.transform = 'translate(' + dx + 'px,' + dy + 'px)';
+    piece.getBoundingClientRect();  // commit the start position before the transition
+    piece.style.transition = 'transform ' + PIECE_ANIMATION_MS + 'ms ease-out';
+    piece.style.transform = '';
+    setTimeout(function() {
+      piece.style.transition = '';
+      piece.style.zIndex = '';
+      delete piece.dataset.animating;
+    }, PIECE_ANIMATION_MS + 20);
+  });
+}
+
 function render() {
   boardEl.innerHTML = '';
   renderCoords();
@@ -2656,6 +2776,9 @@ function render() {
   turnLabel.textContent = (displayGame.turn() === 'w' ? 'White' : 'Black') + ' to move' +
     (displayGame.in_checkmate() ? ' - checkmate' : displayGame.in_check() ? ' - check' : '') +
     (isAtLive() ? '' : ' (viewing move ' + viewPly + ' of ' + game.history().length + ')');
+  var animateMove = pendingMoveAnimation;
+  pendingMoveAnimation = null;
+  if (animateMove && isAtLive()) animateMoveOnBoard(animateMove);  // #689
   renderMoveList();
   renderNavControls();
   if (analysisMode && !train) scheduleEval(displayGame.fen());  // TASK_614: evaluate the VIEWED position, except during a drill
@@ -3128,7 +3251,7 @@ function trainStep() {
       var lineId = t.lineId;
       t.opponentTimer = setTimeout(function() {
         if (train !== t || t.lineId !== lineId) return;
-        game.move(known);
+        playAnimatedMove(known);  // #689
         t.busy = false;
         viewPly = game.history().length;
         render();
@@ -3156,7 +3279,7 @@ async function trainOpponentMove(t, lineId) {
   if (targetMove) {
     t.opponentTimer = setTimeout(function() {
       if (train !== t || t.lineId !== lineId) return;
-      game.move(targetMove);
+      playAnimatedMove(targetMove);  // #689
       t.busy = false;
       viewPly = game.history().length;
       render();
@@ -3177,7 +3300,7 @@ async function trainOpponentMove(t, lineId) {
   var pick = trainPick(choices, Math.random());
   t.opponentTimer = setTimeout(function() {
     if (train !== t || t.lineId !== lineId) return;
-    game.move(pick.san);
+    playAnimatedMove(pick.san);  // #689
     t.gapPending = pick.gap;
     t.busy = false;
     viewPly = game.history().length;
