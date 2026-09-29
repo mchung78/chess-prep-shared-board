@@ -99,6 +99,11 @@ Analysis mode
 <div id="repertoireNotice" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0 0 8px; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"></div>
 <button id="removeRepertoireBtn" style="display:none; margin:0 0 8px; font-size:12px;">Remove from repertoire</button>
 <div id="moveList" style="font-size:14px; line-height:1.7; max-height:200px; overflow-y:auto; color:var(--text-primary, #eee);">Start position</div>
+<details id="gamesPanel" style="display:none; margin-top:12px; font-size:13px;">
+<summary style="cursor:pointer; color:var(--text-secondary, #aaa);">Games <span id="gamesCount"></span></summary>
+<p style="margin:4px 0; font-size:12px; color:var(--text-secondary, #aaa);">Your Lichess games from the last <span id="gamesDays">90</span> days, newest first. Click one to load it; the current game is kept in History. <a href="#" id="gamesRefresh">Refresh</a></p>
+<ol id="gamesList" style="list-style:none; padding:0; margin:0; max-height:200px; overflow-y:auto;"></ol>
+</details>
 <details id="historyPanel" style="display:none; margin-top:12px; font-size:13px;">
 <summary style="cursor:pointer; color:var(--text-secondary, #aaa);">History <span id="historyCount"></span></summary>
 <p style="margin:4px 0; font-size:12px; color:var(--text-secondary, #aaa);">Lines cleared from the shared board in the last 90 days. Click one to load it; the current game is kept here too.</p>
@@ -125,7 +130,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "657b442 \u00b7 2026-09-29 00:16 UTC";
+var BOARD_BUILD = "fadd608 \u00b7 2026-09-29 05:05 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1364,6 +1369,7 @@ function gameMistakeRecord(game, scan, tier, loss, bestSan) {
     opponent: (opponent && (opponent.name || opponent.id)) || 'anonymous',
     date: typeof game.lastMoveAt === 'number' ? game.lastMoveAt : (game.createdAt || 0),
     played: scan.playedSan,
+    ply: scan.ply,  // #684: the Games panel opens the game just before this move
     tier: tier,
     drilled: false,
   };
@@ -1402,6 +1408,168 @@ function gameMistakeSummaryText(counts) {
   return text + '.';
 }
 /* TASK_668_GAME_MISTAKES_END */
+
+/*
+  TASK_684: the Games panel - a cached list of my recent Lichess games,
+  filled by #668's sync and kept in Firebase (lichess/<uid>/games), by age
+  only (decision 2). This block is pure (Chess is passed in) so the Node
+  harness can extract it; the fetching, Firebase and DOM parts are with
+  the #668 sync further down.
+*/
+/* TASK_684_GAMES_START */
+var GAME_CACHE = {
+  maxAgeDays: 90,       // retention, by age only (decision 2)
+  pageSize: 100,        // games per export request - keeps each call cheap
+  maxPagesPerSync: 10,  // oldest-first paging: a cap only delays, never skips
+};
+var GAME_DAY_MS = 24 * 60 * 60 * 1000;
+var GAME_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+function gameClip(text, max) {
+  text = String(text);
+  return text.length > max ? text.slice(0, max) : text;
+}
+
+// One Lichess export object -> { id, record } or null. Same filter as
+// gameMistakeScan (standard variant, standard start, my game). Moves are
+// external input: replayed with chess.js, truncated at the first illegal
+// move; a game with no legal move is skipped. movesSan keeps chess.js's
+// SAN (with +/#) so decodeSharedState accepts it as-is.
+function summarizeGame(game, username, ChessImpl) {
+  if (!game || typeof game !== 'object') return null;
+  if (game.variant !== 'standard' || game.initialFen) return null;
+  if (typeof game.id !== 'string' || !/^[A-Za-z0-9]{8}$/.test(game.id)) return null;
+  if (typeof game.createdAt !== 'number' || !(game.createdAt > 0)) return null;
+  var wanted = String(username || '').toLowerCase();
+  var players = game.players || {};
+  function userId(side) {
+    var u = players[side] && players[side].user;
+    return u ? String(u.id || '').toLowerCase() : '';
+  }
+  var color = null;
+  if (wanted && userId('white') === wanted) color = 'w';
+  else if (wanted && userId('black') === wanted) color = 'b';
+  if (!color) return null;
+  var tokens = typeof game.moves === 'string' ? game.moves.trim().split(/\s+/).filter(Boolean) : [];
+  var replay = new ChessImpl();
+  var sans = [];
+  var length = 0;
+  for (var i = 0; i < tokens.length; i++) {
+    var move = replay.move(tokens[i]);
+    if (!move) break;
+    if (length + move.san.length + 1 > 6000) break;  // the rules' movesSan cap
+    sans.push(move.san);
+    length += move.san.length + 1;
+  }
+  if (!sans.length) return null;
+  var other = players[color === 'w' ? 'black' : 'white'] || {};
+  var opponent = 'anonymous';
+  if (other.user && (other.user.name || other.user.id)) opponent = String(other.user.name || other.user.id);
+  else if (typeof other.aiLevel === 'number') opponent = 'Stockfish level ' + other.aiLevel;
+  var result = '*';
+  if (game.winner === 'white' || game.winner === 'black') {
+    result = (game.winner === 'white') === (color === 'w') ? 'win' : 'loss';
+  } else if (['created', 'started', 'aborted', 'noStart', 'unknownFinish'].indexOf(game.status) === -1 &&
+             typeof game.status === 'string') {
+    result = 'draw';
+  }
+  var word = function(v) { return typeof v === 'string' && /^[A-Za-z]{1,30}$/.test(v) ? v : 'unknown'; };
+  var record = {
+    createdAt: game.createdAt,
+    lastMoveAt: typeof game.lastMoveAt === 'number' && game.lastMoveAt > 0 ? game.lastMoveAt : game.createdAt,
+    color: color,
+    opponent: gameClip(opponent, 60),
+    result: result,
+    status: word(game.status),
+    speed: word(game.speed),
+    movesSan: sans.join(' '),
+  };
+  if (typeof other.rating === 'number' && other.rating >= 0 && other.rating <= 4000) record.opponentRating = Math.round(other.rating);
+  if (game.opening && typeof game.opening.name === 'string' && game.opening.name) record.opening = gameClip(game.opening.name, 200);
+  return { id: game.id, record: record };
+}
+
+// Merge summarized games into the cache (id -> record), without changing
+// the input. A re-fetched game replaces its cached copy unless older.
+function mergeGameCache(cache, entries) {
+  var out = {};
+  Object.keys(cache || {}).forEach(function(id) { out[id] = cache[id]; });
+  (entries || []).forEach(function(e) {
+    if (!e || !e.id || !e.record) return;
+    var have = out[e.id];
+    if (!have || !(have.lastMoveAt > e.record.lastMoveAt)) out[e.id] = e.record;
+  });
+  return out;
+}
+
+// Drop games created more than maxAgeDays before now (decision 2).
+function pruneGameCache(cache, now, cfg) {
+  var cutoff = now - cfg.maxAgeDays * GAME_DAY_MS;
+  var out = {};
+  Object.keys(cache || {}).forEach(function(id) {
+    var r = cache[id];
+    if (r && typeof r.createdAt === 'number' && r.createdAt >= cutoff) out[id] = r;
+  });
+  return out;
+}
+
+// The first page's `since`: the earlier of the cache cursor and the scan
+// cursor (a missing cache cursor = the whole retention window, which is
+// how a player linked before #684 gets backfilled), never older than the
+// retention window.
+function gameSyncFrom(link, now, cfg) {
+  var floor = now - cfg.maxAgeDays * GAME_DAY_MS;
+  var from = link && typeof link.gamesSince === 'number' ? link.gamesSince : floor;
+  if (link && typeof link.since === 'number') from = Math.min(from, link.since);
+  return Math.max(floor, from);
+}
+
+// Newest createdAt first (ties by id, so the order is stable).
+function sortedGames(cache) {
+  return Object.keys(cache || {}).map(function(id) {
+    var r = cache[id];
+    var row = { id: id };
+    Object.keys(r).forEach(function(k) { row[k] = r[k]; });
+    return row;
+  }).sort(function(a, b) { return (b.createdAt - a.createdAt) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0); });
+}
+
+// #668's target records are keyed by position; index them by game.
+function gameTargetsById(targets) {
+  var out = {};
+  Object.keys(targets || {}).forEach(function(k) {
+    var t = targets[k];
+    if (t && typeof t.gameId === 'string') out[t.gameId] = t;
+  });
+  return out;
+}
+
+// The view ply to open a game at: just before my mistake, or null (= the
+// end) when there is no target or it predates #684's stored ply.
+function gameMistakePly(id, record, targetsById) {
+  var t = targetsById && targetsById[id];
+  if (!t || typeof t.ply !== 'number' || t.ply < 0 || !record) return null;
+  var plies = String(record.movesSan || '').split(' ').filter(Boolean).length;
+  return Math.min(Math.floor(t.ply), plies);
+}
+
+// "27 Sep \u00b7 \u25cf vs Opponent (1850) \u00b7 1\u20130 win \u00b7 Italian Game \u00b7 blitz \u26a0"
+// Dates are UTC; every non-ASCII character is escaped (no <meta charset>).
+function gameRowText(id, record, targetsById) {
+  var d = new Date(record.createdAt);
+  var parts = [d.getUTCDate() + ' ' + GAME_MONTHS[d.getUTCMonth()]];
+  parts.push((record.color === 'b' ? '\u25cb' : '\u25cf') + ' vs ' + record.opponent +
+    (typeof record.opponentRating === 'number' ? ' (' + record.opponentRating + ')' : ''));
+  var whiteWon = (record.result === 'win') === (record.color === 'w');
+  var score = record.result === 'draw' ? '\u00bd\u2013\u00bd'
+    : record.result === 'win' || record.result === 'loss' ? (whiteWon ? '1\u20130' : '0\u20131') : '*';
+  parts.push(record.result === '*' ? score : score + ' ' + record.result);
+  if (record.opening) parts.push(record.opening);
+  parts.push(record.speed);
+  var text = parts.join(' \u00b7 ');
+  return targetsById && targetsById[id] ? text + ' \u26a0' : text;
+}
+/* TASK_684_GAMES_END */
 
 /*
   TASK_651: 90-day history of shared-board lines. Any write that does not
@@ -3049,6 +3217,7 @@ function updateTrainUI() {
   ['resetBtn', 'undoBtn', 'flipBtn', 'analysisModeCheckbox'].forEach(function(id) { document.getElementById(id).disabled = on; });
   if (fenInput) fenInput.disabled = on;
   renderMissedPanel();  // #675: entries enable/disable with training
+  renderGames();  // #684: so do the Games panel's rows
 }
 
 // #648 PR 2: the spaced-repetition store needs a signed-in player and a
@@ -3456,13 +3625,33 @@ trainBtn.onclick = function() {
 */
 var linkLichessBtn = document.getElementById('linkLichessBtn');
 var trainLichessEl = document.getElementById('trainLichess');
-var gameMistakesState = null;   // per sign-in: { username, since, lastSyncAt, targets }
+var gameMistakesState = null;   // per sign-in: { username, since, gamesSince, lastSyncAt, targets }
 var gameMistakesSyncing = false;
+// #684: declared without initializers, like attachRepertoire's state: the
+// auth callback may run attachGameMistakes before this part of the script.
+var gameLinkMode;      // 'firebase' (lichess/<uid>/link) | 'pending' (reading it) | else browser storage (#668)
+var gameLinkWritten;   // JSON of the link last written to Firebase
+var gamesRef;          // listener on lichess/<uid>/games
+var gamesCache;        // game id -> cached record (TASK_684 block)
+var gamesRefreshAt;    // last Refresh click - at most one forced sync a minute
+var GAME_LINK_FIELDS = ['username', 'since', 'gamesSince', 'lastSyncAt', 'unlinkedAt'];
 
 function gameMistakesStorageKey(uid) { return 'chessPrepBoard.gameMistakes.' + uid; }
 
+function gameLinkOf(st) {
+  if (!st || (!st.username && !st.unlinkedAt)) return null;
+  var link = {};
+  GAME_LINK_FIELDS.forEach(function(f) { if (st[f] !== undefined && st[f] !== null) link[f] = st[f]; });
+  return link;
+}
+
 function attachGameMistakes(user) {
   gameMistakesState = null;
+  if (gamesRef) gamesRef.off();
+  gamesRef = null;
+  gamesCache = {};
+  gameLinkMode = 'local';
+  gameLinkWritten = null;
   if (user) {
     gameMistakesState = {};
     try {
@@ -3470,15 +3659,86 @@ function attachGameMistakes(user) {
       if (stored && typeof stored === 'object') gameMistakesState = stored;
     } catch (e) { /* unreadable or corrupt - start fresh */ }
     if (!gameMistakesState.targets || typeof gameMistakesState.targets !== 'object') gameMistakesState.targets = {};
+    if (firebaseReady) {
+      gameLinkMode = 'pending';
+      loadGameLink(user);
+    }
   }
   updateLinkLichessUI();
+  renderGames();
 }
 
+// #684 decision 3: the link and cursors live in lichess/<uid>/link. A #668
+// link still in this browser's storage is copied up once and then removed
+// here, so an unlink in another browser is not undone by this one. If the
+// read fails (e.g. rules not deployed yet), this session keeps using the
+// browser-stored link, exactly as #668 did, with no Games panel.
+function loadGameLink(user) {
+  var st = gameMistakesState;
+  var root = firebase.database().ref('lichess/' + user.uid);
+  var stale = function() { return currentUser !== user || gameMistakesState !== st; };
+  function finish() {
+    if (stale()) return;
+    gameLinkMode = 'firebase';
+    saveGameMistakesState();  // drops the link fields from browser storage
+    gamesRef = root.child('games');
+    gamesRef.on('value', function(snapshot) {
+      gamesCache = (snapshot && snapshot.val()) || {};
+      renderGames();
+    }, function(err) { console.warn('Lichess games unavailable', err); });
+    updateLinkLichessUI();
+    renderGames();
+    maybeSyncGameMistakes();
+  }
+  root.child('link').once('value').then(function(snapshot) {
+    if (stale()) return null;
+    var link = snapshot && snapshot.val();
+    // A tombstone is authoritative too: without it, a browser that still has
+    // the pre-#684 local link can resurrect an account unlinked elsewhere.
+    if (link && typeof link === 'object' &&
+        (typeof link.username === 'string' || typeof link.unlinkedAt === 'number')) {
+      GAME_LINK_FIELDS.forEach(function(f) { if (link[f] !== undefined) st[f] = link[f]; else delete st[f]; });
+      gameLinkWritten = JSON.stringify(gameLinkOf(st));
+      return finish();
+    }
+    if (!st.username) return finish();
+    var up = gameLinkOf(st);
+    return root.child('link').set(up).then(function() {
+      gameLinkWritten = JSON.stringify(up);
+      finish();
+    });
+  }).catch(function(err) {
+    if (stale()) return;
+    console.warn('Lichess link unavailable in Firebase; using this browser\'s', err);
+    gameLinkMode = 'local';
+    updateLinkLichessUI();
+    renderGames();
+    maybeSyncGameMistakes();
+  });
+}
+
+// Targets always stay in browser storage (#668); the link fields go to
+// Firebase once it holds the link, and to browser storage otherwise.
 function saveGameMistakesState() {
   if (!currentUser || !gameMistakesState) return;
+  var st = gameMistakesState;
+  var local = { targets: st.targets };
+  if (gameLinkMode !== 'firebase') {
+    GAME_LINK_FIELDS.forEach(function(f) { if (st[f] !== undefined) local[f] = st[f]; });
+  }
   try {
-    localStorage.setItem(gameMistakesStorageKey(currentUser.uid), JSON.stringify(gameMistakesState));
+    localStorage.setItem(gameMistakesStorageKey(currentUser.uid), JSON.stringify(local));
   } catch (e) { /* private browsing - the session still works, nothing persists */ }
+  if (gameLinkMode === 'firebase') {
+    var link = gameLinkOf(st);
+    var json = JSON.stringify(link);
+    if (json === gameLinkWritten) return;
+    gameLinkWritten = json;
+    firebase.database().ref('lichess/' + currentUser.uid + '/link').set(link).catch(function(err) {
+      gameLinkWritten = null;
+      console.warn('Lichess link save failed', err);
+    });
+  }
 }
 
 function updateLinkLichessUI() {
@@ -3500,25 +3760,43 @@ if (linkLichessBtn) {
     if (!gameMistakesState) gameMistakesState = { targets: {} };
     if (name === current) { maybeSyncGameMistakes(); return; }
     // A different (or removed) account starts its history from scratch.
-    if (name) gameMistakesState.username = name;
-    else delete gameMistakesState.username;
+    if (name) {
+      gameMistakesState.username = name;
+      delete gameMistakesState.unlinkedAt;
+    } else {
+      delete gameMistakesState.username;
+      gameMistakesState.unlinkedAt = Date.now();
+    }
     delete gameMistakesState.since;
+    delete gameMistakesState.gamesSince;
+    delete gameMistakesState.lastSyncAt;
     gameMistakesState.targets = {};
+    if (gameLinkMode === 'firebase') {
+      // #684: the old account's games go in the same write as the new link.
+      var link = gameLinkOf(gameMistakesState);
+      gameLinkWritten = JSON.stringify(link);
+      gamesCache = {};
+      firebase.database().ref('lichess/' + currentUser.uid).update({ link: link, games: null })
+        .catch(function(err) { gameLinkWritten = null; console.warn('Lichess link change failed', err); });
+    }
     saveGameMistakesState();
     updateLinkLichessUI();
+    renderGames();
     if (name) maybeSyncGameMistakes();
   });
 }
 
 // Sync after sign-in once the repertoire has loaded, and when Train starts -
-// at most once per GAME_MISTAKES.minSyncMinutes, in the background.
-function maybeSyncGameMistakes() {
+// at most once per GAME_MISTAKES.minSyncMinutes, in the background. force
+// (the Games panel's Refresh) skips that throttle.
+function maybeSyncGameMistakes(force) {
   if (!currentUser || !repertoireData || !firebaseReady || !gameMistakesState || !gameMistakesState.username) return;
-  if (gameMistakesState.lastSyncAt && Date.now() - gameMistakesState.lastSyncAt < GAME_MISTAKES.minSyncMinutes * 60 * 1000) return;
+  if (gameLinkMode === 'pending') return;  // #684: wait for the Firebase link and cursors
+  if (!force && gameMistakesState.lastSyncAt && Date.now() - gameMistakesState.lastSyncAt < GAME_MISTAKES.minSyncMinutes * 60 * 1000) return;
   if (gameMistakesSyncing) return;
   gameMistakesSyncing = true;
   syncGameMistakes().catch(function(err) { console.warn('Lichess game sync failed', err); })
-    .then(function() { gameMistakesSyncing = false; });
+    .then(function() { gameMistakesSyncing = false; renderGames(); });
 }
 // The loss of the candidate's move, when the game's own analysis could not
 // measure it: one evaluateRepertoireMove call (#665's evaluator shares the
@@ -3539,28 +3817,103 @@ function showGameMistakeSummary(counts) {
   trainLichessEl.style.display = '';
   trainLichessEl.textContent = gameMistakeSummaryText(counts);
 }
-async function syncGameMistakes() {
-  var st = gameMistakesState;
-  var uid = currentUser && currentUser.uid;
-  if (!st || !st.username || !uid || !repertoireData) return { games: 0, added: 0, unchecked: 0 };
-  st.lastSyncAt = Date.now();  // set first, so a crash doesn't loop the sync
-  saveGameMistakesState();
-  var counts = { games: 0, added: 0, unchecked: 0 };
-  var url = 'https://lichess.org/api/games/user/' + encodeURIComponent(st.username) +
-    '?max=' + GAME_MISTAKES.firstSyncGames + '&moves=true&evals=true&opening=false&clocks=false' +
-    (st.since ? '&since=' + st.since : '');
+// One page of the Lichess games export: { games, lines } (lines counts the
+// non-empty NDJSON lines, so a malformed line still counts toward a full
+// page), or null when the request fails.
+async function fetchLichessGamesPage(url) {
   var response = null;
-  try { response = await fetch(url, { headers: { 'Accept': 'application/x-ndjson' } }); } catch (e) { return counts; }
-  if (!response || !response.ok) return counts;
+  try { response = await fetch(url, { headers: { 'Accept': 'application/x-ndjson' } }); } catch (e) { return null; }
+  if (!response || !response.ok) return null;
   var games = [];
+  var lines = 0;
   try {
     String(await response.text()).split('\n').forEach(function(line) {
       line = line.trim();
       if (!line) return;
+      lines++;
       try { games.push(JSON.parse(line)); } catch (e) { /* skip a malformed line */ }
     });
-  } catch (e) { return counts; }
-  games.sort(function(a, b) { return ((a && a.createdAt) || 0) - ((b && b.createdAt) || 0); });  // oldest first: the cursor only moves forward
+  } catch (e) { return null; }
+  return { games: games, lines: lines };
+}
+
+// Order-independent comparison: Firebase returns keys sorted.
+function gameRecordJson(r) { return r ? JSON.stringify(r, Object.keys(r).sort()) : ''; }
+
+// #684: cache every fetched game (merge, prune by age, one multi-path
+// write), then advance the cache cursor. Runs before the mistake scan,
+// which can stop early; a failed write leaves the cursor where it was.
+async function cacheFetchedGames(uid, st, games, now) {
+  var entries = games.map(function(g) { return summarizeGame(g, st.username, Chess); }).filter(Boolean);
+  var before = gamesCache || {};
+  var after = pruneGameCache(mergeGameCache(before, entries), now, GAME_CACHE);
+  var updates = {};
+  Object.keys(after).forEach(function(id) {
+    if (gameRecordJson(before[id]) !== gameRecordJson(after[id])) updates['games/' + id] = after[id];
+  });
+  Object.keys(before).forEach(function(id) { if (!after[id]) updates['games/' + id] = null; });
+  try {
+    if (Object.keys(updates).length) await firebase.database().ref('lichess/' + uid).update(updates);
+  } catch (err) {
+    console.warn('Lichess games cache write failed', err);
+    return;
+  }
+  if (gameMistakesState !== st) return;  // signed out or switched meanwhile
+  gamesCache = after;
+  if (games.length) st.gamesSince = games[games.length - 1].createdAt + 1;
+  saveGameMistakesState();
+  renderGames();
+}
+
+async function syncGameMistakes() {
+  var st = gameMistakesState;
+  var uid = currentUser && currentUser.uid;
+  if (!st || !st.username || !uid || !repertoireData) return { games: 0, added: 0, unchecked: 0 };
+  var now = Date.now();
+  st.lastSyncAt = now;  // set first, so a crash doesn't loop the sync
+  saveGameMistakesState();
+  var counts = { games: 0, added: 0, unchecked: 0 };
+  // #684: oldest first, a page at a time, from the earlier cursor (never
+  // older than the retention window), so a busy stretch is never skipped -
+  // a page cap only leaves the rest for the next sync. Without a Firebase
+  // cache there is no cache cursor: fetch from the scan cursor.
+  var cached = gameLinkMode === 'firebase';
+  var from = gameSyncFrom(cached ? st : { since: st.since, gamesSince: st.since }, now, GAME_CACHE);
+  var base = 'https://lichess.org/api/games/user/' + encodeURIComponent(st.username) +
+    '?max=' + GAME_CACHE.pageSize + '&sort=dateAsc&moves=true&evals=true&opening=true&clocks=false&since=';
+  var games = [];
+  var seen = {};
+  var fetched = false;
+  var complete = false;
+  for (var page = 0; page < GAME_CACHE.maxPagesPerSync; page++) {
+    var batch = await fetchLichessGamesPage(base + from);
+    if (!batch) break;
+    fetched = true;
+    var newest = null;
+    batch.games.forEach(function(g) {
+      if (!g || typeof g !== 'object' || typeof g.createdAt !== 'number') return;
+      if (newest === null || g.createdAt > newest) newest = g.createdAt;
+      if (typeof g.id === 'string') {
+        if (seen[g.id]) return;
+        seen[g.id] = true;
+      }
+      games.push(g);
+    });
+    if (batch.lines < GAME_CACHE.pageSize || newest === null || newest + 1 <= from) { complete = true; break; }
+    from = newest + 1;
+  }
+  if (!fetched) return counts;
+  games.sort(function(a, b) { return a.createdAt - b.createdAt; });  // oldest first: the cursors only move forward
+  if (cached) await cacheFetchedGames(uid, st, games, now);
+  // The scan skips what an earlier sync already scanned. On a first link
+  // (no scan cursor) only the newest firstSyncGames count (#668 decision 5),
+  // and only once the window has been fetched in full.
+  var scanGames;
+  if (typeof st.since === 'number') {
+    scanGames = games.filter(function(g) { return g.createdAt >= st.since; });
+  } else {
+    scanGames = complete ? games.slice(-GAME_MISTAKES.firstSyncGames) : [];
+  }
   var lastScannedAt = null;
   var cardCache = {};  // myColour -> Promise of the stored cards map
   function storedCards(color) {
@@ -3572,9 +3925,8 @@ async function syncGameMistakes() {
     return cardCache[color];
   }
   guardRateLimited = false;
-  for (var i = 0; i < games.length; i++) {
-    var g = games[i];
-    if (!g || typeof g !== 'object' || typeof g.createdAt !== 'number') continue;
+  for (var i = 0; i < scanGames.length; i++) {
+    var g = scanGames[i];
     var scan = gameMistakeScan(g, st.username, repertoireData, Chess, samePositionKey, GAME_MISTAKES);
     if (scan.status !== 'candidate') {
       counts.games++;
@@ -3621,8 +3973,99 @@ async function syncGameMistakes() {
   if (lastScannedAt !== null) st.since = lastScannedAt + 1;
   saveGameMistakesState();
   showGameMistakeSummary(counts);
+  renderGames();  // new target records add their warning marks
   return counts;
 }
+
+/*
+  #684: the Games panel. Shown when signed in with a Lichess link held in
+  Firebase; the list follows lichess/<uid>/games (a sync in another
+  browser shows up too). Rows are disabled while Train runs.
+*/
+function renderGames() {
+  var panel = document.getElementById('gamesPanel');
+  if (!panel) return;
+  var st = gameMistakesState;
+  var show = !!(currentUser && st && st.username && gameLinkMode === 'firebase');
+  panel.style.display = show ? '' : 'none';
+  if (!show) return;
+  var list = document.getElementById('gamesList');
+  var count = document.getElementById('gamesCount');
+  var days = document.getElementById('gamesDays');
+  if (days) days.textContent = String(GAME_CACHE.maxAgeDays);
+  var rows = sortedGames(pruneGameCache(gamesCache || {}, Date.now(), GAME_CACHE));
+  var targetsById = gameTargetsById(st.targets);
+  count.textContent = rows.length ? '(' + rows.length + ')' : '';
+  list.textContent = '';
+  if (!rows.length) {
+    var empty = document.createElement('li');
+    empty.textContent = 'No games yet - they appear after the next Lichess sync.';
+    empty.style.color = 'var(--text-secondary, #aaa)';
+    list.appendChild(empty);
+    return;
+  }
+  rows.forEach(function(row) {
+    var li = document.createElement('li');
+    li.style.display = 'flex';
+    li.style.gap = '6px';
+    li.style.alignItems = 'baseline';
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'games-entry';
+    btn.dataset.id = row.id;
+    btn.disabled = !!train;
+    btn.textContent = gameRowText(row.id, row, targetsById);  // display text: never innerHTML
+    btn.title = (targetsById[row.id] && gameMistakeMessage(targetsById[row.id])) ||
+      'Load this game as the shared game (the current one is kept in History)';
+    btn.addEventListener('click', function() { loadCachedGame(row.id, row, targetsById); });
+    var link = document.createElement('a');
+    link.href = 'https://lichess.org/' + encodeURIComponent(row.id);
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.title = 'Open on Lichess';
+    link.textContent = '\u2197';
+    li.appendChild(btn);
+    li.appendChild(link);
+    list.appendChild(li);
+  });
+}
+
+// Load a cached game as the shared line, the way restoreHistoryEntry does
+// (the push archives the current line to History), from my side of the
+// board, at the ply before my mistake when there is one.
+function loadCachedGame(id, record, targetsById) {
+  if (train) return;
+  var loaded;
+  try {
+    var replay = new Chess();
+    var tokens = String(record.movesSan || '').split(' ').filter(Boolean);
+    tokens.forEach(function(san) { if (!replay.move(san)) throw new Error('illegal move'); });
+    loaded = decodeSharedState({ schemaVersion: STATE_SCHEMA_VERSION, baseFen: new Chess().fen(),
+      currentFen: replay.fen(), movesSan: tokens.join(' '), updatedAt: 0 });
+  } catch (err) {
+    setSyncStatus('error', 'cached game is invalid');
+    return;
+  }
+  game = loaded.game;
+  baseFen = loaded.baseFen;
+  selected = null;
+  flipped = record.color === 'b';
+  var ply = gameMistakePly(id, record, targetsById);
+  viewPly = ply === null ? game.history().length : ply;
+  render();
+  pushSharedState();
+}
+
+var gamesRefreshEl = document.getElementById('gamesRefresh');
+if (gamesRefreshEl) {
+  gamesRefreshEl.addEventListener('click', function(ev) {
+    ev.preventDefault();
+    if (gamesRefreshAt && Date.now() - gamesRefreshAt < 60 * 1000) return;
+    gamesRefreshAt = Date.now();
+    maybeSyncGameMistakes(true);
+  });
+}
+
 // Has the line just reached the end of its target path (the card's position,
 // mine to move at)? No stored metadata: any target that ends where I have
 // no favorite is treated as a game-mistake gap fill.
