@@ -130,7 +130,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "f1ea38c \u00b7 2026-09-29 05:18 UTC";
+var BOARD_BUILD = "eb1ed67 \u00b7 2026-09-29 05:57 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -664,11 +664,17 @@ var RARITY_LEVEL1_MAX = 100;
 var RARITY_LEVEL2_MAX = 500;
 var RARITY_LEVEL3_MAX = 2500;
 
+// #701: the level (1 green .. 4 purple) behind the color, so Train can
+// order by it.
+function rarityLevelForGamesInN(gamesInN) {
+  if (gamesInN <= RARITY_LEVEL1_MAX) return 1;
+  if (gamesInN <= RARITY_LEVEL2_MAX) return 2;
+  if (gamesInN <= RARITY_LEVEL3_MAX) return 3;
+  return 4;
+}
+
 function rarityColorForGamesInN(gamesInN) {
-  if (gamesInN <= RARITY_LEVEL1_MAX) return RARITY_LEVEL_COLORS[1];
-  if (gamesInN <= RARITY_LEVEL2_MAX) return RARITY_LEVEL_COLORS[2];
-  if (gamesInN <= RARITY_LEVEL3_MAX) return RARITY_LEVEL_COLORS[3];
-  return RARITY_LEVEL_COLORS[4];
+  return RARITY_LEVEL_COLORS[rarityLevelForGamesInN(gamesInN)];
 }
 
 // The Worker's cache key and the Explorer both ignore move counters, so
@@ -1126,6 +1132,7 @@ function srsNextCard(card, result, now, path, cfg) {
   var lapses = card && typeof card.lapses === 'number' ? card.lapses : 0;
   var next = { lapses: lapses, path: path };
   if (card && typeof card.lastMistake === 'number') next.lastMistake = card.lastMistake;
+  if (card && trainValidProbability(card.p)) next.p = card.p;  // #701: kept until a fresher value is known
   if (result === 'wrong') {
     interval = cfg.wrongDays;
     next.lapses = lapses + 1;
@@ -1168,7 +1175,48 @@ function trainSkipsPosition(card, now, cfg) {
 function gameMistakeCard(card, gameTime, path, cfg) {
   if (card && typeof card.lastMistake === 'number' && card.lastMistake >= gameTime) return null;
   var lapses = card && typeof card.lapses === 'number' ? card.lapses : 0;
-  return { lapses: lapses + 1, lastMistake: gameTime, interval: cfg.wrongDays, due: gameTime, path: path };
+  var next = { lapses: lapses + 1, lastMistake: gameTime, interval: cfg.wrongDays, due: gameTime, path: path };
+  if (card && trainValidProbability(card.p)) next.p = card.p;  // #701
+  return next;
+}
+
+/*
+  #701: the probability level (1 green .. 4 purple, TASK_620's thresholds)
+  of a card's position, from computeMoveRarity's entries for its path: the
+  last entry's level, 4 when off book, null when the stats to score it
+  aren't known yet (or the path is empty).
+*/
+var TRAIN_LEVEL_CONFIG = {
+  unknownLevel: 1,  // an unscored card competes as green, so it is never starved while stats load
+};
+
+function trainPositionLevel(rarity) {
+  var last = rarity && rarity.length ? rarity[rarity.length - 1] : null;
+  if (!last) return null;
+  if (last.state === 'offbook') return 4;
+  if (last.state === 'colored' && typeof last.gamesInN === 'number') return rarityLevelForGamesInN(last.gamesInN);
+  return null;
+}
+
+/*
+  #701 (decision (c), Michael 2026-09-29): each card also stores p, its
+  position's probability when it was last reviewed, so a fresh page can
+  order by level before the Explorer stats load; live stats win once they
+  have. p is 1 / gamesInN (the move list's rounded value), so the stored
+  level is exactly the colour shown then. Off book or unknown: no p.
+*/
+function trainValidProbability(p) {
+  return typeof p === 'number' && p > 0 && p <= 1;
+}
+
+function trainPositionProbability(rarity) {
+  var last = rarity && rarity.length ? rarity[rarity.length - 1] : null;
+  if (!last || last.state !== 'colored' || !(last.gamesInN >= 1)) return null;
+  return 1 / last.gamesInN;
+}
+
+function trainLevelFromProbability(p) {
+  return trainValidProbability(p) ? rarityLevelForGamesInN(Math.max(1, Math.round(1 / p))) : null;
 }
 
 /*
@@ -1180,11 +1228,17 @@ function gameMistakeCard(card, gameTime, path, cfg) {
   score - a Lichess game mistake counts 5x and a plain repertoire deviation
   2x until Train next asks that position, so they are highly prioritized
   without always being first: a far more overdue plain card can still win.
+  level(path) (#701, optional) ranks before the score: every due card of
+  probability level 1 (green) comes before any of level 2 (blue), and so on,
+  however overdue or boosted; the score only orders cards within a level.
+  level is called as level(path, card). A null level counts as
+  TRAIN_LEVEL_CONFIG.unknownLevel.
   Returns the card's key, or null.
 */
-function srsPickTarget(cards, now, rootPath, reach, pathLive, boost) {
+function srsPickTarget(cards, now, rootPath, reach, pathLive, boost, level) {
   var best = null;
   var bestScore = -Infinity;
+  var bestLevel = Infinity;
   Object.keys(cards || {}).forEach(function(key) {
     var c = cards[key];
     if (!c || typeof c.due !== 'number' || c.due > now || typeof c.path !== 'string') return;
@@ -1192,10 +1246,14 @@ function srsPickTarget(cards, now, rootPath, reach, pathLive, boost) {
     if (rootPath) {
       if (c.path.indexOf(rootPath + ' ') !== 0) return;
     } else if (!c.path) return;
+    var lv = level ? level(c.path, c) : 1;
+    if (typeof lv !== 'number') lv = TRAIN_LEVEL_CONFIG.unknownLevel;
+    if (lv > bestLevel) return;
     var score = ((now - c.due) / SRS_DAY_MS + 1) * reach(c.path) * (boost ? boost(key) : 1);
-    if (score > bestScore || (score === bestScore && best !== null && c.due < cards[best].due)) {
+    if (lv < bestLevel || score > bestScore || (score === bestScore && best !== null && c.due < cards[best].due)) {
       best = key;
       bestScore = score;
+      bestLevel = lv;
     }
   });
   return best;
@@ -3245,11 +3303,21 @@ function trainSaveCard(t, positionKey, result, path) {
     statsCards[t.color][sk] = card;
     renderRepertoireStats();
   }
-  var stored = Object.assign({}, card);
-  // the rules require lastMistake <= server time: use the server's clock
-  if (result === 'wrong') stored.lastMistake = firebase.database.ServerValue.TIMESTAMP;
-  firebase.database().ref('training/' + currentUser.uid + '/' + t.color + '/' + sk).set(stored)
-    .catch(function(err) { console.warn('Training schedule write failed', err); });
+  var uid = currentUser.uid;
+  // #701: store the position's probability with the card. Its Explorer stats
+  // may still be loading (Train steers to a due line without waiting for
+  // them), so fetch what's missing first; the write waits for that.
+  var scored = explorerPositionKey(normalizeFen(baseFen)) === STANDARD_START_KEY
+    ? trainScorePath(path) : Promise.resolve(null);
+  scored.catch(function() { return null; }).then(function(rarity) {
+    var p = trainPositionProbability(rarity);
+    if (p !== null) card.p = p;  // the in-memory card too (same object)
+    if (!currentUser || currentUser.uid !== uid) return;  // signed out/switched meanwhile
+    var stored = Object.assign({}, card);
+    // the rules require lastMistake <= server time: use the server's clock
+    if (result === 'wrong') stored.lastMistake = firebase.database.ServerValue.TIMESTAMP;
+    return firebase.database().ref('training/' + uid + '/' + t.color + '/' + sk).set(stored);
+  }).catch(function(err) { console.warn('Training schedule write failed', err); });
 }
 
 // How likely you are to reach the end of path from the root: the product of
@@ -3266,6 +3334,52 @@ function trainReach(t, path) {
     if (!replay.move(moves[i])) return 0;
   }
   return p;
+}
+
+// #701: computeMoveRarity for path, scored like the move list (absolute from
+// the start, your favorites free, transpositions counted), from the Explorer
+// stats cached so far; null for a path that doesn't replay.
+function trainPathPlies(path) {
+  var moves = path ? path.split(' ') : [];
+  var replay = new Chess(normalizeFen(baseFen));
+  var plies = [];
+  for (var i = 0; i < moves.length; i++) {
+    var ply = { key: explorerPositionKey(replay.fen()), posKey: samePositionKey(replay), san: moves[i], color: replay.turn() };
+    if (!replay.move(moves[i])) return null;
+    ply.afterKey = samePositionKey(replay);
+    ply.pathSan = moves.slice(0, i + 1).join(' ');
+    plies.push(ply);
+  }
+  return plies;
+}
+
+function trainPathRarity(path) {
+  var plies = trainPathPlies(path);
+  return plies && computeMoveRarity(plies, explorerLookup, currentPerspective());
+}
+
+// #701: trainPathRarity, first fetching the Explorer stats the path still
+// needs (the move list's own fetch order; failed/blocked positions give up).
+async function trainScorePath(path) {
+  var plies = trainPathPlies(path);
+  if (!plies) return null;
+  for (var n = 0; n <= plies.length; n++) {
+    var perspective = currentPerspective();
+    var rarity = computeMoveRarity(plies, explorerLookup, perspective);
+    var last = rarity[rarity.length - 1];
+    if (!last || last.state !== 'unknown') return rarity;
+    var index = nextRarityFetchIndex(plies, explorerLookup, explorerBlocked, perspective);
+    if (index < 0 || explorerLookup(plies[index].key)) return rarity;
+    await fetchExplorerStats(plies[index].key);
+  }
+  return computeMoveRarity(plies, explorerLookup, currentPerspective());
+}
+
+// #701: the card's level - live stats when cached, else the stored p, else null.
+function trainCardLevel(path, card) {
+  var live = trainPositionLevel(trainPathRarity(path));
+  if (live !== null) return live;
+  return trainLevelFromProbability(card && card.p);
 }
 
 function trainPathLive(t, path) {
@@ -3287,7 +3401,8 @@ function trainChooseTarget(t) {
   var key = srsPickTarget(t.cards, Date.now(), game.history().map(stripSanDecorations).join(' '),
     function(path) { return trainReach(t, path); },
     function(path) { return trainPathLive(t, path); },
-    function(sk) { return trainGameMistakeBoost(t.color, sk); });
+    function(sk) { return trainGameMistakeBoost(t.color, sk); },
+    trainCardLevel);
   if (key) t.target = t.cards[key].path.split(' ');
   // #678: with a target, positions you know and that aren't due are played
   // for you; with none, every position is asked (extra practice).
