@@ -130,7 +130,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "fadd608 \u00b7 2026-09-29 05:05 UTC";
+var BOARD_BUILD = "f1ea38c \u00b7 2026-09-29 05:18 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -442,7 +442,7 @@ function nextViewPlyOnRemoteUpdate(currentPly, wasAtLive, newHistoryLength) {
   slides its piece instead of jumping. Full redraws (load, navigation,
   reset, remote sync) stay instant - only callers that request it animate.
 */
-var PIECE_ANIMATION_MS = 180;
+var PIECE_ANIMATION_MS = 160;
 
 // The pieces a chess.js verbose move slides: the mover, plus the rook
 // when castling ('k' / 'q' flags). [{ from, to }]
@@ -1019,7 +1019,7 @@ var TRAIN_CONFIG = {
   mistakeHintStepSeconds: 0.5,
   mistakeHintDelayMaxSeconds: 2,
   mistakeWindowDays: 7,
-  opponentDelayMs: 700,
+  opponentDelayMs: 600,
   lineEndPauseMs: 1500,
   maxLinePlies: 80,
   lastMistakeToleranceMs: 60 * 1000,  // #678: server/client clock skew on lastMistake
