@@ -1,3 +1,21 @@
+<!--
+  Page title and icon (TASK_705 / issue #705). This file is a fragment with
+  no <head>, but the browser hoists these tags into the implicit one as long
+  as they come before any body content, so keep them first in the file.
+  The icon is the Chrome extension's (chrome-extension/icons/, built by
+  generate_icons.py: wood-tone checkerboard, dark frame, four
+  probability-tier accent squares) redrawn as a 4x4 board with the accents
+  in the corners so it still reads at 16px. Same palette: light F0D9B5, dark
+  B58863, frame 3B2A1E, accents 32CD32 / 00FFFF / FFA500 / 9370DB. It is
+  inline (data: URI) for the same reason the pieces and chess.js are: this
+  file runs as a claude.ai artifact widget and as a standalone site, and
+  /favicon.ico on the Pages site does not exist. The title is ASCII on
+  purpose (no <meta charset>, see the escapes elsewhere in this file). iOS
+  ignores SVG for apple-touch-icon, so that one is a small inline PNG.
+-->
+<title>Chess Prep - Shared Board</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='6'%20fill='%233B2A1E'/%3E%3Crect%20x='2'%20y='2'%20width='28'%20height='28'%20fill='%23F0D9B5'/%3E%3Crect%20x='2'%20y='2'%20width='7'%20height='7'%20fill='%2332CD32'/%3E%3Crect%20x='9'%20y='2'%20width='7'%20height='7'%20fill='%23B58863'/%3E%3Crect%20x='23'%20y='2'%20width='7'%20height='7'%20fill='%2300FFFF'/%3E%3Crect%20x='2'%20y='9'%20width='7'%20height='7'%20fill='%23B58863'/%3E%3Crect%20x='16'%20y='9'%20width='7'%20height='7'%20fill='%23B58863'/%3E%3Crect%20x='9'%20y='16'%20width='7'%20height='7'%20fill='%23B58863'/%3E%3Crect%20x='23'%20y='16'%20width='7'%20height='7'%20fill='%23B58863'/%3E%3Crect%20x='2'%20y='23'%20width='7'%20height='7'%20fill='%23FFA500'/%3E%3Crect%20x='16'%20y='23'%20width='7'%20height='7'%20fill='%23B58863'/%3E%3Crect%20x='23'%20y='23'%20width='7'%20height='7'%20fill='%239370DB'/%3E%3C/svg%3E">
+<link rel="apple-touch-icon" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAALQAAAC0CAIAAACyr5FlAAACEUlEQVR42u3SMRGAQAxFwVOCAMprkYMBZNCjAQnIQACDCRwcAqCiSEF25hlI/pah76TXihcIDsEhOASH4BAcgkNwCA7BIX3CUfca3zaP8V3HFl9pLT444IADDjjggAMOOOCAAw444IADDjjggAMOOOCAAw444IADDjjggAMOOOCAAw444IADDjjggAMOOOCAAw444IADDjjggAMOOOCAAw444IADDjjggAMOOOCAAw444IADDjjggCMtjjw75bkUDjjggAMOOOCAAw444IADDjjggAMOOOCAAw444IADDjjggAMOOOCAAw444IADDjjggAMOOOCAAw444IADDjjggAMOOOCAAw444IADDjjggAMOOOCAAw444IADDjjggAMOOOBIi8NO/7sUDjjggAMOOOCAAw444IADDjjggAMOOOCAAw444IADDjjggAMOOOCAAw444IADDjjggAMOOOCAAw444IADDjjggAMOOOCAAw444IADDjjggAMOOOCAAw444IADDjjggAMOOOBIi6OtJb48Oy3TGR8ccMABBxxwwAEHHHDAAQcccMABBxxwwAEHHHDAAQcccMABBxxwwAEHHHDAAQcccMABBxxwwAEHHHDAAQcccMABBxxwwAEHHHDAAQcccMABBxxwwAEHHHDAAQcccMABBxxwwJEWh3IGh+AQHIJDcAgOwSE4BIfgEBzSoxtkrrFsSemVtQAAAABJRU5ErkJggg==">
 <script>
 /*
   chess.js 0.10.3, vendored inline (BSD-2-Clause, Jeff Hlywa,
@@ -130,7 +148,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "eb1ed67 \u00b7 2026-09-29 05:57 UTC";
+var BOARD_BUILD = "9b24485 \u00b7 2026-09-30 02:40 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
