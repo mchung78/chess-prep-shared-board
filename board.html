@@ -62,6 +62,8 @@ var Chess=function(r){var u="b",s="w",l=-1,_="p",A="n",S="b",m="r",y="q",p="k",t
 .sr-only { position:absolute !important; width:1px !important; height:1px !important; padding:0 !important; margin:-1px !important; overflow:hidden !important; clip:rect(0,0,0,0) !important; clip-path:inset(50%) !important; white-space:nowrap !important; border:0 !important; }
 html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, #eee); margin:0; }
 #board { grid-template-columns:repeat(8,var(--square-size,44px)); grid-template-rows:repeat(8,var(--square-size,44px)); }
+/* Train locks the pieces while it auto-plays (piecesLocked()); the squares carry inline cursors, hence !important. */
+#board.pieces-locked, #board.pieces-locked * { cursor:default !important; }
 </style>
 <div style="padding: 1rem 0;">
 <h2 class="sr-only" style="position:absolute !important; width:1px !important; height:1px !important; padding:0 !important; margin:-1px !important; overflow:hidden !important; clip:rect(0,0,0,0) !important; clip-path:inset(50%) !important; white-space:nowrap !important; border:0 !important;">Interactive chess board for studying positions and sending them to Claude</h2>
@@ -148,7 +150,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "8bd4938 \u00b7 2026-09-30 04:15 UTC";
+var BOARD_BUILD = "f6ca6cc \u00b7 2026-09-30 12:57 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -2194,6 +2196,23 @@ function isAtLive() {
 }
 
 /*
+  Train mode locks the pieces whenever it is not the player's turn to move:
+  while the session loads, while the opponent's (or a known) move is
+  auto-played, during the pause between lines and while a gap fill is being
+  checked. A locked piece cannot be lifted, dragged or selected.
+  train.busy covers all of those; the turn test is a second guard.
+*/
+function piecesLocked() {
+  return !!train && (train.busy || game.turn() !== train.color);
+}
+
+// The locked cursor (see the #board.pieces-locked rule). Called from render()
+// and from every Train message, since busy flips between renders.
+function syncPieceLock() {
+  boardEl.classList.toggle('pieces-locked', piecesLocked());
+}
+
+/*
   The position actually shown on the board/turn-label - game's own live
   position when following live, or a replay from baseFen through the
   first viewPly plies of game.history() otherwise. Rebuilt on every
@@ -2976,6 +2995,7 @@ function render() {
         span.onmousedown = (function(fromSq) {
           return function(ev) {
             if (!isAtLive()) return;  // TASK_613: browsing history is read-only
+            if (piecesLocked()) return;  // Train is auto-playing: nothing can be lifted
             var p = game.get(fromSq);
             if (!p || p.color !== game.turn()) return;
             ev.preventDefault();
@@ -3025,6 +3045,7 @@ function render() {
   if (animateMove && isAtLive()) animateMoveOnBoard(animateMove);  // #689
   renderMoveList();
   renderNavControls();
+  syncPieceLock();
   if (analysisMode && !train) scheduleEval(displayGame.fen());  // TASK_614: evaluate the VIEWED position, except during a drill
 }
 
@@ -3131,6 +3152,10 @@ function renderNavControls() {
 
 function onSquareClick(sq) {
   if (!isAtLive()) return;  // TASK_613: browsing history is read-only
+  if (piecesLocked()) {  // Train is auto-playing: nothing can be selected
+    if (selected) { selected = null; render(); }
+    return;
+  }
   var piece = game.get(sq);
   if (selected) {
     if (selected === sq) { selected = null; render(); return; }
@@ -3243,6 +3268,7 @@ function setTrainMessage(message) {
   trainPanel.style.display = '';
   trainMessageEl.textContent = message;
   if (train) trainStatsEl.textContent = trainSummaryText(train.stats);
+  syncPieceLock();
 }
 
 /*
@@ -3482,7 +3508,7 @@ function startTraining() {
     saved: saved,
     rootPly: viewPly,
     lineId: 0,
-    busy: false,
+    busy: true,  // locked until trainStep() hands the first move to the player (schedule still loading)
     gapPending: false,
     turn: null,
     hintSquare: null,
@@ -3561,6 +3587,7 @@ function trainStep() {
       }, TRAIN_CONFIG.opponentDelayMs);
       return;
     }
+    t.busy = false;  // the player's move: unlock the pieces
     if (atGameMistake) t.gapPending = true;  // #668: a game mistake with no favorite - your move fills the gap (the guard applies)
     t.turn = { hinted: false, counted: false };
     var note = trainGameMistakeNote(t);
