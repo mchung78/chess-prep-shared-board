@@ -83,7 +83,8 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 <button id="trainBtn" aria-pressed="false" title="Drill your repertoire from the position shown. Your side is the board orientation.">Train</button>
   <button id="linkLichessBtn" style="display:none;" title="Link your Lichess account: Train drills the opening mistakes from your recent games.">Link Lichess</button>
 </div>
-<div id="repertoireStats" style="display:none; margin-top:6px; font-size:12px; color:var(--text-secondary, #aaa); white-space:pre-wrap;" title="Learned: answered cleanly on a review after its first day, with no miss since. Due: scheduled for review now."></div>
+<div id="repertoireStats" style="display:none; margin-top:6px; font-size:12px; color:var(--text-secondary, #aaa); white-space:pre-wrap;" title="Learned: answered cleanly on a review after its first day, with no miss since. Due: scheduled for review now. 50/94 due: 94 are due, the cap defers all but 50 (lowest probability first) for 12 hours."></div>
+<div id="maxDueRow" style="display:none; margin-top:4px; font-size:12px; color:var(--text-secondary, #aaa);"><label for="maxDueInput" title="Cards above this many due on a side are deferred 12 hours, purple first, then orange, blue, green.">Max cards due per side <input id="maxDueInput" type="number" min="1" max="1000" step="1" style="width:64px;"></label></div>
 </div>
 <div style="flex:1; min-width:220px;">
 <p id="turnLabel" style="font-size:14px; color:var(--text-secondary, #aaa); margin:0 0 12px;">White to move</p>
@@ -150,7 +151,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "f6ca6cc \u00b7 2026-09-30 12:57 UTC";
+var BOARD_BUILD = "5bcbf3c \u00b7 2026-09-30 14:29 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1177,6 +1178,7 @@ function srsNextCard(card, result, now, path, cfg) {
 */
 function trainSkipsPosition(card, now, cfg) {
   if (!card || typeof card.due !== 'number' || typeof card.interval !== 'number') return false;
+  if (srsIsDeferred(card, now)) return true;  // #712: over the cap - played for you, never asked
   if (card.due <= now) return false;
   if (typeof card.lastMistake !== 'number') return true;
   var reviewedAt = card.due - card.interval * SRS_DAY_MS;
@@ -1262,6 +1264,7 @@ function srsPickTarget(cards, now, rootPath, reach, pathLive, boost, level) {
   Object.keys(cards || {}).forEach(function(key) {
     var c = cards[key];
     if (!c || typeof c.due !== 'number' || c.due > now || typeof c.path !== 'string') return;
+    if (srsIsDeferred(c, now)) return;  // #712
     if (pathLive && !pathLive(c.path)) return;
     if (rootPath) {
       if (c.path.indexOf(rootPath + ' ') !== 0) return;
@@ -1269,7 +1272,7 @@ function srsPickTarget(cards, now, rootPath, reach, pathLive, boost, level) {
     var lv = level ? level(c.path, c) : 1;
     if (typeof lv !== 'number') lv = TRAIN_LEVEL_CONFIG.unknownLevel;
     if (lv > bestLevel) return;
-    var score = ((now - c.due) / SRS_DAY_MS + 1) * reach(c.path) * (boost ? boost(key) : 1);
+    var score = srsPriorityScore(c, now, reach(c.path), boost ? boost(key) : 1);
     if (lv < bestLevel || score > bestScore || (score === bestScore && best !== null && c.due < cards[best].due)) {
       best = key;
       bestScore = score;
@@ -1278,6 +1281,61 @@ function srsPickTarget(cards, now, rootPath, reach, pathLive, boost, level) {
   });
   return best;
 }
+/*
+  #712: a cap on cards due, per side. Cards above the maximum are deferred:
+  deferUntil = now + deferMs, stored on the card (due keeps its overdue age
+  and #678's "when was it last reviewed" inference). A review or a new game
+  mistake writes a fresh card, which drops deferUntil. The user's maximum is
+  trainingSettings/<uid>/maxDue (Firebase).
+*/
+var TRAIN_DUE_CAP = {
+  defaultMaxDue: 50,
+  minMaxDue: 1,
+  maxMaxDue: 1000,
+  deferMs: 12 * 60 * 60 * 1000,
+};
+
+function srsIsDeferred(card, now) {
+  return !!card && typeof card.deferUntil === 'number' && card.deferUntil > now;
+}
+
+function trainNormalizeMaxDue(value, cfg) {
+  var n = typeof value === 'number' ? value : NaN;
+  if (!isFinite(n)) return cfg.defaultMaxDue;
+  return Math.min(cfg.maxMaxDue, Math.max(cfg.minMaxDue, Math.round(n)));
+}
+
+// The ordering within a level, shared by target picking and the cap:
+// overdue days (1 on the due date) x reach x boost.
+function srsPriorityScore(card, now, reach, boost) {
+  return ((now - card.due) / SRS_DAY_MS + 1) * reach * boost;
+}
+
+/*
+  Which of one colour's cards to defer. cards: { key: card }. Counted: due,
+  not already deferred, and active(key) (the position still has an active
+  favorite). When more than maxDue are counted, the maxDue with the lowest
+  level, then highest score, then oldest due are kept and the rest returned
+  (purple goes first, green last). level(key, card) and score(key, card) as
+  for srsPickTarget; an unknown level counts as green.
+*/
+function srsPlanDeferrals(cards, now, maxDue, active, level, score) {
+  var counted = [];
+  Object.keys(cards || {}).forEach(function(key) {
+    var c = cards[key];
+    if (!c || typeof c.due !== 'number' || c.due > now || srsIsDeferred(c, now)) return;
+    if (active && !active(key)) return;
+    var lv = level ? level(key, c) : 1;
+    if (typeof lv !== 'number') lv = TRAIN_LEVEL_CONFIG.unknownLevel;
+    counted.push({ key: key, level: lv, score: score ? score(key, c) : 1, due: c.due });
+  });
+  if (counted.length <= maxDue) return [];
+  counted.sort(function(a, b) {
+    return (a.level - b.level) || (b.score - a.score) || (a.due - b.due) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+  });
+  return counted.slice(maxDue).map(function(e) { return e.key; });
+}
+
 /*
   #667: repertoire statistics, per colour. total = positions where it's that
   colour's move with at least one active favorite (several favorites at one
@@ -1290,7 +1348,7 @@ function srsPickTarget(cards, now, rootPath, reach, pathLive, boost, level) {
 var REPERTOIRE_STATS = { learnedMinIntervalDays: 2 };
 
 function repertoireStats(repData, cardsByColour, now, cfg) {
-  var out = { w: { total: 0, learned: 0, due: 0 }, b: { total: 0, learned: 0, due: 0 } };
+  var out = { w: { total: 0, learned: 0, due: 0, actionable: 0 }, b: { total: 0, learned: 0, due: 0, actionable: 0 } };
   Object.keys(repData || {}).forEach(function(sk) {
     var colour = String(sk).split(' ')[1];
     if (colour !== 'w' && colour !== 'b') return;
@@ -1301,7 +1359,10 @@ function repertoireStats(repData, cardsByColour, now, cfg) {
     var card = cards && cards[sk];
     if (!card) return;
     if (typeof card.interval === 'number' && card.interval >= cfg.learnedMinIntervalDays) s.learned++;
-    if (typeof card.due === 'number' && card.due <= now) s.due++;
+    if (typeof card.due === 'number' && card.due <= now) {
+      s.due++;
+      if (!srsIsDeferred(card, now)) s.actionable++;  // #712: due and not deferred by the cap
+    }
   });
   return out;
 }
@@ -1312,7 +1373,9 @@ function repertoireStatsText(stats, firstColour) {
   var order = firstColour === 'b' ? ['b', 'w'] : ['w', 'b'];
   return 'Repertoire  ' + order.map(function(c) {
     var s = stats[c];
-    return (c === 'w' ? 'White ' : 'Black ') + s.learned + '/' + s.total + ' learned \u00b7 ' + s.due + ' due';
+    // #712: "50/94 due" when the cap defers some (50 to do now, 94 due in all)
+    var dueText = (typeof s.actionable === 'number' && s.actionable < s.due ? s.actionable + '/' : '') + s.due + ' due';
+    return (c === 'w' ? 'White ' : 'Black ') + s.learned + '/' + s.total + ' learned \u00b7 ' + dueText;
   }).join('   ');
 }
 /* TASK_648_TRAIN_END */
@@ -2604,6 +2667,7 @@ function attachRepertoire(user) {
     repertoireRef = firebase.database().ref('repertoire/' + user.uid);
     repertoireRef.on('value', function(snapshot) {
       repertoireData = snapshot.val() || {};
+      trainApplyDueCap();  // #712: the cards may have loaded before the repertoire
       maybeSyncGameMistakes();  // #668: the game scan runs against the repertoire, so sync once it has loaded
       renderMoveList();  // also renders the #667 stats line
     }, function(err) {
@@ -2620,10 +2684,22 @@ function attachRepertoire(user) {
 // learned rather than hiding the line.
 function loadStatsCards(user) {
   statsCards = null;
+  trainMaxDue = undefined;  // #712: the default until this user's setting loads
+  syncMaxDueInput();
   if (!user || !firebaseReady) return;
-  firebase.database().ref('training/' + user.uid).once('value').then(function(snapshot) {
+  var db = firebase.database();
+  Promise.all([
+    db.ref('training/' + user.uid).once('value'),
+    db.ref('trainingSettings/' + user.uid + '/maxDue').once('value').catch(function(err) {
+      console.warn('Max-due setting unavailable', err);
+      return null;
+    }),
+  ]).then(function(results) {
     if (!currentUser || currentUser.uid !== user.uid) return;  // signed out/switched meanwhile
-    statsCards = (snapshot && snapshot.val()) || {};
+    statsCards = (results[0] && results[0].val()) || {};
+    trainMaxDue = trainNormalizeMaxDue(results[1] ? results[1].val() : null, TRAIN_DUE_CAP);
+    syncMaxDueInput();
+    trainApplyDueCap();
     renderRepertoireStats();
   }).catch(function(err) {
     console.warn('Training cards unavailable for stats', err);
@@ -2633,13 +2709,81 @@ function loadStatsCards(user) {
 
 function renderRepertoireStats() {
   var el = document.getElementById('repertoireStats');
+  var row = document.getElementById('maxDueRow');
   if (!el || !REPERTOIRE_STATS) return;  // an early auth callback can beat the config's initializer
-  if (!currentUser || !repertoireData) { el.style.display = 'none'; el.textContent = ''; return; }
+  if (!currentUser || !repertoireData) {
+    el.style.display = 'none'; el.textContent = '';
+    if (row) row.style.display = 'none';
+    return;
+  }
   var stats = repertoireStats(repertoireData, statsCards || {}, Date.now(), REPERTOIRE_STATS);
   el.textContent = repertoireStatsText(stats, friendlyColorForOrientation(flipped));
   el.style.display = '';
+  if (row) row.style.display = '';
 }
-setInterval(renderRepertoireStats, 60 * 1000);  // due counts move with the clock
+
+/*
+  #712: the cap on cards due, per side. trainMaxDue is the user's setting
+  (trainingSettings/<uid>/maxDue). trainApplyDueCap defers the lowest-priority
+  cards above it for 12 hours (deferUntil on the card), decided from the
+  cards' stored p (a cold Explorer cache would otherwise mis-tier them) and
+  scored like Train's target pick, with reach from the standard start.
+  Needs a signed-in player, a loaded repertoire and the standard start.
+*/
+var trainMaxDue;  // no initializer, like the repertoire state: an early auth callback may already have set it
+
+function syncMaxDueInput() {
+  var input = document.getElementById('maxDueInput');
+  if (!input || !TRAIN_DUE_CAP || document.activeElement === input) return;  // TRAIN_DUE_CAP: an early auth callback can beat the config's initializer
+  input.value = String(trainNormalizeMaxDue(trainMaxDue, TRAIN_DUE_CAP));
+}
+
+function trainMirrorDeferral(colour, sk, until) {
+  [statsCards && statsCards[colour], train && train.color === colour ? train.cards : null].forEach(function(cards) {
+    if (cards && cards[sk]) cards[sk].deferUntil = until;
+  });
+}
+
+// cardsByColour: { w: {sk: card}, b: {...} } (defaults to the stats copy).
+function trainApplyDueCap(cardsByColour) {
+  cardsByColour = cardsByColour || statsCards;
+  if (!cardsByColour || !repertoireData || !srsAvailable()) return;
+  var now = Date.now();
+  var until = now + TRAIN_DUE_CAP.deferMs;
+  var updates = {};
+  var count = 0;
+  ['w', 'b'].forEach(function(colour) {
+    var cards = cardsByColour[colour];
+    if (!cards) return;
+    var keys = srsPlanDeferrals(cards, now, trainNormalizeMaxDue(trainMaxDue, TRAIN_DUE_CAP),
+      function(sk) { return repertoireFavorites(repertoireData, sk).length > 0; },
+      function(sk, card) { return trainLevelFromProbability(card.p); },
+      function(sk, card) {
+        var reach = typeof card.path === 'string' ? trainReach({ rootPly: 0, color: colour }, card.path) : 1;
+        return srsPriorityScore(card, now, reach, trainGameMistakeBoost(colour, sk));
+      });
+    keys.forEach(function(sk) {
+      cards[sk].deferUntil = until;
+      trainMirrorDeferral(colour, sk, until);
+      updates['training/' + currentUser.uid + '/' + colour + '/' + sk + '/deferUntil'] = until;
+      count++;
+    });
+  });
+  if (!count) return;
+  firebase.database().ref().update(updates).catch(function(err) { console.warn('Deferring cards over the cap failed', err); });
+}
+
+document.getElementById('maxDueInput').addEventListener('change', function() {
+  var input = this;
+  trainMaxDue = trainNormalizeMaxDue(parseFloat(input.value), TRAIN_DUE_CAP);
+  input.value = String(trainMaxDue);
+  if (!currentUser || !firebaseReady) return;
+  firebase.database().ref('trainingSettings/' + currentUser.uid + '/maxDue').set(trainMaxDue)
+    .catch(function(err) { console.warn('Max-due setting write failed', err); });
+  trainApplyDueCap();
+  renderRepertoireStats();
+});
+setInterval(function() { if (!train) trainApplyDueCap(); renderRepertoireStats(); }, 60 * 1000);  // due counts (and expired deferrals) move with the clock
 
 // TASK_630: every viewer colors from their own orientation. favoritesFor
 // is null without a signed-in repertoire (spectators, signed out, still
@@ -3332,7 +3476,12 @@ function srsAvailable() {
 function trainLoadCards(t) {
   if (!srsAvailable()) return Promise.resolve();
   return firebase.database().ref('training/' + currentUser.uid + '/' + t.color).once('value')
-    .then(function(snapshot) { t.cards = (snapshot && snapshot.val()) || {}; })
+    .then(function(snapshot) {
+      t.cards = (snapshot && snapshot.val()) || {};
+      var mine = {};
+      mine[t.color] = t.cards;
+      trainApplyDueCap(mine);  // #712
+    })
     .catch(function(err) { console.warn('Training schedule unavailable', err); });
 }
 
@@ -3458,7 +3607,7 @@ function trainChooseTarget(t) {
 function trainIsExtraPractice(t) {
   if (t.hadTarget || t.gapPending) return false;
   var card = t.cards[repertoireStorageKey(samePositionKey(game))];
-  return !!card && typeof card.due === 'number' && card.due > Date.now();
+  return !!card && typeof card.due === 'number' && (card.due > Date.now() || srsIsDeferred(card, Date.now()));
 }
 
 // #678: your move at a position you know and that isn't due - the target
