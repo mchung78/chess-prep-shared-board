@@ -82,10 +82,9 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 <button id="flipBtn">Flip board</button>
 <button id="trainBtn" aria-pressed="false" title="Drill your repertoire from the position shown. Your side is the board orientation.">Train</button>
   <button id="linkLichessBtn" style="display:none;" title="Link your Lichess account: Train drills the opening mistakes from your recent games.">Link Lichess</button>
-  <button id="settingsBtn" style="display:none;" title="Your settings: analysis and repertoire-check limits.">Settings</button>
+  <button id="settingsBtn" style="display:none;" title="Your analysis, repertoire-check, and training settings.">Settings</button>
 </div>
 <div id="repertoireStats" style="display:none; margin-top:6px; font-size:12px; color:var(--text-secondary, #aaa); white-space:pre-wrap;" title="Learned: answered cleanly on a review after its first day, with no miss since. Due: scheduled for review now. 50/94 due: 94 are due, the cap defers all but 50 (lowest probability first) for 12 hours."></div>
-<div id="maxDueRow" style="display:none; margin-top:4px; font-size:12px; color:var(--text-secondary, #aaa);"><label for="maxDueInput" title="Cards above this many due on a side are deferred 12 hours, purple first, then orange, blue, green.">Max cards due per side <input id="maxDueInput" type="number" min="1" max="1000" step="1" style="width:64px;"></label></div>
 </div>
 <div style="flex:1; min-width:220px;">
 <p id="turnLabel" style="font-size:14px; color:var(--text-secondary, #aaa); margin:0 0 12px;">White to move</p>
@@ -163,7 +162,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "68ce04d \u00b7 2026-09-30 20:06 UTC";
+var BOARD_BUILD = "b3f235b \u00b7 2026-09-30 21:29 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1299,9 +1298,10 @@ function srsPickTarget(cards, now, rootPath, reach, pathLive, boost, level) {
   deferUntil = now + deferMs, stored on the card (due keeps its overdue age
   and #678's "when was it last reviewed" inference). A review or a new game
   mistake writes a fresh card, which drops deferUntil. The user's maximum is
-  trainingSettings/<uid>/maxDue (Firebase).
+  settings/<uid>/maxDue (Firebase), alongside the board's other settings.
 */
 var TRAIN_DUE_CAP = {
+  // Mirrored in USER_SETTINGS.maxDue; board-settings.test.js keeps the rules in sync.
   defaultMaxDue: 50,
   minMaxDue: 1,
   maxMaxDue: 1000,
@@ -2335,7 +2335,9 @@ var USER_SETTINGS = [
   { key: 'guardDepth', label: 'Repertoire check depth', unit: 'plies', min: 10, max: 30, def: 16,
     hint: 'Local Stockfish depth for the weak-move check when Lichess has no cached evaluation.' },
   { key: 'guardTimeSec', label: 'Repertoire check time limit', unit: 'seconds', min: 1, max: 10, def: 2,
-    hint: 'Longest local search per position for the weak-move check.' }
+    hint: 'Longest local search per position for the weak-move check.' },
+  { key: 'maxDue', label: 'Maximum cards due', unit: 'per side', min: 1, max: 1000, def: 50,
+    hint: 'Cards above this many are deferred 12 hours, lowest probability first.' }
 ];
 
 function userSettingDef(key) {
@@ -2772,6 +2774,9 @@ function applyUserSettings(values) {
   REPERTOIRE_GUARD.weakMoveCp = values.guardWeakMoveCp;
   REPERTOIRE_GUARD.localDepth = values.guardDepth;
   REPERTOIRE_GUARD.localTimeMs = values.guardTimeSec * 1000;
+  trainMaxDue = values.maxDue;
+  trainApplyDueCap();
+  renderRepertoireStats();
   if (engineChanged && analysisMode) {
     cancelEval();
     scheduleEval(buildViewGame().fen());
@@ -2911,17 +2916,22 @@ function attachSettings(user) {
   settingsLoaded = false;
   settingsDirty = {};
   if (settingsDialogEl && settingsDialogEl.open) settingsDialogEl.close();
+  trainCapReady = false;
   applyUserSettings(resolveUserSettings(null).values);  // signed out, or until the first read: the defaults
   if (user && firebaseReady) {
     settingsRef = firebase.database().ref('settings/' + user.uid);
     settingsRef.on('value', function(snapshot) {
       settingsResolved = resolveUserSettings(snapshot.val());
       settingsLoaded = true;
+      trainCapReady = true;
       applyUserSettings(settingsResolved.values);
       updateSettingsUI();
     }, function(err) {
       console.warn('Settings unavailable - using defaults', err);
       settingsLoaded = false;
+      trainCapReady = true;  // fall back to the default cap
+      trainApplyDueCap();
+      renderRepertoireStats();
       updateSettingsUI();
       setSettingsStatus(SETTINGS_UNAVAILABLE_TEXT, true);
     });
@@ -3005,21 +3015,11 @@ function attachRepertoire(user) {
 // learned rather than hiding the line.
 function loadStatsCards(user) {
   statsCards = null;
-  trainMaxDue = undefined;  // #712: the default until this user's setting loads
-  syncMaxDueInput();
   if (!user || !firebaseReady) return;
   var db = firebase.database();
-  Promise.all([
-    db.ref('training/' + user.uid).once('value'),
-    db.ref('trainingSettings/' + user.uid + '/maxDue').once('value').catch(function(err) {
-      console.warn('Max-due setting unavailable', err);
-      return null;
-    }),
-  ]).then(function(results) {
+  db.ref('training/' + user.uid).once('value').then(function(snapshot) {
     if (!currentUser || currentUser.uid !== user.uid) return;  // signed out/switched meanwhile
-    statsCards = (results[0] && results[0].val()) || {};
-    trainMaxDue = trainNormalizeMaxDue(results[1] ? results[1].val() : null, TRAIN_DUE_CAP);
-    syncMaxDueInput();
+    statsCards = snapshot.val() || {};
     trainApplyDueCap();
     renderRepertoireStats();
   }).catch(function(err) {
@@ -3030,34 +3030,26 @@ function loadStatsCards(user) {
 
 function renderRepertoireStats() {
   var el = document.getElementById('repertoireStats');
-  var row = document.getElementById('maxDueRow');
   if (!el || !REPERTOIRE_STATS) return;  // an early auth callback can beat the config's initializer
   if (!currentUser || !repertoireData) {
     el.style.display = 'none'; el.textContent = '';
-    if (row) row.style.display = 'none';
     return;
   }
   var stats = repertoireStats(repertoireData, statsCards || {}, Date.now(), REPERTOIRE_STATS);
   el.textContent = repertoireStatsText(stats, friendlyColorForOrientation(flipped));
   el.style.display = '';
-  if (row) row.style.display = '';
 }
 
 /*
   #712: the cap on cards due, per side. trainMaxDue is the user's setting
-  (trainingSettings/<uid>/maxDue). trainApplyDueCap defers the lowest-priority
+  (settings/<uid>/maxDue). trainApplyDueCap defers the lowest-priority
   cards above it for 12 hours (deferUntil on the card), decided from the
   cards' stored p (a cold Explorer cache would otherwise mis-tier them) and
   scored like Train's target pick, with reach from the standard start.
   Needs a signed-in player, a loaded repertoire and the standard start.
 */
-var trainMaxDue;  // no initializer, like the repertoire state: an early auth callback may already have set it
-
-function syncMaxDueInput() {
-  var input = document.getElementById('maxDueInput');
-  if (!input || !TRAIN_DUE_CAP || document.activeElement === input) return;  // TRAIN_DUE_CAP: an early auth callback can beat the config's initializer
-  input.value = String(trainNormalizeMaxDue(trainMaxDue, TRAIN_DUE_CAP));
-}
+var trainMaxDue;  // populated by applyUserSettings; the default is applied before a user's settings load
+var trainCapReady;  // true once the settings read has answered (value or failure); trainApplyDueCap waits for it
 
 function trainMirrorDeferral(colour, sk, until) {
   [statsCards && statsCards[colour], train && train.color === colour ? train.cards : null].forEach(function(cards) {
@@ -3068,7 +3060,7 @@ function trainMirrorDeferral(colour, sk, until) {
 // cardsByColour: { w: {sk: card}, b: {...} } (defaults to the stats copy).
 function trainApplyDueCap(cardsByColour) {
   cardsByColour = cardsByColour || statsCards;
-  if (!cardsByColour || !repertoireData || !srsAvailable()) return;
+  if (!cardsByColour || !repertoireData || !srsAvailable() || !trainCapReady) return;  // never plan against the default cap before the player's setting is known
   var now = Date.now();
   var until = now + TRAIN_DUE_CAP.deferMs;
   var updates = {};
@@ -3094,16 +3086,6 @@ function trainApplyDueCap(cardsByColour) {
   firebase.database().ref().update(updates).catch(function(err) { console.warn('Deferring cards over the cap failed', err); });
 }
 
-document.getElementById('maxDueInput').addEventListener('change', function() {
-  var input = this;
-  trainMaxDue = trainNormalizeMaxDue(parseFloat(input.value), TRAIN_DUE_CAP);
-  input.value = String(trainMaxDue);
-  if (!currentUser || !firebaseReady) return;
-  firebase.database().ref('trainingSettings/' + currentUser.uid + '/maxDue').set(trainMaxDue)
-    .catch(function(err) { console.warn('Max-due setting write failed', err); });
-  trainApplyDueCap();
-  renderRepertoireStats();
-});
 setInterval(function() { if (!train) trainApplyDueCap(); renderRepertoireStats(); }, 60 * 1000);  // due counts (and expired deferrals) move with the clock
 
 // TASK_630: every viewer colors from their own orientation. favoritesFor
