@@ -82,6 +82,7 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 <button id="flipBtn">Flip board</button>
 <button id="trainBtn" aria-pressed="false" title="Drill your repertoire from the position shown. Your side is the board orientation.">Train</button>
   <button id="linkLichessBtn" style="display:none;" title="Link your Lichess account: Train drills the opening mistakes from your recent games.">Link Lichess</button>
+  <button id="settingsBtn" style="display:none;" title="Your settings: analysis and repertoire-check limits.">Settings</button>
 </div>
 <div id="repertoireStats" style="display:none; margin-top:6px; font-size:12px; color:var(--text-secondary, #aaa); white-space:pre-wrap;" title="Learned: answered cleanly on a review after its first day, with no miss since. Due: scheduled for review now. 50/94 due: 94 are due, the cap defers all but 50 (lowest probability first) for 12 hours."></div>
 <div id="maxDueRow" style="display:none; margin-top:4px; font-size:12px; color:var(--text-secondary, #aaa);"><label for="maxDueInput" title="Cards above this many due on a side are deferred 12 hours, purple first, then orange, blue, green.">Max cards due per side <input id="maxDueInput" type="number" min="1" max="1000" step="1" style="width:64px;"></label></div>
@@ -134,6 +135,17 @@ Analysis mode
 </div>
 </div>
 </div>
+<dialog id="settingsDialog" aria-labelledby="settingsTitle" style="width:calc(100% - 32px); max-width:460px; box-sizing:border-box; background:var(--bg-primary, #18181b); color:var(--text-primary, #eee); border:1px solid var(--border-strong, #666); border-radius:8px; padding:16px;">
+<h3 id="settingsTitle" style="margin:0 0 4px; font-size:16px;">Settings</h3>
+<p style="margin:0 0 12px; font-size:12px; color:var(--text-secondary, #aaa);">Saved to your account, so they follow you to other devices. A setting left on its default follows any future change to that default.</p>
+<div id="settingsRows"></div>
+<p id="settingsStatus" role="status" aria-live="polite" style="min-height:1.3em; margin:0 0 10px; font-size:12px; color:var(--text-secondary, #aaa);"></p>
+<div style="display:flex; gap:8px; justify-content:flex-end; flex-wrap:wrap;">
+<button id="settingsResetAllBtn">Reset all to defaults</button>
+<button id="settingsSaveBtn">Save</button>
+<button id="settingsCloseBtn">Close</button>
+</div>
+</dialog>
 <script>
 /*
   Set to a full 6-field FEN or this project's 4-field positionKey to
@@ -151,7 +163,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "5bcbf3c \u00b7 2026-09-30 14:29 UTC";
+var BOARD_BUILD = "68ce04d \u00b7 2026-09-30 20:06 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -306,6 +318,7 @@ if (firebaseReady) {
     updateAuthUI();
     attachRepertoire(user);  // TASK_629
     attachGameMistakes(user);  // #668: per-uid Lichess link + sync cursor
+    attachSettings(user);  // TASK_709: per-uid settings, defaults when signed out
     if (user) pruneExpiredHistory();  // TASK_651
     // TASK_620 (Codex review of #623): a newly signed-in player can now
     // fill cache misses, so retry lookups that failed as not_cached while
@@ -2300,6 +2313,104 @@ function goToPly(ply) {
 }
 
 /*
+  TASK_709 (#709): user settings. Pure logic only - the Firebase listener,
+  the dialog and the wiring into the engine constants are further down
+  (search "TASK_709 wiring"). ASCII on purpose, like the other blocks (no
+  <meta charset>).
+
+  Storage is settings/<uid>: only OVERRIDES are stored, one integer per key.
+  A missing key means "use the built-in default below", so a later change
+  to a default reaches everyone who never customised that setting. The same
+  list drives the dialog and is mirrored in infra/rules.json (bounds there
+  must match); infra/firebase-rules/test/rules.test.js checks the two agree.
+*/
+/* TASK_709_SETTINGS_START */
+var USER_SETTINGS = [
+  { key: 'engineDepth', label: 'Analysis depth', unit: 'plies', min: 10, max: 30, def: 24,
+    hint: 'Local Stockfish search depth for Analysis mode.' },
+  { key: 'engineTimeSec', label: 'Analysis time limit', unit: 'seconds', min: 1, max: 30, def: 5,
+    hint: 'Longest local Stockfish search per position; it stops at depth or time, whichever comes first.' },
+  { key: 'guardWeakMoveCp', label: 'Weak-move threshold', unit: 'centipawns', min: 10, max: 300, def: 50,
+    hint: 'A move that loses at least this much versus the best move is not added to your repertoire.' },
+  { key: 'guardDepth', label: 'Repertoire check depth', unit: 'plies', min: 10, max: 30, def: 16,
+    hint: 'Local Stockfish depth for the weak-move check when Lichess has no cached evaluation.' },
+  { key: 'guardTimeSec', label: 'Repertoire check time limit', unit: 'seconds', min: 1, max: 10, def: 2,
+    hint: 'Longest local search per position for the weak-move check.' }
+];
+
+function userSettingDef(key) {
+  for (var i = 0; i < USER_SETTINGS.length; i++) if (USER_SETTINGS[i].key === key) return USER_SETTINGS[i];
+  return null;
+}
+
+function isValidSettingValue(def, value) {
+  return !!def && typeof value === 'number' && isFinite(value) && Math.floor(value) === value &&
+    value >= def.min && value <= def.max;
+}
+
+function settingRangeText(def) { return 'Enter a whole number from ' + def.min + ' to ' + def.max + '.'; }
+
+// Text from an input box -> { ok, value } or { ok: false, error }. Digits only:
+// no sign, decimal point or exponent, so "2.5", "1e1" and "" are all refused.
+function parseSettingInput(def, text) {
+  var t = String(text === null || text === undefined ? '' : text).trim();
+  if (!/^\d{1,4}$/.test(t)) return { ok: false, error: settingRangeText(def) };
+  var n = parseInt(t, 10);
+  if (!isValidSettingValue(def, n)) return { ok: false, error: settingRangeText(def) };
+  return { ok: true, value: n };
+}
+
+// What is stored (anything, possibly null) -> { values, custom }. values has a
+// number for every setting; custom[key] is true only for a valid stored
+// override. Unknown keys and invalid or out-of-range values are ignored, so a
+// bad record can never stop the board from having a usable setting.
+function resolveUserSettings(stored) {
+  var values = {}, custom = {};
+  var src = (stored && typeof stored === 'object') ? stored : {};
+  USER_SETTINGS.forEach(function(def) {
+    if (isValidSettingValue(def, src[def.key])) { values[def.key] = src[def.key]; custom[def.key] = true; }
+    else { values[def.key] = def.def; custom[def.key] = false; }
+  });
+  return { values: values, custom: custom };
+}
+
+// Edits ({ key: number, or null to go back to the default }) -> a multi-path
+// update map for settings/<uid>, or null when an edit is unknown or invalid.
+function buildSettingsUpdate(edits) {
+  var update = {}, count = 0;
+  for (var key in edits) {
+    if (!Object.prototype.hasOwnProperty.call(edits, key)) continue;
+    var def = userSettingDef(key);
+    if (!def) return null;
+    if (edits[key] === null) update[key] = null;
+    else if (isValidSettingValue(def, edits[key])) update[key] = edits[key];
+    else return null;
+    count++;
+  }
+  return count ? update : null;
+}
+// What a Save should do. inputs: { key: text in the box }; dirty: { key: true } for the
+// boxes the player has touched; resolved: what is stored now (resolveUserSettings).
+// Only touched boxes count, and a touched box is saved unless it already equals the
+// player's OWN stored override. So typing the default into a setting that has no stored
+// value DOES store it (an explicit choice that stops following future default changes),
+// while re-typing an existing override is a no-op.
+// -> { ok: false, errors: [{ key, error }] } for touched boxes that are not valid, or
+//    { ok: true, edits: { key: number }, unchanged: [keys] }.
+function planSettingsSave(inputs, dirty, resolved) {
+  var edits = {}, unchanged = [], errors = [];
+  USER_SETTINGS.forEach(function(def) {
+    if (!dirty || !dirty[def.key]) return;
+    var parsed = parseSettingInput(def, inputs[def.key]);
+    if (!parsed.ok) { errors.push({ key: def.key, error: parsed.error }); return; }
+    if (resolved.custom[def.key] && resolved.values[def.key] === parsed.value) unchanged.push(def.key);
+    else edits[def.key] = parsed.value;
+  });
+  return errors.length ? { ok: false, errors: errors } : { ok: true, edits: edits, unchanged: unchanged };
+}
+/* TASK_709_SETTINGS_END */
+
+/*
   TASK_614: analysis-mode orchestration - debounce, cache, rate limit,
   and the Cloud-Eval-then-local-Stockfish fallback sequence. The pure
   parsing/formatting helpers this calls are in the TASK_614_ENGINE_EVAL
@@ -2311,8 +2422,12 @@ var LICHESS_CLOUD_EVAL_URL = 'https://lichess.org/api/cloud-eval';
 var ENGINE_API_DELAY_MS = 500;     // minimum spacing between actual Lichess calls
 var ENGINE_DEBOUNCE_MS = 500;      // position-stability debounce before firing a lookup at all
 var ENGINE_LOCAL_REFRESH_MS = 500; // how often the badge updates with local-Stockfish deepening progress
-var STOCKFISH_TIME_LIMIT_S = 5;   // TASK_614: bumped from 2s so a depth-24 search actually has time to get there - "go depth N movetime M" stops at whichever bound hits first
-var STOCKFISH_DEPTH_LIMIT = 24;   // Michael's preference (2026-09-22) - was 18
+// TASK_709: the next two, and REPERTOIRE_GUARD's weakMoveCp/localDepth/localTimeMs, are user
+// settings now: defaults in USER_SETTINGS above (5 s - TASK_614 bumped it from 2 s so a depth-24
+// search has time to get there; depth 24 is Michael's preference, 2026-09-22, was 18), overridden
+// per player by applyUserSettings(). "go depth N movetime M" stops at whichever bound hits first.
+var STOCKFISH_TIME_LIMIT_S = userSettingDef('engineTimeSec').def;
+var STOCKFISH_DEPTH_LIMIT = userSettingDef('engineDepth').def;
 var STOCKFISH_HARD_TIMEOUT_BUFFER_MS = 15000;
 // Co-located with board.html itself on the deployed static site (both
 // GitHub Pages and Cloudflare Pages serve straight from the same repo
@@ -2338,7 +2453,7 @@ var stockfishCancel = null;       // settles the in-flight local search through 
 var stockfishAvailable = true;    // flips false after the engine script fails to load once - stop retrying it every Cloud Eval miss for the rest of the session
 
 /* TASK_665_REPERTOIRE_GUARD_START */
-var REPERTOIRE_GUARD = { weakMoveCp: 50, multiPv: 5, localDepth: 16, localTimeMs: 2000 };
+var REPERTOIRE_GUARD = { weakMoveCp: userSettingDef('guardWeakMoveCp').def, multiPv: 5, localDepth: userSettingDef('guardDepth').def, localTimeMs: userSettingDef('guardTimeSec').def * 1000 };  // TASK_709: three of these follow the player's settings
 var guardEvalCache = new Map();   // "multiPv|fen" -> pvs, null for unavailable
 var guardRateLimited = false;     // set when Cloud Eval answers 429, so TASK_668's sync can stop and retry later
 var guardStockfishWorkers = new Set(); // deliberately separate from the badge's cancellation slot
@@ -2623,6 +2738,212 @@ if (analysisModeCheckbox) {
       evalBadgeEl.style.display = 'none';
     }
   });
+}
+
+/*
+  TASK_709 wiring: the signed-in player's settings (settings/<uid>), kept
+  live by a listener so a change on another device applies here too. The
+  pure logic is in the TASK_709_SETTINGS block above. Signed out (or Firebase
+  not configured) there are no settings: everything runs on the defaults and
+  the Settings button stays hidden. Declared without initializers because
+  onAuthStateChanged can call attachSettings before this part has run.
+*/
+var settingsRef;
+var settingsResolved;         // { values, custom } for the current player; undefined until first load
+var settingsLoaded;           // true once the listener has delivered (Save needs it)
+var settingsDirty;            // { key: true } for inputs the player has edited and not yet saved
+var SETTINGS_UNAVAILABLE_TEXT = 'Settings are unavailable right now, so the defaults are in use.';
+var settingsBtnEl = document.getElementById('settingsBtn');
+var settingsDialogEl = document.getElementById('settingsDialog');
+var settingsRowsEl = document.getElementById('settingsRows');
+var settingsStatusEl = document.getElementById('settingsStatus');
+var settingsSaveBtnEl = document.getElementById('settingsSaveBtn');
+var settingsResetAllBtnEl = document.getElementById('settingsResetAllBtn');
+var settingsCloseBtnEl = document.getElementById('settingsCloseBtn');
+
+// Pushes resolved values into the engine/guard variables that the code
+// above reads at call time (nothing is cached, so the next search or
+// weak-move check simply uses them). A change that affects the badge
+// re-runs the eval for the position on screen.
+function applyUserSettings(values) {
+  var engineChanged = STOCKFISH_DEPTH_LIMIT !== values.engineDepth || STOCKFISH_TIME_LIMIT_S !== values.engineTimeSec;
+  STOCKFISH_DEPTH_LIMIT = values.engineDepth;
+  STOCKFISH_TIME_LIMIT_S = values.engineTimeSec;
+  REPERTOIRE_GUARD.weakMoveCp = values.guardWeakMoveCp;
+  REPERTOIRE_GUARD.localDepth = values.guardDepth;
+  REPERTOIRE_GUARD.localTimeMs = values.guardTimeSec * 1000;
+  if (engineChanged && analysisMode) {
+    cancelEval();
+    scheduleEval(buildViewGame().fen());
+  }
+}
+
+function setSettingsStatus(text, isError) {
+  if (!settingsStatusEl) return;
+  settingsStatusEl.textContent = text || '';
+  settingsStatusEl.style.color = isError ? 'var(--text-danger, #f66)' : 'var(--text-secondary, #aaa)';
+}
+
+function buildSettingsRows() {
+  if (!settingsRowsEl || settingsRowsEl.firstChild) return;
+  USER_SETTINGS.forEach(function(def) {
+    var row = document.createElement('div');
+    row.setAttribute('data-setting', def.key);
+    row.style.cssText = 'display:flex; align-items:center; gap:8px; margin:0 0 10px; flex-wrap:wrap;';
+    var label = document.createElement('label');
+    label.setAttribute('for', 'setting-' + def.key);
+    label.style.cssText = 'flex:1 1 200px; font-size:13px;';
+    label.appendChild(document.createTextNode(def.label));
+    var hint = document.createElement('span');
+    hint.style.cssText = 'display:block; font-size:11px; color:var(--text-muted, #999);';
+    hint.textContent = def.hint;
+    label.appendChild(hint);
+    var input = document.createElement('input');
+    input.id = 'setting-' + def.key;
+    input.type = 'number';
+    input.step = '1';
+    input.min = String(def.min);
+    input.max = String(def.max);
+    input.setAttribute('inputmode', 'numeric');
+    input.style.cssText = 'width:64px;';
+    input.setAttribute('aria-describedby', 'settingState-' + def.key);
+    var unit = document.createElement('span');
+    unit.style.cssText = 'font-size:12px; color:var(--text-secondary, #aaa);';
+    unit.textContent = def.unit;
+    var state = document.createElement('span');
+    state.id = 'settingState-' + def.key;
+    state.setAttribute('data-role', 'state');
+    state.style.cssText = 'font-size:11px; color:var(--text-secondary, #aaa); min-width:88px;';
+    var reset = document.createElement('button');
+    reset.setAttribute('data-role', 'reset');
+    reset.textContent = 'Default';
+    reset.title = 'Go back to the default (' + def.def + ') and follow any future change to it';
+    row.appendChild(label); row.appendChild(input); row.appendChild(unit); row.appendChild(state); row.appendChild(reset);
+    settingsRowsEl.appendChild(row);
+    input.addEventListener('input', function() {
+      if (!settingsDirty) settingsDirty = {};
+      settingsDirty[def.key] = true;
+      input.removeAttribute('aria-invalid');
+      setSettingsStatus('');
+    });
+    input.addEventListener('keydown', function(ev) { if (ev.key === 'Enter') { ev.preventDefault(); saveSettingsFromDialog(); } });
+    reset.addEventListener('click', function() { writeSettings(buildSettingsUpdate(singleEdit(def.key)), 'Back to the default.'); });
+  });
+}
+
+function singleEdit(key) { var e = {}; e[key] = null; return e; }
+
+// Paints the resolved values into the dialog. Inputs the player is in the
+// middle of editing are left alone (a change from another device must not
+// wipe what they are typing); their state text still reports what is stored.
+function renderSettings() {
+  if (!settingsRowsEl) return;
+  buildSettingsRows();
+  var resolved = settingsResolved || resolveUserSettings(null);
+  USER_SETTINGS.forEach(function(def) {
+    var row = settingsRowsEl.querySelector('[data-setting="' + def.key + '"]');
+    if (!row) return;
+    var input = row.querySelector('input');
+    if (!(settingsDirty && settingsDirty[def.key])) input.value = String(resolved.values[def.key]);
+    row.querySelector('[data-role="state"]').textContent = resolved.custom[def.key] ? 'yours (default ' + def.def + ')' : 'default';
+    row.querySelector('[data-role="reset"]').disabled = !resolved.custom[def.key] || !settingsLoaded;
+  });
+  if (settingsSaveBtnEl) settingsSaveBtnEl.disabled = !settingsLoaded;
+  if (settingsResetAllBtnEl) settingsResetAllBtnEl.disabled = !settingsLoaded ||
+    !USER_SETTINGS.some(function(def) { return resolved.custom[def.key]; });
+}
+
+function updateSettingsUI() {
+  if (settingsBtnEl) settingsBtnEl.style.display = (currentUser && firebaseReady) ? '' : 'none';
+  renderSettings();
+}
+
+// One multi-path update to settings/<uid>. The listener reports the result
+// (Firebase raises the local event at once and reverts it if the rules refuse).
+function writeSettings(update, okText) {
+  if (!update || !currentUser || !firebaseReady || !settingsLoaded) return Promise.resolve(false);
+  var uid = currentUser.uid;
+  return firebase.database().ref('settings/' + uid).update(update).then(function() {
+    if (!currentUser || currentUser.uid !== uid) return true;
+    Object.keys(update).forEach(function(key) { if (settingsDirty) delete settingsDirty[key]; });
+    renderSettings();
+    setSettingsStatus(okText || 'Saved.');
+    return true;
+  }).catch(function(err) {
+    console.warn('Settings save failed', err);
+    setSettingsStatus("Couldn't save: this account may not be allowed to write. Nothing changed.", true);
+    return false;
+  });
+}
+
+function saveSettingsFromDialog() {
+  if (!settingsRowsEl || !settingsLoaded) return Promise.resolve(false);
+  var resolved = settingsResolved || resolveUserSettings(null);
+  var inputs = {};
+  USER_SETTINGS.forEach(function(def) {
+    var input = settingsRowsEl.querySelector('[data-setting="' + def.key + '"] input');
+    inputs[def.key] = input.value;
+    input.removeAttribute('aria-invalid');
+  });
+  var plan = planSettingsSave(inputs, settingsDirty, resolved);
+  if (!plan.ok) {
+    plan.errors.forEach(function(e) {
+      settingsRowsEl.querySelector('[data-setting="' + e.key + '"] input').setAttribute('aria-invalid', 'true');
+    });
+    var first = plan.errors[0];
+    setSettingsStatus(userSettingDef(first.key).label + ': ' + first.error, true);
+    settingsRowsEl.querySelector('[data-setting="' + first.key + '"] input').focus();
+    return Promise.resolve(false);
+  }
+  plan.unchanged.forEach(function(key) { delete settingsDirty[key]; });  // already their stored choice
+  if (!Object.keys(plan.edits).length) {
+    renderSettings();
+    setSettingsStatus('No changes to save.');
+    return Promise.resolve(true);
+  }
+  return writeSettings(buildSettingsUpdate(plan.edits), 'Saved.');
+}
+
+function attachSettings(user) {
+  if (settingsRef) settingsRef.off();
+  settingsRef = null;
+  settingsResolved = undefined;
+  settingsLoaded = false;
+  settingsDirty = {};
+  if (settingsDialogEl && settingsDialogEl.open) settingsDialogEl.close();
+  applyUserSettings(resolveUserSettings(null).values);  // signed out, or until the first read: the defaults
+  if (user && firebaseReady) {
+    settingsRef = firebase.database().ref('settings/' + user.uid);
+    settingsRef.on('value', function(snapshot) {
+      settingsResolved = resolveUserSettings(snapshot.val());
+      settingsLoaded = true;
+      applyUserSettings(settingsResolved.values);
+      updateSettingsUI();
+    }, function(err) {
+      console.warn('Settings unavailable - using defaults', err);
+      settingsLoaded = false;
+      updateSettingsUI();
+      setSettingsStatus(SETTINGS_UNAVAILABLE_TEXT, true);
+    });
+  }
+  updateSettingsUI();
+}
+
+if (settingsBtnEl && settingsDialogEl) {
+  settingsBtnEl.addEventListener('click', function() {
+    if (!currentUser || typeof settingsDialogEl.showModal !== 'function') return;
+    settingsDirty = {};
+    setSettingsStatus(settingsLoaded ? '' : SETTINGS_UNAVAILABLE_TEXT, !settingsLoaded);
+    renderSettings();
+    settingsDialogEl.showModal();
+  });
+  settingsSaveBtnEl.addEventListener('click', function() { saveSettingsFromDialog(); });
+  settingsResetAllBtnEl.addEventListener('click', function() {
+    var edits = {};
+    USER_SETTINGS.forEach(function(def) { edits[def.key] = null; });
+    writeSettings(buildSettingsUpdate(edits), 'All settings are back to their defaults.');
+  });
+  settingsCloseBtnEl.addEventListener('click', function() { settingsDialogEl.close(); });
 }
 
 /*
@@ -3351,6 +3672,7 @@ document.getElementById('navLiveBtn').onclick = function() { goToPly(game.histor
 document.addEventListener('keydown', function(ev) {
   var tag = document.activeElement && document.activeElement.tagName;
   if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+  if (settingsDialogEl && settingsDialogEl.open) return;  // TASK_709: the dialog owns the keyboard
   if (ev.key === 'ArrowLeft') { ev.preventDefault(); goToPly(viewPly - 1); }
   else if (ev.key === 'ArrowRight') { ev.preventDefault(); goToPly(viewPly + 1); }
   else if (ev.key === 'Home') { ev.preventDefault(); goToPly(0); }
