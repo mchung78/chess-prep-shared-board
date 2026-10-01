@@ -136,13 +136,12 @@ Analysis mode
 </div>
 <dialog id="settingsDialog" aria-labelledby="settingsTitle" style="width:calc(100% - 32px); max-width:460px; box-sizing:border-box; background:var(--bg-primary, #18181b); color:var(--text-primary, #eee); border:1px solid var(--border-strong, #666); border-radius:8px; padding:16px;">
 <h3 id="settingsTitle" style="margin:0 0 4px; font-size:16px;">Settings</h3>
-<p style="margin:0 0 12px; font-size:12px; color:var(--text-secondary, #aaa);">Saved to your account, so they follow you to other devices. A setting left on its default follows any future change to that default.</p>
+<p style="margin:0 0 12px; font-size:12px; color:var(--text-secondary, #aaa);">Saved to your account, so they follow you to other devices. Close saves your changes; Esc closes without saving. A setting left on its default follows any future change to that default.</p>
 <div id="settingsRows"></div>
 <p id="settingsStatus" role="status" aria-live="polite" style="min-height:1.3em; margin:0 0 10px; font-size:12px; color:var(--text-secondary, #aaa);"></p>
 <div style="display:flex; gap:8px; justify-content:flex-end; flex-wrap:wrap;">
 <button id="settingsResetAllBtn">Reset all to defaults</button>
-<button id="settingsSaveBtn">Save</button>
-<button id="settingsCloseBtn">Close</button>
+<button id="settingsCloseBtn" title="Save your changes and close (Esc closes without saving)">Close</button>
 </div>
 </dialog>
 <script>
@@ -162,7 +161,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "b3f235b \u00b7 2026-09-30 21:29 UTC";
+var BOARD_BUILD = "d3142fc \u00b7 2026-10-01 04:28 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -2752,14 +2751,15 @@ if (analysisModeCheckbox) {
 */
 var settingsRef;
 var settingsResolved;         // { values, custom } for the current player; undefined until first load
-var settingsLoaded;           // true once the listener has delivered (Save needs it)
+var settingsLoaded;           // true once the listener has delivered (nothing can be edited or saved before)
+var settingsOpenGen;          // bumped on every opening (and sign-in change); a save only acts on the opening that started it
+var settingsClosing;          // the opening whose Close (save, then close) is in flight; a second click on it is ignored
 var settingsDirty;            // { key: true } for inputs the player has edited and not yet saved
 var SETTINGS_UNAVAILABLE_TEXT = 'Settings are unavailable right now, so the defaults are in use.';
 var settingsBtnEl = document.getElementById('settingsBtn');
 var settingsDialogEl = document.getElementById('settingsDialog');
 var settingsRowsEl = document.getElementById('settingsRows');
 var settingsStatusEl = document.getElementById('settingsStatus');
-var settingsSaveBtnEl = document.getElementById('settingsSaveBtn');
 var settingsResetAllBtnEl = document.getElementById('settingsResetAllBtn');
 var settingsCloseBtnEl = document.getElementById('settingsCloseBtn');
 
@@ -2831,7 +2831,7 @@ function buildSettingsRows() {
       input.removeAttribute('aria-invalid');
       setSettingsStatus('');
     });
-    input.addEventListener('keydown', function(ev) { if (ev.key === 'Enter') { ev.preventDefault(); saveSettingsFromDialog(); } });
+    input.addEventListener('keydown', function(ev) { if (ev.key === 'Enter') { ev.preventDefault(); closeSettingsDialog(); } });
     reset.addEventListener('click', function() { writeSettings(buildSettingsUpdate(singleEdit(def.key)), 'Back to the default.'); });
   });
 }
@@ -2849,11 +2849,11 @@ function renderSettings() {
     var row = settingsRowsEl.querySelector('[data-setting="' + def.key + '"]');
     if (!row) return;
     var input = row.querySelector('input');
+    input.disabled = !settingsLoaded;  // unavailable: Close would have nothing to save, so don't let edits be typed and lost
     if (!(settingsDirty && settingsDirty[def.key])) input.value = String(resolved.values[def.key]);
     row.querySelector('[data-role="state"]').textContent = resolved.custom[def.key] ? 'yours (default ' + def.def + ')' : 'default';
     row.querySelector('[data-role="reset"]').disabled = !resolved.custom[def.key] || !settingsLoaded;
   });
-  if (settingsSaveBtnEl) settingsSaveBtnEl.disabled = !settingsLoaded;
   if (settingsResetAllBtnEl) settingsResetAllBtnEl.disabled = !settingsLoaded ||
     !USER_SETTINGS.some(function(def) { return resolved.custom[def.key]; });
 }
@@ -2868,14 +2868,17 @@ function updateSettingsUI() {
 function writeSettings(update, okText) {
   if (!update || !currentUser || !firebaseReady || !settingsLoaded) return Promise.resolve(false);
   var uid = currentUser.uid;
+  var gen = settingsOpenGen;
   return firebase.database().ref('settings/' + uid).update(update).then(function() {
     if (!currentUser || currentUser.uid !== uid) return true;
+    if (gen !== settingsOpenGen) return true;  // the dialog was reopened since: its edits and status are not this write's to touch
     Object.keys(update).forEach(function(key) { if (settingsDirty) delete settingsDirty[key]; });
     renderSettings();
     setSettingsStatus(okText || 'Saved.');
     return true;
   }).catch(function(err) {
     console.warn('Settings save failed', err);
+    if (gen !== settingsOpenGen) return false;
     setSettingsStatus("Couldn't save: this account may not be allowed to write. Nothing changed.", true);
     return false;
   });
@@ -2903,10 +2906,27 @@ function saveSettingsFromDialog() {
   plan.unchanged.forEach(function(key) { delete settingsDirty[key]; });  // already their stored choice
   if (!Object.keys(plan.edits).length) {
     renderSettings();
-    setSettingsStatus('No changes to save.');
-    return Promise.resolve(true);
+    return Promise.resolve(true);  // nothing to write
   }
   return writeSettings(buildSettingsUpdate(plan.edits), 'Saved.');
+}
+
+// Close = save what was edited, then close. The window stays open, with the reason in the
+// status line and the typed values kept, when an edit is not valid or could not be saved, so
+// nothing is dropped silently. Esc is the way out without saving (the dialog's native cancel).
+function closeSettingsDialog() {
+  if (!settingsDialogEl || (settingsClosing && settingsClosing === settingsOpenGen)) return Promise.resolve(false);
+  if (!settingsLoaded) {  // the boxes are disabled: nothing could have been edited
+    if (settingsDialogEl.open) settingsDialogEl.close();
+    return Promise.resolve(true);
+  }
+  var gen = settingsClosing = settingsOpenGen;
+  return saveSettingsFromDialog().then(function(ok) {
+    if (settingsClosing === gen) settingsClosing = false;
+    // Esc then reopen while the save was pending: the new opening is not ours to close.
+    if (ok && gen === settingsOpenGen && settingsDialogEl.open) settingsDialogEl.close();
+    return ok;
+  });
 }
 
 function attachSettings(user) {
@@ -2915,6 +2935,7 @@ function attachSettings(user) {
   settingsResolved = undefined;
   settingsLoaded = false;
   settingsDirty = {};
+  settingsOpenGen = (settingsOpenGen || 0) + 1;
   if (settingsDialogEl && settingsDialogEl.open) settingsDialogEl.close();
   trainCapReady = false;
   applyUserSettings(resolveUserSettings(null).values);  // signed out, or until the first read: the defaults
@@ -2943,17 +2964,17 @@ if (settingsBtnEl && settingsDialogEl) {
   settingsBtnEl.addEventListener('click', function() {
     if (!currentUser || typeof settingsDialogEl.showModal !== 'function') return;
     settingsDirty = {};
+    settingsOpenGen = (settingsOpenGen || 0) + 1;
     setSettingsStatus(settingsLoaded ? '' : SETTINGS_UNAVAILABLE_TEXT, !settingsLoaded);
     renderSettings();
     settingsDialogEl.showModal();
   });
-  settingsSaveBtnEl.addEventListener('click', function() { saveSettingsFromDialog(); });
   settingsResetAllBtnEl.addEventListener('click', function() {
     var edits = {};
     USER_SETTINGS.forEach(function(def) { edits[def.key] = null; });
     writeSettings(buildSettingsUpdate(edits), 'All settings are back to their defaults.');
   });
-  settingsCloseBtnEl.addEventListener('click', function() { settingsDialogEl.close(); });
+  settingsCloseBtnEl.addEventListener('click', function() { closeSettingsDialog(); });
 }
 
 /*
