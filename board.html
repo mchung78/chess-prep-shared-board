@@ -159,7 +159,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "2072249 \u00b7 2026-10-03 13:15 UTC";
+var BOARD_BUILD = "3171d4c \u00b7 2026-10-03 13:26 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -2320,18 +2320,41 @@ function goToPly(ply) {
 /* TASK_709_SETTINGS_START */
 var USER_SETTINGS = [
   { key: 'engineDepth', label: 'Analysis depth', unit: 'plies', min: 10, max: 30, def: 24,
-    hint: 'Local Stockfish search depth for Analysis mode.' },
+    group: 'analysis', short: 'depth' },
   { key: 'engineTimeSec', label: 'Analysis time limit', unit: 'seconds', min: 1, max: 30, def: 5,
-    hint: 'Longest local Stockfish search per position; it stops at depth or time, whichever comes first.' },
+    group: 'analysis', short: 'time (s)' },
   { key: 'guardWeakMoveCp', label: 'Weak-move threshold', unit: 'centipawns', min: 10, max: 300, def: 50,
     hint: 'A move that loses at least this much versus the best move is not added to your repertoire.' },
   { key: 'guardDepth', label: 'Repertoire check depth', unit: 'plies', min: 10, max: 30, def: 16,
-    hint: 'Local Stockfish depth for the weak-move check when Lichess has no cached evaluation.' },
-  { key: 'guardTimeSec', label: 'Repertoire check time limit', unit: 'seconds', min: 1, max: 10, def: 2,
-    hint: 'Longest local search per position for the weak-move check.' },
+    group: 'guard', short: 'depth' },
+  { key: 'guardTimeSec', label: 'Repertoire check time limit', unit: 'seconds', min: 1, max: 10, def: 1,
+    group: 'guard', short: 'time (s)' },
   { key: 'maxDue', label: 'Maximum cards due', unit: 'per side', min: 1, max: 1000, def: 25,
     hint: 'Cards above this many are deferred 12 hours, lowest probability first.' }
 ];
+
+// Settings that share one line in the dialog (depth and time limit side by side).
+// Presentation only: every setting keeps its own stored key, bounds and default.
+var USER_SETTING_GROUPS = {
+  analysis: { title: 'Analysis',
+    hint: 'Local Stockfish search in Analysis mode; stops at the depth or time, whichever comes first.' },
+  guard: { title: 'Repertoire check',
+    hint: 'Local Stockfish search for the weak-move check when Lichess has no cached evaluation.' }
+};
+
+// The dialog's rows, in order: consecutive settings of one group share a row.
+// -> [{ id, title, hint, defs }]; id is the group name, or the key of a lone setting.
+function settingsRows() {
+  var rows = [];
+  USER_SETTINGS.forEach(function(def) {
+    var last = rows[rows.length - 1];
+    if (def.group && last && last.group === def.group) { last.defs.push(def); return; }
+    var g = def.group ? USER_SETTING_GROUPS[def.group] : null;
+    rows.push({ id: def.group || def.key, group: def.group || null,
+      title: g ? g.title : def.label, hint: g ? g.hint : def.hint, defs: [def] });
+  });
+  return rows;
+}
 
 function userSettingDef(key) {
   for (var i = 0; i < USER_SETTINGS.length; i++) if (USER_SETTINGS[i].key === key) return USER_SETTINGS[i];
@@ -2421,6 +2444,8 @@ var ENGINE_LOCAL_REFRESH_MS = 500; // how often the badge updates with local-Sto
 // settings now: defaults in USER_SETTINGS above (5 s - TASK_614 bumped it from 2 s so a depth-24
 // search has time to get there; depth 24 is Michael's preference, 2026-09-22, was 18), overridden
 // per player by applyUserSettings(). "go depth N movetime M" stops at whichever bound hits first.
+// Analysis is 24 plies / 5 s on purpose: it goes deep and updates live, so slow is expected. The
+// Repertoire check is 16 plies / 1 s: a quick check, not an analysis (Michael, 2026-10-03; was 2 s).
 var STOCKFISH_TIME_LIMIT_S = userSettingDef('engineTimeSec').def;
 var STOCKFISH_DEPTH_LIMIT = userSettingDef('engineDepth').def;
 var STOCKFISH_HARD_TIMEOUT_BUFFER_MS = 15000;
@@ -2785,52 +2810,76 @@ function setSettingsStatus(text, isError) {
 
 function buildSettingsRows() {
   if (!settingsRowsEl || settingsRowsEl.firstChild) return;
-  USER_SETTINGS.forEach(function(def) {
+  settingsRows().forEach(function(r) {
+    var grouped = r.defs.length > 1;
     var row = document.createElement('div');
-    row.setAttribute('data-setting', def.key);
-    row.style.cssText = 'display:flex; align-items:center; gap:8px; margin:0 0 10px; flex-wrap:wrap;';
-    var label = document.createElement('label');
-    label.setAttribute('for', 'setting-' + def.key);
-    label.style.cssText = 'flex:1 1 200px; font-size:13px;';
-    label.appendChild(document.createTextNode(def.label));
-    var hint = document.createElement('span');
-    hint.style.cssText = 'display:block; font-size:11px; color:var(--text-muted, #999);';
-    hint.textContent = def.hint;
-    label.appendChild(hint);
-    var input = document.createElement('input');
-    input.id = 'setting-' + def.key;
-    input.type = 'number';
-    input.step = '1';
-    input.min = String(def.min);
-    input.max = String(def.max);
-    input.setAttribute('inputmode', 'numeric');
-    input.style.cssText = 'width:64px;';
-    input.setAttribute('aria-describedby', 'settingState-' + def.key);
-    var unit = document.createElement('span');
-    unit.style.cssText = 'font-size:12px; color:var(--text-secondary, #aaa);';
-    unit.textContent = def.unit;
+    row.setAttribute('data-row', r.id);
+    row.style.cssText = 'display:flex; align-items:center; gap:2px 8px; margin:0 0 10px; flex-wrap:wrap;';
+    if (grouped) { row.setAttribute('role', 'group'); row.setAttribute('aria-label', r.title); }
+    // Title + state on the left, the boxes (and Default) on the right, the hint under both.
+    var head = document.createElement(grouped ? 'div' : 'label');
+    if (!grouped) head.setAttribute('for', 'setting-' + r.defs[0].key);
+    head.style.cssText = 'flex:1 1 130px; font-size:13px;';
+    head.appendChild(document.createTextNode(r.title));
     var state = document.createElement('span');
-    state.id = 'settingState-' + def.key;
+    state.id = 'settingState-' + r.id;
     state.setAttribute('data-role', 'state');
-    state.style.cssText = 'font-size:11px; color:var(--text-secondary, #aaa); min-width:88px;';
+    state.style.cssText = 'display:block; font-size:11px; color:var(--text-secondary, #aaa);';
+    head.appendChild(state);
+    var controls = document.createElement('div');
+    controls.style.cssText = 'display:flex; align-items:center; gap:8px; flex:0 0 auto;';
+    r.defs.forEach(function(def) {
+      var cell = document.createElement('span');
+      cell.setAttribute('data-setting', def.key);
+      cell.style.cssText = 'display:inline-flex; align-items:center; gap:4px;';
+      var caption = document.createElement(grouped ? 'label' : 'span');
+      if (grouped) caption.setAttribute('for', 'setting-' + def.key);
+      caption.style.cssText = 'font-size:12px; color:var(--text-secondary, #aaa);';
+      caption.textContent = grouped ? def.short : '';
+      var input = document.createElement('input');
+      input.id = 'setting-' + def.key;
+      input.type = 'number';
+      input.step = '1';
+      input.min = String(def.min);
+      input.max = String(def.max);
+      input.setAttribute('inputmode', 'numeric');
+      input.style.cssText = 'width:' + (grouped ? '56' : '64') + 'px;';
+      input.setAttribute('aria-describedby', 'settingState-' + r.id);
+      if (grouped) cell.appendChild(caption);
+      cell.appendChild(input);
+      if (!grouped) {
+        var unit = document.createElement('span');
+        unit.style.cssText = 'font-size:12px; color:var(--text-secondary, #aaa);';
+        unit.textContent = def.unit;
+        cell.appendChild(unit);
+      }
+      controls.appendChild(cell);
+      input.addEventListener('input', function() {
+        if (!settingsDirty) settingsDirty = {};
+        settingsDirty[def.key] = true;
+        input.removeAttribute('aria-invalid');
+        setSettingsStatus('');
+      });
+      input.addEventListener('keydown', function(ev) { if (ev.key === 'Enter') { ev.preventDefault(); closeSettingsDialog(); } });
+    });
     var reset = document.createElement('button');
     reset.setAttribute('data-role', 'reset');
     reset.textContent = 'Default';
-    reset.title = 'Go back to the default (' + def.def + ') and follow any future change to it';
-    row.appendChild(label); row.appendChild(input); row.appendChild(unit); row.appendChild(state); row.appendChild(reset);
-    settingsRowsEl.appendChild(row);
-    input.addEventListener('input', function() {
-      if (!settingsDirty) settingsDirty = {};
-      settingsDirty[def.key] = true;
-      input.removeAttribute('aria-invalid');
-      setSettingsStatus('');
+    reset.title = 'Go back to the default' + (grouped ? 's (' + r.defs.map(function(d) { return d.def; }).join(', ') + ')' : ' (' + r.defs[0].def + ')') +
+      ' and follow any future change to ' + (grouped ? 'them' : 'it');
+    reset.addEventListener('click', function() {
+      var edits = {};
+      r.defs.forEach(function(def) { edits[def.key] = null; });
+      writeSettings(buildSettingsUpdate(edits), grouped ? 'Back to the defaults.' : 'Back to the default.');
     });
-    input.addEventListener('keydown', function(ev) { if (ev.key === 'Enter') { ev.preventDefault(); closeSettingsDialog(); } });
-    reset.addEventListener('click', function() { writeSettings(buildSettingsUpdate(singleEdit(def.key)), 'Back to the default.'); });
+    controls.appendChild(reset);
+    var hint = document.createElement('div');
+    hint.style.cssText = 'flex:1 1 100%; font-size:11px; color:var(--text-muted, #999);';
+    hint.textContent = r.hint;
+    row.appendChild(head); row.appendChild(controls); row.appendChild(hint);
+    settingsRowsEl.appendChild(row);
   });
 }
-
-function singleEdit(key) { var e = {}; e[key] = null; return e; }
 
 // Paints the resolved values into the dialog. Inputs the player is in the
 // middle of editing are left alone (a change from another device must not
@@ -2839,14 +2888,18 @@ function renderSettings() {
   if (!settingsRowsEl) return;
   buildSettingsRows();
   var resolved = settingsResolved || resolveUserSettings(null);
-  USER_SETTINGS.forEach(function(def) {
-    var row = settingsRowsEl.querySelector('[data-setting="' + def.key + '"]');
+  settingsRows().forEach(function(r) {
+    var row = settingsRowsEl.querySelector('[data-row="' + r.id + '"]');
     if (!row) return;
-    var input = row.querySelector('input');
-    input.disabled = !settingsLoaded;  // unavailable: Close would have nothing to save, so don't let edits be typed and lost
-    if (!(settingsDirty && settingsDirty[def.key])) input.value = String(resolved.values[def.key]);
-    row.querySelector('[data-role="state"]').textContent = resolved.custom[def.key] ? 'yours (default ' + def.def + ')' : 'default';
-    row.querySelector('[data-role="reset"]').disabled = !resolved.custom[def.key] || !settingsLoaded;
+    r.defs.forEach(function(def) {
+      var input = row.querySelector('[data-setting="' + def.key + '"] input');
+      input.disabled = !settingsLoaded;  // unavailable: Close would have nothing to save, so don't let edits be typed and lost
+      if (!(settingsDirty && settingsDirty[def.key])) input.value = String(resolved.values[def.key]);
+    });
+    var anyCustom = r.defs.some(function(def) { return resolved.custom[def.key]; });
+    row.querySelector('[data-role="state"]').textContent = anyCustom
+      ? 'yours (default ' + r.defs.map(function(d) { return d.def; }).join(' / ') + ')' : 'default';
+    row.querySelector('[data-role="reset"]').disabled = !anyCustom || !settingsLoaded;
   });
   if (settingsResetAllBtnEl) settingsResetAllBtnEl.disabled = !settingsLoaded ||
     !USER_SETTINGS.some(function(def) { return resolved.custom[def.key]; });
