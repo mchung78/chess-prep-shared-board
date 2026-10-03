@@ -159,7 +159,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "98be357 \u00b7 2026-10-03 04:46 UTC";
+var BOARD_BUILD = "a5d8c2b \u00b7 2026-10-03 05:09 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -4025,6 +4025,39 @@ function stopTraining(message) {
   if (t.pendingRemote !== undefined) applyRemoteState(t.pendingRemote);
 }
 
+// The message that ends the line at the player's turn in the current position,
+// or null when the player can move (asked, or played for them from a known
+// position). gapPending: the position is a gap the player fills.
+function trainPlayerTurnEnd(t, gapPending) {
+  if (gapPending) return null;
+  if (activeFavoritesAt(game).length === 0) {
+    // #668: the end of a game-mistake target is a gap fill, not the end of the prep
+    return trainAtTargetEnd(t) ? null : 'End of your prep here.';
+  }
+  if (t.hadTarget && trainSkipsPosition(t.cards[repertoireStorageKey(samePositionKey(game))], Date.now(), TRAIN_CONFIG) &&
+      !trainKnownMove(t)) return 'Line complete.';
+  return null;
+}
+
+// The opponent must not play a reply the player then never answers: would the
+// line end at the player's turn right after the opponent plays san
+// (gapPending: that reply leaves a gap to fill)? The move is tried on the
+// board and taken back. Returns the message that ends the line, or null.
+function trainOpponentMoveEndsLine(t, san, gapPending) {
+  // The line's first move: ending before it is an empty line, not an ending.
+  if (game.history().length <= t.rootPly) return null;
+  var savedTarget = t.target;  // trainKnownMove drops a diverged target
+  var message = null;
+  if (game.move(san)) {
+    if (!game.game_over() && game.history().length - t.rootPly < TRAIN_CONFIG.maxLinePlies) {
+      message = trainPlayerTurnEnd(t, gapPending);
+    }
+    game.undo();
+  }
+  t.target = savedTarget;
+  return message;
+}
+
 // Decide what happens in the current position.
 function trainStep() {
   var t = train;
@@ -4034,12 +4067,13 @@ function trainStep() {
   var plies = game.history().length - t.rootPly;
   if (game.game_over() || plies >= TRAIN_CONFIG.maxLinePlies) return trainEndLine('Line complete.');
   if (game.turn() === t.color) {
+    var endMessage = trainPlayerTurnEnd(t, t.gapPending);
+    if (endMessage) return trainEndLine(endMessage);
     var atGameMistake = !t.gapPending && activeFavoritesAt(game).length === 0 && trainAtTargetEnd(t);
-    if (!t.gapPending && !atGameMistake && activeFavoritesAt(game).length === 0) return trainEndLine('End of your prep here.');
     if (!t.gapPending && !atGameMistake && t.hadTarget &&
         trainSkipsPosition(t.cards[repertoireStorageKey(samePositionKey(game))], Date.now(), TRAIN_CONFIG)) {
       var known = trainKnownMove(t);
-      if (!known) return trainEndLine('Line complete.');
+      if (!known) return trainEndLine('Line complete.');  // unreachable: trainPlayerTurnEnd ended the line
       t.busy = true;
       setTrainMessage('Playing your known moves...');
       var lineId = t.lineId;
@@ -4072,6 +4106,8 @@ function trainStep() {
 async function trainOpponentMove(t, lineId) {
   var targetMove = trainLegalSan(trainTargetMove(t));  // #678: also through a check
   if (targetMove) {
+    var targetEnd = trainOpponentMoveEndsLine(t, targetMove, t.gapPending);
+    if (targetEnd) return trainEndLine(targetEnd);
     t.opponentTimer = setTimeout(function() {
       if (train !== t || t.lineId !== lineId) return;
       playAnimatedMove(targetMove);  // #689
@@ -4093,6 +4129,8 @@ async function trainOpponentMove(t, lineId) {
   var choices = trainOpponentChoices(legal, explorerStats.get(key) || null, TRAIN_CONFIG);
   if (!choices.length) { t.busy = false; return trainEndLine('End of your prep here.'); }
   var pick = trainPick(choices, Math.random());
+  var pickEnd = trainOpponentMoveEndsLine(t, pick.san, pick.gap);
+  if (pickEnd) return trainEndLine(pickEnd);
   t.opponentTimer = setTimeout(function() {
     if (train !== t || t.lineId !== lineId) return;
     playAnimatedMove(pick.san);  // #689
