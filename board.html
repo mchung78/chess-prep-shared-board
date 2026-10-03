@@ -159,7 +159,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "ac7f392 \u00b7 2026-10-01 22:58 UTC";
+var BOARD_BUILD = "7fd2638 \u00b7 2026-10-03 04:38 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1056,7 +1056,7 @@ var TRAIN_CONFIG = {
   mistakeHintDelayMaxSeconds: 2,
   mistakeWindowDays: 7,
   opponentDelayMs: 450,
-  lineEndPauseMs: 1500,
+  lineEndPauseMs: 300,
   maxLinePlies: 80,
   lastMistakeToleranceMs: 60 * 1000,  // #678: server/client clock skew on lastMistake
 };
