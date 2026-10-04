@@ -82,7 +82,7 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
   <button id="linkLichessBtn" style="display:none;" title="Link your Lichess account: Train drills the opening mistakes from your recent games.">Link Lichess</button>
   <button id="settingsBtn" style="display:none;" title="Your analysis, repertoire-check, and training settings.">Settings</button>
 </div>
-<div id="repertoireStats" style="display:none; margin-top:6px; font-size:12px; color:var(--text-secondary, #aaa); white-space:pre-wrap;" title="Learned: answered cleanly on a review after its first day, with no miss since. Due: scheduled for review now. 50/94 due: 94 are due, the cap defers all but 50 (lowest probability first) for 12 hours."></div>
+<div id="repertoireStats" style="display:none; margin-top:6px; font-size:12px; color:var(--text-secondary, #aaa); white-space:pre-wrap;" title="Learned: answered cleanly on a review after its first day, with no miss since. Due: scheduled for review now. 50/94 due: 94 are due, the cap defers all but 50 for 2 hours: lowest probability first, with positions from your own recent Lichess games ranked one level higher."></div>
 </div>
 <div style="flex:1; min-width:220px;">
 <p id="turnLabel" style="font-size:14px; color:var(--text-secondary, #aaa); margin:0 0 12px;">White to move</p>
@@ -159,7 +159,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "752d996 \u00b7 2026-10-04 04:45 UTC";
+var BOARD_BUILD = "330e0d3 \u00b7 2026-10-04 05:06 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1296,13 +1296,18 @@ function srsPickTarget(cards, now, rootPath, reach, pathLive, boost, level) {
   and #678's "when was it last reviewed" inference). A review or a new game
   mistake writes a fresh card, which drops deferUntil. The user's maximum is
   settings/<uid>/maxDue (Firebase), alongside the board's other settings.
+  #758: a deferral lasts 2 hours (was 12), and a position reached in my own
+  Lichess games (the ones the move list auto-bolds) counts seenTierBoost
+  probability levels higher when the cap picks what to defer (trainCapLevel) -
+  only there, not in the target pick.
 */
 var TRAIN_DUE_CAP = {
   // Mirrored in USER_SETTINGS.maxDue; board-settings.test.js keeps the rules in sync.
   defaultMaxDue: 25,
   minMaxDue: 1,
   maxMaxDue: 1000,
-  deferMs: 12 * 60 * 60 * 1000,
+  deferMs: 2 * 60 * 60 * 1000,  // #758: was 12 hours (the rules allow up to 24)
+  seenTierBoost: 1,             // #758: levels up for a position seen in my own games (green is the floor)
 };
 
 function srsIsDeferred(card, now) {
@@ -1313,6 +1318,15 @@ function trainNormalizeMaxDue(value, cfg) {
   var n = typeof value === 'number' ? value : NaN;
   if (!isFinite(n)) return cfg.defaultMaxDue;
   return Math.min(cfg.maxMaxDue, Math.max(cfg.minMaxDue, Math.round(n)));
+}
+
+// #758: the level the cap ranks a card at. A position reached in my own games
+// moves seenTierBoost levels toward green (1), never past it. An unknown
+// level (no stored p) is returned as is - srsPlanDeferrals already counts it
+// as green, so there is nothing to move up.
+function trainCapLevel(level, seen, cfg) {
+  if (typeof level !== 'number' || !seen) return level;
+  return Math.max(1, level - cfg.seenTierBoost);
 }
 
 // The ordering within a level, shared by target picking and the cap:
@@ -1719,6 +1733,35 @@ function gameRowText(id, record, targetsById) {
   parts.push(record.speed);
   var text = parts.join(' \u00b7 ');
   return targetsById && targetsById[id] ? text + ' \u26a0' : text;
+}
+
+/*
+  #758: the positions reached in my cached games - the board's counterpart of
+  the Chrome extension's game-history position index (background.js
+  buildPositionIndex): the position AFTER every ply of every cached game, both
+  sides' moves, whichever colour I played. { key: true }. The start position is
+  not included, so it is never "reached". A move in the move list is bolded
+  when the position after it is in this set (the extension's auto-bold), and a
+  Train card whose position is in it ranks one level higher when the cap
+  defers - one definition for both, so a bold move is exactly a boosted card.
+  Keys are storageKey(sameKey(chess)), the ones Train's cards and the
+  repertoire use, so transpositions match. Cached moves are external input:
+  replayed with chess.js and cut at the first illegal one. sameKey and
+  storageKey are injected (board helpers), like gameMistakeScan's.
+*/
+function gamePositionsReached(cache, ChessImpl, sameKey, storageKey) {
+  var reached = {};
+  Object.keys(cache || {}).forEach(function(id) {
+    var r = cache[id];
+    if (!r || typeof r.movesSan !== 'string') return;
+    var chess = new ChessImpl();
+    var tokens = r.movesSan.split(' ').filter(Boolean);
+    for (var i = 0; i < tokens.length; i++) {
+      if (!chess.move(tokens[i])) break;
+      reached[storageKey(sameKey(chess))] = true;
+    }
+  });
+  return reached;
 }
 /* TASK_684_GAMES_END */
 
@@ -2330,7 +2373,7 @@ var USER_SETTINGS = [
   { key: 'guardTimeSec', label: 'Repertoire check time limit', unit: 'seconds', min: 1, max: 10, def: 1,
     group: 'guard', short: 'time (s)' },
   { key: 'maxDue', label: 'Maximum cards due', unit: 'per side', min: 1, max: 1000, def: 25,
-    hint: 'Cards above this many are deferred 12 hours, lowest probability first.' }
+    hint: 'Cards above this many are deferred 2 hours, lowest probability first (positions from your Lichess games rank one level higher).' }
 ];
 
 // Settings that share one line in the dialog (depth and time limit side by side).
@@ -3111,13 +3154,36 @@ function renderRepertoireStats() {
 /*
   #712: the cap on cards due, per side. trainMaxDue is the user's setting
   (settings/<uid>/maxDue). trainApplyDueCap defers the lowest-priority
-  cards above it for 12 hours (deferUntil on the card), decided from the
+  cards above it for 2 hours (deferUntil on the card), decided from the
   cards' stored p (a cold Explorer cache would otherwise mis-tier them) and
   scored like Train's target pick, with reach from the standard start.
+  #758: a position reached in my own cached Lichess games (bold in the move
+  list) ranks one level higher (trainCapLevel), so the plan waits until that
+  cache has answered.
   Needs a signed-in player, a loaded repertoire and the standard start.
 */
 var trainMaxDue;  // populated by applyUserSettings; the default is applied before a user's settings load
 var trainCapReady;  // true once the settings read has answered (value or failure); trainApplyDueCap waits for it
+
+// #758: the plan also needs to know which positions came up in my games. Ready
+// once the games cache has answered (value or failure), or when there is none
+// to wait for (the link lives in browser storage - no cache, no boost).
+function trainGamesReady() {
+  return gameLinkMode === 'local' || (gameLinkMode === 'firebase' && !!gamesCacheAnswered);
+}
+
+// Was this position (a storage key) reached in one of my cached games? Drives
+// both the move list's auto-bold and the cap's one-level boost. The scan
+// replays every cached game, so it is memoized per cache snapshot.
+function positionReachedInGames(sk) {
+  if (!gamesReachedMemo || gamesReachedMemo.cache !== gamesCache) {
+    gamesReachedMemo = {
+      cache: gamesCache,
+      reached: gamePositionsReached(pruneGameCache(gamesCache || {}, Date.now(), GAME_CACHE), Chess, samePositionKey, repertoireStorageKey),
+    };
+  }
+  return gamesReachedMemo.reached[sk] === true;
+}
 
 function trainMirrorDeferral(colour, sk, until) {
   [statsCards && statsCards[colour], train && train.color === colour ? train.cards : null].forEach(function(cards) {
@@ -3128,7 +3194,7 @@ function trainMirrorDeferral(colour, sk, until) {
 // cardsByColour: { w: {sk: card}, b: {...} } (defaults to the stats copy).
 function trainApplyDueCap(cardsByColour) {
   cardsByColour = cardsByColour || statsCards;
-  if (!cardsByColour || !repertoireData || !srsAvailable() || !trainCapReady) return;  // never plan against the default cap before the player's setting is known
+  if (!cardsByColour || !repertoireData || !srsAvailable() || !trainCapReady || !trainGamesReady()) return;  // never plan against the default cap before the player's setting is known, nor without the positions from their games (#758)
   var now = Date.now();
   var until = now + TRAIN_DUE_CAP.deferMs;
   var updates = {};
@@ -3138,7 +3204,7 @@ function trainApplyDueCap(cardsByColour) {
     if (!cards) return;
     var keys = srsPlanDeferrals(cards, now, trainNormalizeMaxDue(trainMaxDue, TRAIN_DUE_CAP),
       function(sk) { return repertoireFavorites(repertoireData, sk).length > 0; },
-      function(sk, card) { return trainLevelFromProbability(card.p); },
+      function(sk, card) { return trainCapLevel(trainLevelFromProbability(card.p), positionReachedInGames(sk), TRAIN_DUE_CAP); },  // #758
       function(sk, card) {
         var reach = typeof card.path === 'string' ? trainReach({ rootPly: 0, color: colour }, card.path) : 1;
         return srsPriorityScore(card, now, reach, trainGameMistakeBoost(colour, sk));
@@ -3598,10 +3664,10 @@ function renderMoveList() {
     numSpan.textContent = num + '. ';
     numSpan.style.color = 'var(--text-secondary, #aaa)';
     moveListEl.appendChild(numSpan);
-    moveListEl.appendChild(makeMoveSpan(hist[i], i + 1, rarity[i]));
+    moveListEl.appendChild(makeMoveSpan(hist[i], i + 1, rarity[i], plyReachedInGames(plies[i])));
     if (hist[i + 1]) {
       moveListEl.appendChild(document.createTextNode(' '));
-      moveListEl.appendChild(makeMoveSpan(hist[i + 1], i + 2, rarity[i + 1]));
+      moveListEl.appendChild(makeMoveSpan(hist[i + 1], i + 2, rarity[i + 1], plyReachedInGames(plies[i + 1])));
     }
     moveListEl.appendChild(document.createTextNode('  '));
   }
@@ -3625,7 +3691,14 @@ function renderRemoveRepertoireButton() {
 }
 document.getElementById('removeRepertoireBtn').onclick = removeViewedRepertoireMove;
 
-function makeMoveSpan(san, ply, rarity) {
+// #758: is the position after this ply (from buildRarityPlies) one of my games reached?
+function plyReachedInGames(ply) {
+  return !!(ply && ply.afterKey && positionReachedInGames(repertoireStorageKey(ply.afterKey)));
+}
+
+// bold (#758): the position after this move was reached in one of my cached
+// Lichess games - the extension's auto-bold.
+function makeMoveSpan(san, ply, rarity, bold) {
   var span = document.createElement('span');
   span.textContent = san;
   span.style.cursor = 'pointer';
@@ -3633,7 +3706,9 @@ function makeMoveSpan(san, ply, rarity) {
   span.style.borderRadius = '3px';
   // TASK_620: rarity color, like the extension's move-list coloring
   if (rarity && rarity.color) span.style.color = rarity.color;
+  if (bold) span.style.fontWeight = 'bold';
   var tip = rarityTooltip(rarity);
+  if (bold) tip = (tip ? tip + '\n' : '') + 'Reached in one of your recent Lichess games';
   if (tip) span.title = tip;
   if (ply === viewPly) {
     span.style.background = 'var(--border-accent, #4a9eff)';
@@ -4350,6 +4425,8 @@ var gameLinkMode;      // 'firebase' (lichess/<uid>/link) | 'pending' (reading i
 var gameLinkWritten;   // JSON of the link last written to Firebase
 var gamesRef;          // listener on lichess/<uid>/games
 var gamesCache;        // game id -> cached record (TASK_684 block)
+var gamesCacheAnswered; // #758: true once lichess/<uid>/games has answered (value or failure)
+var gamesReachedMemo;  // #758: { cache, reached } - gamePositionsReached of the current gamesCache
 var gamesRefreshAt;    // last Refresh click - at most one forced sync a minute
 var GAME_LINK_FIELDS = ['username', 'since', 'gamesSince', 'lastSyncAt', 'unlinkedAt'];
 
@@ -4367,6 +4444,8 @@ function attachGameMistakes(user) {
   if (gamesRef) gamesRef.off();
   gamesRef = null;
   gamesCache = {};
+  gamesCacheAnswered = false;
+  gamesReachedMemo = null;
   gameLinkMode = 'local';
   gameLinkWritten = null;
   if (user) {
@@ -4383,6 +4462,11 @@ function attachGameMistakes(user) {
   }
   updateLinkLichessUI();
   renderGames();
+  // #758: the move list's auto-bold reads gamesCache, just emptied (sign-out, or
+  // another player). attachRepertoire drew the list before this reset, so draw
+  // it again. Guarded like the auth callback's own redraw: this can run before
+  // the Explorer state further down the script has initialized.
+  if (explorerStats instanceof Map) renderMoveList();
 }
 
 // #684 decision 3: the link and cursors live in lichess/<uid>/link. A #668
@@ -4401,8 +4485,17 @@ function loadGameLink(user) {
     gamesRef = root.child('games');
     gamesRef.on('value', function(snapshot) {
       gamesCache = (snapshot && snapshot.val()) || {};
+      gamesCacheAnswered = true;
       renderGames();
-    }, function(err) { console.warn('Lichess games unavailable', err); });
+      renderMoveList();  // #758: the auto-bold follows the cache
+      if (!train) trainApplyDueCap();  // #758: the cap was waiting for these (not mid-session, like the minute timer)
+      renderRepertoireStats();
+    }, function(err) {
+      console.warn('Lichess games unavailable', err);
+      gamesCacheAnswered = true;  // plan without the boost rather than never
+      if (!train) trainApplyDueCap();
+      renderRepertoireStats();
+    });
     updateLinkLichessUI();
     renderGames();
     maybeSyncGameMistakes();
@@ -4431,6 +4524,8 @@ function loadGameLink(user) {
     updateLinkLichessUI();
     renderGames();
     maybeSyncGameMistakes();
+    if (!train) trainApplyDueCap();  // #758: no games cache to wait for any more
+    renderRepertoireStats();
   });
 }
 
