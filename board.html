@@ -150,6 +150,14 @@ Analysis mode
 <h3 id="settingsTitle" style="margin:0 0 4px; font-size:16px;">Settings</h3>
 <p style="margin:0 0 12px; font-size:12px; color:var(--text-secondary, #aaa);">Saved to your account, so they follow you to other devices. Close saves your changes; Esc closes without saving. A setting left on its default follows any future change to that default.</p>
 <div id="settingsRows"></div>
+<div id="settingsLichess" data-row="lichess" style="display:none; align-items:center; gap:2px 8px; margin:0 0 10px; flex-wrap:wrap;">
+<div style="flex:1 1 130px; font-size:13px;">Lichess account<span id="settingsLichessState" style="display:block; font-size:11px; color:var(--text-secondary, #aaa);"></span></div>
+<div style="display:flex; align-items:center; gap:8px; flex:0 0 auto;">
+<button id="settingsLichessChangeBtn">Link</button>
+<button id="settingsLichessUnlinkBtn" style="display:none;" title="Remove the link and the games cached from this account.">Unlink</button>
+</div>
+<div style="flex:1 1 100%; font-size:11px; color:var(--text-muted, #999);">Train drills the opening mistakes from your recent games. A change here applies at once; Close does not save it.</div>
+</div>
 <p id="settingsStatus" role="status" aria-live="polite" style="min-height:1.3em; margin:0 0 10px; font-size:12px; color:var(--text-secondary, #aaa);"></p>
 <div style="display:flex; gap:8px; justify-content:flex-end; flex-wrap:wrap;">
 <button id="settingsResetAllBtn">Reset all to defaults</button>
@@ -173,7 +181,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "59a0468 \u00b7 2026-10-07 02:49 UTC";
+var BOARD_BUILD = "3641fb9 \u00b7 2026-10-07 02:50 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -4627,50 +4635,90 @@ function saveGameMistakesState() {
   }
 }
 
+var settingsLichessEl = document.getElementById('settingsLichess');
+var settingsLichessStateEl = document.getElementById('settingsLichessState');
+var settingsLichessChangeBtn = document.getElementById('settingsLichessChangeBtn');
+var settingsLichessUnlinkBtn = document.getElementById('settingsLichessUnlinkBtn');
+var LINK_LICHESS_TITLE = 'Link your Lichess account: Train drills the opening mistakes from your recent games.';
+
+// #805: an unlinked player gets the button in the main row; once linked, the control
+// (username, change, unlink) lives in the Settings window instead. The button stays in
+// the row for a linked player only when Settings is not reachable (same test as the
+// Settings button), so the link can never be left without a control. While the link is
+// still loading (gameLinkMode 'pending') the state is unknown and neither shows it.
 function updateLinkLichessUI() {
-  if (!linkLichessBtn) return;
-  linkLichessBtn.style.display = currentUser ? '' : 'none';
-  linkLichessBtn.title = (currentUser && gameMistakesState && gameMistakesState.username)
-    ? 'Lichess: ' + gameMistakesState.username + '. Click to change or unlink.'
-    : 'Link your Lichess account: Train drills the opening mistakes from your recent games.';
+  var linked = !!(currentUser && gameMistakesState && gameMistakesState.username);
+  var unknown = !!currentUser && gameLinkMode === 'pending';
+  var settingsReachable = !!(currentUser && firebaseReady);
+  if (linkLichessBtn) {
+    linkLichessBtn.style.display = (currentUser && !unknown && !(linked && settingsReachable)) ? '' : 'none';
+    linkLichessBtn.title = linked
+      ? 'Lichess: ' + gameMistakesState.username + '. Click to change or unlink.'
+      : LINK_LICHESS_TITLE;
+  }
+  if (settingsLichessEl) {
+    settingsLichessEl.style.display = settingsReachable ? 'flex' : 'none';
+    settingsLichessStateEl.textContent = unknown ? 'Checking...'
+      : linked ? 'Linked as ' + gameMistakesState.username : 'Not linked';
+    settingsLichessChangeBtn.textContent = linked ? 'Change' : 'Link';
+    settingsLichessChangeBtn.title = linked ? 'Change the linked Lichess account.' : LINK_LICHESS_TITLE;
+    settingsLichessChangeBtn.disabled = unknown;
+    settingsLichessUnlinkBtn.style.display = linked ? '' : 'none';
+  }
 }
 
-if (linkLichessBtn) {
-  linkLichessBtn.addEventListener('click', function() {
-    if (!currentUser) return;
-    var current = (gameMistakesState && gameMistakesState.username) || '';
-    var name = null;
-    try { name = prompt('Your Lichess username (leave empty to unlink):', current); } catch (e) { /* sandboxed prompt */ }
-    if (name === null) return;  // cancelled
-    name = String(name).trim();
-    if (!gameMistakesState) gameMistakesState = { targets: {} };
-    if (name === current) { maybeSyncGameMistakes(); return; }
-    // A different (or removed) account starts its history from scratch.
-    if (name) {
-      gameMistakesState.username = name;
-      delete gameMistakesState.unlinkedAt;
-    } else {
-      delete gameMistakesState.username;
-      gameMistakesState.unlinkedAt = Date.now();
-    }
-    delete gameMistakesState.since;
-    delete gameMistakesState.gamesSince;
-    delete gameMistakesState.lastSyncAt;
-    gameMistakesState.targets = {};
-    if (gameLinkMode === 'firebase') {
-      // #684: the old account's games go in the same write as the new link.
-      var link = gameLinkOf(gameMistakesState);
-      gameLinkWritten = JSON.stringify(link);
-      gamesCache = {};
-      firebase.database().ref('lichess/' + currentUser.uid).update({ link: link, games: null })
-        .catch(function(err) { gameLinkWritten = null; console.warn('Lichess link change failed', err); });
-    }
-    saveGameMistakesState();
-    updateLinkLichessUI();
-    renderGames();
-    if (name) maybeSyncGameMistakes();
-  });
+// Link, change or unlink (name '' unlinks). A different (or removed) account starts its
+// history from scratch.
+function applyLichessLink(name, current) {
+  if (!gameMistakesState) gameMistakesState = { targets: {} };
+  if (name === current) { maybeSyncGameMistakes(); return; }
+  if (name) {
+    gameMistakesState.username = name;
+    delete gameMistakesState.unlinkedAt;
+  } else {
+    delete gameMistakesState.username;
+    gameMistakesState.unlinkedAt = Date.now();
+  }
+  delete gameMistakesState.since;
+  delete gameMistakesState.gamesSince;
+  delete gameMistakesState.lastSyncAt;
+  gameMistakesState.targets = {};
+  if (gameLinkMode === 'firebase') {
+    // #684: the old account's games go in the same write as the new link.
+    var link = gameLinkOf(gameMistakesState);
+    gameLinkWritten = JSON.stringify(link);
+    gamesCache = {};
+    firebase.database().ref('lichess/' + currentUser.uid).update({ link: link, games: null })
+      .catch(function(err) { gameLinkWritten = null; console.warn('Lichess link change failed', err); });
+  }
+  saveGameMistakesState();
+  updateLinkLichessUI();
+  renderGames();
+  if (name) maybeSyncGameMistakes();
 }
+
+function currentLichessName() { return (gameMistakesState && gameMistakesState.username) || ''; }
+
+function promptLichessLink() {
+  if (!currentUser || gameLinkMode === 'pending') return;
+  var current = currentLichessName();
+  var name = null;
+  try { name = prompt('Your Lichess username (leave empty to unlink):', current); } catch (e) { /* sandboxed prompt */ }
+  if (name === null) return;  // cancelled
+  applyLichessLink(String(name).trim(), current);
+}
+
+function confirmLichessUnlink() {
+  var current = currentLichessName();
+  if (!currentUser || gameLinkMode === 'pending' || !current) return;
+  var ok = false;
+  try { ok = confirm('Unlink Lichess account ' + current + '? The games cached from it are removed.'); } catch (e) { /* sandboxed confirm */ }
+  if (ok) applyLichessLink('', current);
+}
+
+if (linkLichessBtn) linkLichessBtn.addEventListener('click', promptLichessLink);
+if (settingsLichessChangeBtn) settingsLichessChangeBtn.addEventListener('click', promptLichessLink);
+if (settingsLichessUnlinkBtn) settingsLichessUnlinkBtn.addEventListener('click', confirmLichessUnlink);
 
 // Sync after sign-in once the repertoire has loaded, and when Train starts -
 // at most once per GAME_MISTAKES.minSyncMinutes, in the background. force
