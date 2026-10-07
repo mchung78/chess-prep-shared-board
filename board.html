@@ -88,7 +88,7 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 <div id="files" style="display:flex; margin-top:2px;"></div>
 </div>
 </div>
-<div style="display:flex; gap:8px; margin-top:12px; align-items:center;">
+<div id="boardButtons" style="display:flex; gap:8px; margin-top:12px; align-items:center;">
 <button id="resetBtn">Reset</button>
 <button id="undoBtn">Undo</button>
 <button id="flipBtn">Flip board</button>
@@ -98,7 +98,7 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 </div>
 <div id="repertoireStats" style="display:none; margin-top:6px; font-size:12px; color:var(--text-secondary, #aaa); white-space:pre-wrap;" title="Learned: answered cleanly on a review after its first day, with no miss since. Due: scheduled for review now. 50/94 due: 94 are due, the cap defers all but 50 for 2 hours: lowest probability first, with positions from your own recent Lichess games ranked one level higher."></div>
 </div>
-<div style="flex:1; min-width:220px;">
+<div id="sidePanel" style="flex:1; min-width:220px;">
 <p id="turnLabel" style="font-size:14px; color:var(--text-secondary, #aaa); margin:0 0 12px;">White to move</p>
 <div style="display:flex; align-items:center; gap:8px; margin-bottom:12px;">
 <label style="font-size:13px; color:var(--text-secondary, #aaa); display:flex; align-items:center; gap:6px; cursor:pointer; user-select:none;">
@@ -114,8 +114,8 @@ Analysis mode
 <p id="fenError" style="font-size:13px; color:var(--text-danger, #f66); margin:0 0 12px; display:none;">That didn't parse. Check it and try again.</p>
 <label style="font-size:13px; color:var(--text-secondary, #aaa); display:block; margin-bottom:4px;">Moves <span id="syncStatus" style="font-weight:normal;"></span></label>
 <div id="authRow" style="display:none; align-items:center; gap:8px; margin-bottom:8px;">
-<button id="authBtn"></button>
-<span id="authStatus" style="font-size:12px; color:var(--text-secondary, #aaa);"></span>
+<button id="authBtn" style="flex:none; white-space:nowrap;"></button>
+<span id="authStatus" style="font-size:12px; color:var(--text-secondary, #aaa); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
 </div>
 <div style="display:flex; gap:6px; align-items:center; margin-bottom:8px;">
 <button id="navFirstBtn" title="First move (Home)" aria-label="Jump to start position">|◀</button>
@@ -173,7 +173,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "6b8e986 \u00b7 2026-10-06 03:29 UTC";
+var BOARD_BUILD = "59a0468 \u00b7 2026-10-07 02:49 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -240,6 +240,9 @@ function calculateSquareSize(containerWidth, availableHeight) {
 */
 function resizeBoard() {
   if (!boardPanelEl || !boardEl) return;
+  // #804: always measure the plain CSS layout; fitBoardPanelToBoard() below
+  // re-applies its cap from the result, so the cap never feeds back into it.
+  boardPanelEl.style.maxWidth = '';
   var boardRect = boardEl.getBoundingClientRect();
   var below = boardPanelEl.getBoundingClientRect().bottom - boardRect.bottom;
   var layoutEl = document.getElementById('boardLayout');
@@ -250,6 +253,37 @@ function resizeBoard() {
   var availableHeight = window.innerHeight - boardRect.top - Math.ceil(below + frame);
   var squareSize = calculateSquareSize(boardPanelEl.clientWidth, availableHeight);
   document.documentElement.style.setProperty('--square-size', squareSize + 'px');
+  fitBoardPanelToBoard();
+}
+
+/*
+  #804: when the window is short the board is height-limited and ends well
+  inside #boardPanel (which stays at its 596px cap), leaving dead space to
+  the right of the board while the side panel (FEN field, sign-in row) is
+  squeezed. Shrink #boardPanel to what it holds so #sidePanel gets that
+  width. The floor is the widest thing under the board (the button row, the
+  stats line), so neither wraps differently than before. Only while the two
+  panels sit side by side: stacked (narrow) layouts keep a full-width panel,
+  and since resizeBoard() clears the cap first, wrapping is still decided by
+  the original CSS and the square size is unchanged.
+*/
+function naturalWidth(el) {
+  if (!el || el.offsetParent === null) return 0;
+  var prev = el.style.width;
+  el.style.width = 'max-content';
+  var w = el.getBoundingClientRect().width;
+  el.style.width = prev;
+  return Math.ceil(w);
+}
+
+function fitBoardPanelToBoard() {
+  var sidePanelEl = document.getElementById('sidePanel');
+  if (!sidePanelEl || sidePanelEl.offsetTop > boardPanelEl.offsetTop) return;
+  var panelRect = boardPanelEl.getBoundingClientRect();
+  var need = Math.ceil(boardEl.getBoundingClientRect().right - panelRect.left);
+  need = Math.max(need, naturalWidth(document.getElementById('boardButtons')),
+    naturalWidth(document.getElementById('repertoireStats')));
+  if (need < panelRect.width - 1) boardPanelEl.style.maxWidth = need + 'px';
 }
 
 var resizeTimer = null;
@@ -259,9 +293,11 @@ function scheduleBoardResize() {
 }
 if (typeof ResizeObserver === 'function') {
   new ResizeObserver(scheduleBoardResize).observe(boardPanelEl);
-} else {
-  window.addEventListener('resize', scheduleBoardResize);
 }
+// #804: always listen to the window too. The observer only sees the panel's
+// own box, which does not change when the window only gets taller or shorter
+// at the same width, so the board stayed at its old size until a width change.
+window.addEventListener('resize', scheduleBoardResize);
 requestAnimationFrame(resizeBoard);
 
 /*
@@ -315,9 +351,11 @@ function updateAuthUI() {
   if (currentUser) {
     authBtnEl.textContent = 'Sign out';
     authStatusEl.textContent = 'Signed in as ' + (currentUser.email || currentUser.uid);
+    authStatusEl.title = authStatusEl.textContent;  // #804: the full address stays readable when it is truncated
   } else {
     authBtnEl.textContent = 'Sign in with Google';
     authStatusEl.textContent = 'Sign in to move pieces for everyone watching';
+    authStatusEl.title = '';
   }
 }
 if (firebaseReady) {
