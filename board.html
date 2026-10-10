@@ -181,7 +181,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "3641fb9 \u00b7 2026-10-07 02:50 UTC";
+var BOARD_BUILD = "1851b71 \u00b7 2026-10-10 02:25 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1186,6 +1186,31 @@ function newestActiveFavorite(data, positionKey) {
     if (best === null || at > bestAt) { best = stripSanDecorations(san); bestAt = at; }
   });
   return best;
+}
+
+// #830: an older friendly choice lowers the whole path by one tier, once.
+// Plies come from trainPathPlies; keeping this pure also lets the cap use
+// its card's color rather than the board orientation. Tied timestamps are
+// equally preferred. Inactive/missing moves are handled by pathLive, not here.
+function trainPathHasOlderFavorite(plies, data, color) {
+  return (plies || []).some(function(ply) {
+    if (ply.color !== color) return false;
+    var san = stripSanDecorations(ply.san);
+    var active = repertoireFavorites(data, ply.posKey);
+    if (active.indexOf(san) === -1) return false;
+    var entry = data[repertoireStorageKey(ply.posKey)];
+    var newest = newestActiveFavorite(data, ply.posKey);
+    var at = entry[san];
+    var newestAt = entry[newest];
+    return typeof at === 'number' && isFinite(at) &&
+      typeof newestAt === 'number' && isFinite(newestAt) && at < newestAt;
+  });
+}
+
+function trainFavoritePriorityLevel(level, older) {
+  if (!older) return level;
+  if (typeof level !== 'number') level = TRAIN_LEVEL_CONFIG.unknownLevel;
+  return Math.min(4, level + 1);
 }
 
 // "Lines 3 \u00b7 7/9 right first time (78%)" - first time means no hint and no
@@ -3274,7 +3299,10 @@ function trainApplyDueCap(cardsByColour) {
     if (!cards) return;
     var keys = srsPlanDeferrals(cards, now, trainNormalizeMaxDue(trainMaxDue, TRAIN_DUE_CAP),
       function(sk) { return repertoireFavorites(repertoireData, sk).length > 0; },
-      function(sk, card) { return trainCapLevel(trainLevelFromProbability(card.p), positionReachedInGames(sk), TRAIN_DUE_CAP); },  // #758
+      function(sk, card) {
+        var level = trainCapLevel(trainLevelFromProbability(card.p), positionReachedInGames(sk), TRAIN_DUE_CAP);
+        return trainFavoritePathLevel(level, card.path, colour);
+      },  // #758 own-game boost, then #830 older-favorite penalty
       function(sk, card) {
         var reach = typeof card.path === 'string' ? trainReach({ rootPly: 0, color: colour }, card.path) : 1;
         return srsPriorityScore(card, now, reach, trainGameMistakeBoost(colour, sk));
@@ -4090,10 +4118,15 @@ async function trainScorePath(path) {
 }
 
 // #701: the card's level - live stats when cached, else the stored p, else null.
-function trainCardLevel(path, card) {
+function trainFavoritePathLevel(level, path, color) {
+  return trainFavoritePriorityLevel(level,
+    trainPathHasOlderFavorite(trainPathPlies(path), repertoireData, color));
+}
+
+function trainCardLevel(path, card, color) {
   var live = trainPositionLevel(trainPathRarity(path));
-  if (live !== null) return live;
-  return trainLevelFromProbability(card && card.p);
+  var level = live !== null ? live : trainLevelFromProbability(card && card.p);
+  return trainFavoritePathLevel(level, path, color);
 }
 
 function trainPathLive(t, path) {
@@ -4117,7 +4150,7 @@ function trainChooseTarget(t) {
     function(path) { return trainReach(t, path); },
     function(path) { return trainPathLive(t, path); },
     function(sk) { return trainGameMistakeBoost(t.color, sk); },
-    trainCardLevel);
+    function(path, card) { return trainCardLevel(path, card, t.color); });
   if (key) t.target = t.cards[key].path.split(' ');
   // #678: with a target, positions you know and that aren't due are played
   // for you; with none, every position is asked (extra practice).
