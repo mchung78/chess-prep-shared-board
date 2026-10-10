@@ -126,7 +126,7 @@ Analysis mode
 </div>
 <div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0 0 8px; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div></div>
 <details id="missedPanel" style="display:none; margin:0 0 8px; font-size:13px;">
-<summary style="cursor:pointer; color:var(--text-secondary, #aaa);">Missed <span id="missedCount"></span></summary>
+<summary style="cursor:pointer; color:var(--text-secondary, #aaa);">Mistakes <span id="missedCount"></span></summary>
 <ol id="missedList" style="list-style:none; padding:0; margin:0; max-height:200px; overflow-y:auto;"></ol>
 </details>
 <div id="repertoireNotice" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0 0 8px; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"></div>
@@ -181,7 +181,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "1851b71 \u00b7 2026-10-10 02:25 UTC";
+var BOARD_BUILD = "f33e003 \u00b7 2026-10-10 22:42 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1213,16 +1213,22 @@ function trainFavoritePriorityLevel(level, older) {
   return Math.min(4, level + 1);
 }
 
-// "Lines 3 \u00b7 7/9 right first time (78%)" - first time means no hint and no
-// mistake. The separator is escaped: this file has no <meta charset> (it's
-// also a widget fragment), so a raw non-ASCII literal breaks wherever it's
-// served without a UTF-8 header.
+// "Lines 3 \u00b7 7/9 correct (78%) \u00b7 2 mistakes \u00b7 4 hints". Correct means
+// the first move played at a position was right; a hint doesn't change that.
+// Mistakes are the positions where it was wrong (correct + mistakes = quizzed).
+// Hints count the positions where the hint ring appeared, right or wrong
+// afterwards, and never affect the score. The separator is escaped: this file
+// has no <meta charset> (it's also a widget fragment), so a raw non-ASCII
+// literal breaks wherever it's served without a UTF-8 header.
 function trainSummaryText(stats) {
   var parts = ['Lines ' + stats.lines];
   if (stats.quizzed > 0) {
-    parts.push(stats.firstTry + '/' + stats.quizzed + ' right first time (' + Math.round(100 * stats.firstTry / stats.quizzed) + '%)');
+    parts.push(stats.firstTry + '/' + stats.quizzed + ' correct (' + Math.round(100 * stats.firstTry / stats.quizzed) + '%)');
   }
-  if (stats.missed.length) parts.push(stats.missed.length + ' missed');  // #675: details in the Missed list
+  var mistakes = stats.mistakes || 0;
+  var hints = stats.hints || 0;
+  if (mistakes) parts.push(mistakes + (mistakes === 1 ? ' mistake' : ' mistakes'));  // #675: details in the Mistakes list
+  if (hints) parts.push(hints + (hints === 1 ? ' hint' : ' hints'));
   return parts.join(' \u00b7 ');
 }
 
@@ -4224,9 +4230,9 @@ function startTraining() {
     cards: {},
     target: null,
     hadTarget: false,
-    stats: { lines: 0, quizzed: 0, firstTry: 0, missed: [] },
+    stats: { lines: 0, quizzed: 0, firstTry: 0, mistakes: 0, hints: 0, missed: [] },
     pendingRemote: undefined,
-  };  // #675: its empty stats.missed is what the Missed list shows now
+  };  // #675: its empty stats.missed is what the Mistakes list shows now
   selected = null;
   viewPly = game.history().length;
   cancelEval();
@@ -4328,7 +4334,7 @@ function trainStep() {
     }
     t.busy = false;  // the player's move: unlock the pieces
     if (atGameMistake) t.gapPending = true;  // #668: a game mistake with no favorite - your move fills the gap (the guard applies)
-    t.turn = { hinted: false, counted: false };
+    t.turn = { hinted: false, counted: false, hintCounted: false };
     var note = trainGameMistakeNote(t);
     setTrainMessage((t.gapPending
       ? (atGameMistake ? 'Not in your repertoire - you went wrong here in a game.' : 'Not in your repertoire yet: play the move you want to keep.')
@@ -4412,6 +4418,15 @@ function trainHintColor() {
   return (last && last.color) || RARITY_LEVEL_COLORS[1];
 }
 
+// A hint counts once per position, and only for a position that was quizzed:
+// a ring that fires before the first move is counted when that move lands
+// (trainOnUserMove), one that fires after a wrong move is counted here.
+function trainNoteHint(t) {
+  if (!t.turn || !t.turn.hinted || !t.turn.counted || t.turn.hintCounted) return;
+  t.turn.hintCounted = true;
+  t.stats.hints++;
+}
+
 function trainScheduleHint() {
   var t = train;
   clearTimeout(t.hintTimer);
@@ -4434,7 +4449,7 @@ function trainScheduleHint() {
     if (!move) return;
     t.hintSquare = move.from;
     t.hintColor = trainHintColor();
-    if (t.turn) t.turn.hinted = true;
+    if (t.turn) { t.turn.hinted = true; trainNoteHint(t); }
     render();
   }, delay * 1000);
 }
@@ -4462,8 +4477,10 @@ function trainOnUserMove(from, to) {
     if (!t.turn.counted) {
       t.turn.counted = true;
       t.stats.quizzed++;
+      t.stats.mistakes++;
       trainSaveCard(t, keyBefore, 'wrong', pathBefore);
       trainNoteMiss(t, lineBefore, movesBefore, favorites);
+      trainNoteHint(t);
     }
     setTrainMessage(move.san + " isn't your repertoire move here. Try again.");
     trainScheduleHint();
@@ -4506,10 +4523,8 @@ function trainOnUserMove(from, to) {
     t.turn.counted = true;
     t.stats.quizzed++;
     trainSaveCard(t, keyBefore, t.turn.hinted ? 'hinted' : 'correct', pathBefore);
-    if (!t.turn.hinted) t.stats.firstTry++;
-    else {
-      trainNoteMiss(t, lineBefore, movesBefore, favorites);
-    }
+    t.stats.firstTry++;
+    trainNoteHint(t);
   }
   viewPly = game.history().length;
   trainStep();
