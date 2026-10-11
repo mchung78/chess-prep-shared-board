@@ -181,7 +181,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "f33e003 \u00b7 2026-10-10 22:42 UTC";
+var BOARD_BUILD = "71d3225 \u00b7 2026-10-11 20:33 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1122,6 +1122,7 @@ var TRAIN_CONFIG = {
   lineEndPauseMs: 450,
   maxLinePlies: 80,
   lastMistakeToleranceMs: 60 * 1000,  // #678: server/client clock skew on lastMistake
+  changeContinuationPlies: 4,  // #830b: 2 additional full moves after a deliberate change; no settings control
 };
 
 function trainHintDelaySeconds(mistakeAt, now, cfg) {
@@ -1192,18 +1193,35 @@ function newestActiveFavorite(data, positionKey) {
 // Plies come from trainPathPlies; keeping this pure also lets the cap use
 // its card's color rather than the board orientation. Tied timestamps are
 // equally preferred. Inactive/missing moves are handled by pathLive, not here.
+// #830b: the active favorites' timestamps by stripped SAN. Stored keys may
+// carry +/# decorations (repertoireFavorites strips them), so read them
+// through the stripped name; an entry without a valid timestamp is left out
+// and never creates a preference.
+function trainFavoriteTimes(data, positionKey) {
+  var active = repertoireFavorites(data, positionKey);
+  var entry = (data && data[repertoireStorageKey(positionKey)]) || {};
+  var times = {};
+  Object.keys(entry).forEach(function(san) {
+    var plain = stripSanDecorations(san);
+    var at = entry[san];
+    if (active.indexOf(plain) !== -1 && typeof at === 'number' && isFinite(at)) times[plain] = at;
+  });
+  return times;
+}
+
+// #830b: is san an active favorite older than another one here? Playing it
+// deliberately changes the preference; the same test marks an older choice on
+// a path (#830). Equal timestamps are co-preferred.
+function trainMoveChangesPreference(data, positionKey, san) {
+  var times = trainFavoriteTimes(data, positionKey);
+  var at = times[stripSanDecorations(san)];
+  if (typeof at !== 'number') return false;
+  return Object.keys(times).some(function(other) { return times[other] > at; });
+}
+
 function trainPathHasOlderFavorite(plies, data, color) {
   return (plies || []).some(function(ply) {
-    if (ply.color !== color) return false;
-    var san = stripSanDecorations(ply.san);
-    var active = repertoireFavorites(data, ply.posKey);
-    if (active.indexOf(san) === -1) return false;
-    var entry = data[repertoireStorageKey(ply.posKey)];
-    var newest = newestActiveFavorite(data, ply.posKey);
-    var at = entry[san];
-    var newestAt = entry[newest];
-    return typeof at === 'number' && isFinite(at) &&
-      typeof newestAt === 'number' && isFinite(newestAt) && at < newestAt;
+    return ply.color === color && trainMoveChangesPreference(data, ply.posKey, ply.san);
   });
 }
 
@@ -1246,11 +1264,12 @@ var SRS_CONFIG = {
   hintedFactor: 1.2,
   minCorrectDays: 1,
   wrongDays: 1,
+  changedDays: 1,  // #830b: a deliberate change of favorite restarts the card at one day
   maxIntervalDays: 365,
 };
 var SRS_DAY_MS = 24 * 60 * 60 * 1000;
 
-// result: 'correct' | 'hinted' | 'wrong'. card: the stored card or null.
+// result: 'correct' | 'hinted' | 'wrong' | 'changed'. card: the stored card or null.
 function srsNextCard(card, result, now, path, cfg) {
   var interval = card && typeof card.interval === 'number' ? card.interval : 0;
   var lapses = card && typeof card.lapses === 'number' ? card.lapses : 0;
@@ -1261,6 +1280,8 @@ function srsNextCard(card, result, now, path, cfg) {
     interval = cfg.wrongDays;
     next.lapses = lapses + 1;
     next.lastMistake = now;
+  } else if (result === 'changed') {
+    interval = cfg.changedDays;  // #830b: no lapse and no mistake stamp - a change is not a failure
   } else if (result === 'hinted') {
     interval = interval * cfg.hintedFactor;
   } else {
@@ -2474,7 +2495,9 @@ var USER_SETTINGS = [
   { key: 'guardTimeSec', label: 'Repertoire check time limit', unit: 'seconds', min: 1, max: 10, def: 1,
     group: 'guard', short: 'time (s)' },
   { key: 'maxDue', label: 'Maximum cards due', unit: 'per side', min: 1, max: 1000, def: 25,
-    hint: 'Cards above this many are deferred 2 hours, lowest probability first (positions from your Lichess games rank one level higher).' }
+    hint: 'Cards above this many are deferred 2 hours, lowest probability first (positions from your Lichess games rank one level higher).' },
+  { key: 'allowChangingFavorites', label: 'Allow Changing Favorites', unit: 'on/off', min: 0, max: 1, def: 0, kind: 'toggle',
+    hint: 'Train: a sound alternative to a favorite becomes your newest favorite instead of counting as a mistake. Turn it on while you expand your repertoire and off for ordinary drilling. Turning it off keeps what you saved.' }
 ];
 
 // Settings that share one line in the dialog (depth and time limit side by side).
@@ -2938,6 +2961,7 @@ function applyUserSettings(values) {
   REPERTOIRE_GUARD.localDepth = values.guardDepth;
   REPERTOIRE_GUARD.localTimeMs = values.guardTimeSec * 1000;
   trainMaxDue = values.maxDue;
+  trainAllowChange = values.allowChangingFavorites === 1;
   trainApplyDueCap();
   renderRepertoireStats();
   if (engineChanged && analysisMode) {
@@ -2950,6 +2974,10 @@ function setSettingsStatus(text, isError) {
   if (!settingsStatusEl) return;
   settingsStatusEl.textContent = text || '';
   settingsStatusEl.style.color = isError ? 'var(--text-danger, #f66)' : 'var(--text-secondary, #aaa)';
+}
+
+function settingDefaultText(def) {
+  return def.kind === 'toggle' ? (def.def === 1 ? 'on' : 'off') : String(def.def);
 }
 
 function buildSettingsRows() {
@@ -2982,23 +3010,27 @@ function buildSettingsRows() {
       caption.textContent = grouped ? def.short : '';
       var input = document.createElement('input');
       input.id = 'setting-' + def.key;
-      input.type = 'number';
-      input.step = '1';
-      input.min = String(def.min);
-      input.max = String(def.max);
-      input.setAttribute('inputmode', 'numeric');
-      input.style.cssText = 'width:' + (grouped ? '56' : '64') + 'px;';
+      if (def.kind === 'toggle') {  // #830b: on/off, stored as 1/0 like every other setting (an integer in the rules)
+        input.type = 'checkbox';
+      } else {
+        input.type = 'number';
+        input.step = '1';
+        input.min = String(def.min);
+        input.max = String(def.max);
+        input.setAttribute('inputmode', 'numeric');
+        input.style.cssText = 'width:' + (grouped ? '56' : '64') + 'px;';
+      }
       input.setAttribute('aria-describedby', 'settingState-' + r.id);
       if (grouped) cell.appendChild(caption);
       cell.appendChild(input);
-      if (!grouped) {
+      if (!grouped && def.kind !== 'toggle') {
         var unit = document.createElement('span');
         unit.style.cssText = 'font-size:12px; color:var(--text-secondary, #aaa);';
         unit.textContent = def.unit;
         cell.appendChild(unit);
       }
       controls.appendChild(cell);
-      input.addEventListener('input', function() {
+      input.addEventListener(def.kind === 'toggle' ? 'change' : 'input', function() {
         if (!settingsDirty) settingsDirty = {};
         settingsDirty[def.key] = true;
         input.removeAttribute('aria-invalid');
@@ -3009,7 +3041,7 @@ function buildSettingsRows() {
     var reset = document.createElement('button');
     reset.setAttribute('data-role', 'reset');
     reset.textContent = 'Default';
-    reset.title = 'Go back to the default' + (grouped ? 's (' + r.defs.map(function(d) { return d.def; }).join(', ') + ')' : ' (' + r.defs[0].def + ')') +
+    reset.title = 'Go back to the default' + (grouped ? 's (' + r.defs.map(settingDefaultText).join(', ') + ')' : ' (' + settingDefaultText(r.defs[0]) + ')') +
       ' and follow any future change to ' + (grouped ? 'them' : 'it');
     reset.addEventListener('click', function() {
       var edits = {};
@@ -3038,11 +3070,14 @@ function renderSettings() {
     r.defs.forEach(function(def) {
       var input = row.querySelector('[data-setting="' + def.key + '"] input');
       input.disabled = !settingsLoaded;  // unavailable: Close would have nothing to save, so don't let edits be typed and lost
-      if (!(settingsDirty && settingsDirty[def.key])) input.value = String(resolved.values[def.key]);
+      if (!(settingsDirty && settingsDirty[def.key])) {
+        if (def.kind === 'toggle') input.checked = resolved.values[def.key] === 1;
+        else input.value = String(resolved.values[def.key]);
+      }
     });
     var anyCustom = r.defs.some(function(def) { return resolved.custom[def.key]; });
     row.querySelector('[data-role="state"]').textContent = anyCustom
-      ? 'yours (default ' + r.defs.map(function(d) { return d.def; }).join(' / ') + ')' : 'default';
+      ? 'yours (default ' + r.defs.map(settingDefaultText).join(' / ') + ')' : 'default';
     row.querySelector('[data-role="reset"]').disabled = !anyCustom || !settingsLoaded;
   });
   if (settingsResetAllBtnEl) settingsResetAllBtnEl.disabled = !settingsLoaded ||
@@ -3081,7 +3116,7 @@ function saveSettingsFromDialog() {
   var inputs = {};
   USER_SETTINGS.forEach(function(def) {
     var input = settingsRowsEl.querySelector('[data-setting="' + def.key + '"] input');
-    inputs[def.key] = input.value;
+    inputs[def.key] = def.kind === 'toggle' ? (input.checked ? '1' : '0') : input.value;
     input.removeAttribute('aria-invalid');
   });
   var plan = planSettingsSave(inputs, settingsDirty, resolved);
@@ -3263,6 +3298,7 @@ function renderRepertoireStats() {
   cache has answered.
   Needs a signed-in player, a loaded repertoire and the standard start.
 */
+var trainAllowChange;  // #830b: populated by applyUserSettings; falsy (off) before a user's settings load
 var trainMaxDue;  // populated by applyUserSettings; the default is applied before a user's settings load
 var trainCapReady;  // true once the settings read has answered (value or failure); trainApplyDueCap waits for it
 
@@ -4220,6 +4256,7 @@ function startTraining() {
     lineId: 0,
     busy: true,  // locked until trainStep() hands the first move to the player (schedule still loading)
     gapPending: false,
+    changeEndPly: 0,  // #830b: history length at which the post-change gap allowance ends
     turn: null,
     hintSquare: null,
     hintColor: null,
@@ -4404,6 +4441,7 @@ function trainEndLine(message) {
     if (train !== t || t.lineId !== lineId) return;
     while (game.history().length > t.rootPly) game.undo();
     t.gapPending = false;
+    t.changeEndPly = 0;  // #830b: the post-change allowance belongs to the line that made the change
     trainChooseTarget(t);
     t.busy = false;
     viewPly = game.history().length;
@@ -4454,6 +4492,81 @@ function trainScheduleHint() {
   }, delay * 1000);
 }
 
+// The line carries on from the move just made, with a notice instead of the
+// end-of-line pause (#830b).
+function trainContinueLine(t, notice) {
+  clearTimeout(t.hintTimer);
+  t.hintSquare = null;
+  viewPly = game.history().length;
+  render();
+  setRepertoireNotice(notice);
+  trainStep();
+}
+
+// #830b: a deliberate change of favorite. The target the player left is dropped and the
+// line goes on along the new branch; gaps are allowed for changeContinuationPlies plies
+// counted from the initiating move. A later change inside that window does not restart it.
+function trainContinueAfterChange(t, notice) {
+  var length = game.history().length;
+  if (!(t.changeEndPly > length)) t.changeEndPly = length + TRAIN_CONFIG.changeContinuationPlies;
+  t.target = null;
+  t.hadTarget = false;
+  trainContinueLine(t, notice);
+}
+
+// A move at a position with no favorite (a gap) or, with Allow Changing Favorites on, an
+// alternative to the favorites (isChange): the weak-move guard decides whether it becomes a
+// favorite. A rejection never grades a failure. Every async step checks the session, line,
+// signed-in player and position, so a stale answer does nothing.
+function trainGuardedAdd(t, move, fenBefore, keyBefore, pathBefore, isChange) {
+  var lineId = t.lineId;
+  var uid = currentUser && currentUser.uid;
+  var fenAfter = game.fen();
+  function stale() {
+    return train !== t || t.lineId !== lineId || !currentUser || currentUser.uid !== uid || game.fen() !== fenAfter;
+  }
+  function keep() {
+    hideRepertoireNotice();
+    recordRepertoireMove(keyBefore, move); noteRepertoireMoveLocally(keyBefore, move.san);
+    t.gapPending = false;
+    if (isChange) {
+      trainSaveCard(t, keyBefore, 'changed', pathBefore);
+      trainContinueAfterChange(t, move.san + ' is now your newest favorite here.');
+      return;
+    }
+    trainSaveCard(t, keyBefore, 'correct', pathBefore);
+    if (game.history().length < t.changeEndPly) {  // #830b: still inside the post-change allowance
+      trainContinueLine(t, move.san + ' added to your repertoire.');
+      return;
+    }
+    trainEndLine(move.san + ' added to your repertoire.');
+  }
+  // A move you already stored (a favorite that has decayed) is not weighed again.
+  if (isChange && repertoireMoveStored(keyBefore, move.san)) { keep(); return; }
+  t.busy = true;
+  setTrainMessage('Checking…');
+  // A rejected check (not just an unavailable eval) must not leave Train stuck busy: fail open.
+  evaluateRepertoireMove(fenBefore, move).catch(function() { return null; }).then(function(result) {
+    if (stale()) return;
+    if (!result || result.loss < REPERTOIRE_GUARD.weakMoveCp) {
+      keep();
+      if (!result) setRepertoireNotice('Added (couldn\'t check it with the engine).');
+      return;
+    }
+    game.undo(); viewPly = game.history().length; t.busy = false; render();
+    var amount = (result.loss / 100).toFixed(1);
+    setTrainMessage(move.san + ' is ' + amount + ' worse than ' + result.bestSan + '. Try another move.');
+    setRepertoireNotice('Weak move was not added.', function() {
+      // Only while this attempt is still open: the same session and line, idle, at the same
+      // position. A stale button (another move since, the line over, training stopped) must
+      // not replay the move into whatever position the board holds now.
+      if (train !== t || t.lineId !== lineId || !currentUser || currentUser.uid !== uid || t.busy || game.fen() !== fenBefore) { hideRepertoireNotice(); return; }
+      game.move(move.san); viewPly = game.history().length; keep();
+    });
+    trainScheduleHint();
+  });
+}
+
 // A move from the board while training (attemptMove's replacement).
 function trainOnUserMove(from, to) {
   var t = train;
@@ -4471,7 +4584,12 @@ function trainOnUserMove(from, to) {
   try { move = game.move({ from: from, to: to, promotion: 'q' }); }
   catch (error) { return false; }
   var grade = trainGrade(move.san, t.gapPending ? [] : favorites);
-  if (grade === 'wrong') {
+  // #830b: with Allow Changing Favorites on, a move outside the favorites is a candidate
+  // new favorite (the guard decides), and deliberately playing an older favorite changes
+  // the preference. Neither is graded as a mistake. Off: grading is unchanged.
+  var change = !t.gapPending && !!trainAllowChange && (grade === 'wrong' ||
+    (grade === 'correct' && trainMoveChangesPreference(repertoireData, keyBefore, move.san)));
+  if (grade === 'wrong' && !change) {
     game.undo();
     t.mistakesAt.set(keyBefore, Date.now());
     if (!t.turn.counted) {
@@ -4486,39 +4604,17 @@ function trainOnUserMove(from, to) {
     trainScheduleHint();
     return true;
   }
-  if (grade === 'gap') {
-    t.busy = true;
-    setTrainMessage('Checking…');
-    // A rejected check (not just an unavailable eval) must not leave Train stuck busy: fail open.
-    evaluateRepertoireMove(fenBefore, move).catch(function() { return null; }).then(function(result) {
-      if (train !== t) return;
-      function keep() {
-        hideRepertoireNotice();
-        recordRepertoireMove(keyBefore, move); noteRepertoireMoveLocally(keyBefore, move.san);
-        t.gapPending = false; trainSaveCard(t, keyBefore, 'correct', pathBefore);
-        trainEndLine(move.san + ' added to your repertoire.');
-      }
-      if (!result || result.loss < REPERTOIRE_GUARD.weakMoveCp) {
-        keep();
-        if (!result) setRepertoireNotice('Added (couldn\'t check it with the engine).');
-        return;
-      }
-      game.undo(); viewPly = game.history().length; t.busy = false; render();
-      var amount = (result.loss / 100).toFixed(1);
-      setTrainMessage(move.san + ' is ' + amount + ' worse than ' + result.bestSan + '. Try another move.');
-      setRepertoireNotice('Weak move was not added.', function() {
-        // Only while this gap is still open: the same session, idle, at the same position.
-        // A stale button (another move since, the line over, training stopped) must not
-        // replay the move into whatever position the board holds now.
-        if (train !== t || t.busy || game.fen() !== fenBefore) { hideRepertoireNotice(); return; }
-        game.move(move.san); viewPly = game.history().length; keep();
-      });
-      trainScheduleHint();
-    });
+  if (grade === 'gap' || grade === 'wrong') {
+    trainGuardedAdd(t, move, fenBefore, keyBefore, pathBefore, grade === 'wrong');
     return true;
   }
   recordRepertoireMove(keyBefore, move);
   noteRepertoireMoveLocally(keyBefore, move.san);
+  if (change) {
+    trainSaveCard(t, keyBefore, 'changed', pathBefore);
+    trainContinueAfterChange(t, move.san + ' is now your newest favorite here.');
+    return true;
+  }
   if (!t.turn.counted) {
     t.turn.counted = true;
     t.stats.quizzed++;
