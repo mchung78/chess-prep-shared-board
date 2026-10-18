@@ -96,7 +96,7 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
   <button id="linkLichessBtn" style="display:none;" title="Link your Lichess account: Train drills the opening mistakes from your recent games.">Link Lichess</button>
   <button id="settingsBtn" style="display:none;" title="Your analysis, repertoire-check, and training settings.">Settings</button>
 </div>
-<div id="repertoireStats" style="display:none; margin-top:6px; font-size:12px; color:var(--text-secondary, #aaa); white-space:pre-wrap;" title="Learned: answered cleanly on a review after its first day, with no miss since. Due: scheduled for review now. 50/94 due: 94 are due, the cap defers all but 50 for 2 hours: lowest probability first, with positions from your own recent Lichess games ranked one level higher."></div>
+<div id="repertoireStats" style="display:none; margin-top:6px; font-size:12px; color:var(--text-secondary, #aaa); white-space:pre-wrap;" title="Learned: answered cleanly on a review after its first day, with no miss since. Due: scheduled for review now. Expired: a learned move left overdue for 30 days (or its own interval, if longer) goes back to being new; train it again to relearn it. 50/94 due: 94 are due, the cap defers all but 50 for 2 hours: lowest probability first, with positions from your own recent Lichess games ranked one level higher."></div>
 </div>
 <div id="sidePanel" style="flex:1; min-width:220px;">
 <p id="turnLabel" style="font-size:14px; color:var(--text-secondary, #aaa); margin:0 0 12px;">White to move</p>
@@ -181,7 +181,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "cedd97f \u00b7 2026-10-11 22:51 UTC";
+var BOARD_BUILD = "e13c7d3 \u00b7 2026-10-18 18:13 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1266,11 +1266,41 @@ var SRS_CONFIG = {
   wrongDays: 1,
   changedDays: 1,  // #830b: a deliberate change of favorite restarts the card at one day
   maxIntervalDays: 365,
+  // #1052: a learned card (interval >= REPERTOIRE_STATS.learnedMinIntervalDays) left
+  // overdue for more than max(expireMinGraceDays, expireIntervalFactor x interval)
+  // days is expired - see srsIsExpired.
+  expireMinGraceDays: 30,
+  expireIntervalFactor: 1,
 };
 var SRS_DAY_MS = 24 * 60 * 60 * 1000;
 
+/*
+  #1052: a learned move that is not trained for a long time after it is due
+  expires: it stops counting as learned or due and Train treats it exactly like a
+  position with no card (asked like a new move; srsNextCard restarts it at one
+  day). Derived from due, interval and now - nothing is stored, so a constant
+  change re-evaluates every card and no rules change is needed. Only learned
+  cards expire: an unlearned or failed card (a Lichess game mistake is due from
+  the game's own time) stays in the queue. The learned minimum defaults to
+  REPERTOIRE_STATS's; cfg defaults to SRS_CONFIG.
+*/
+function srsIsExpired(card, now, cfg, learnedMinDays) {
+  if (!card || typeof card.due !== 'number' || typeof card.interval !== 'number') return false;
+  cfg = cfg || SRS_CONFIG;
+  var learnedMin = typeof learnedMinDays === 'number' ? learnedMinDays : REPERTOIRE_STATS.learnedMinIntervalDays;
+  if (card.interval < learnedMin) return false;
+  var graceDays = Math.max(cfg.expireMinGraceDays, cfg.expireIntervalFactor * card.interval);
+  return now > card.due + graceDays * SRS_DAY_MS;
+}
+
 // result: 'correct' | 'hinted' | 'wrong' | 'changed'. card: the stored card or null.
 function srsNextCard(card, result, now, path, cfg) {
+  // #1052: an expired card restarts as a new move: no interval. lapses and p carry
+  // over (expiry is not a lapse), and so does lastMistake: gameMistakeCard uses it
+  // as the watermark that stops the same Lichess game being counted twice (a rescan
+  // after unlink/relink). It is older than interval + 30 days, so it is outside the
+  // hint window and earlier than this review - trainSkipsPosition still sees a clean one.
+  if (srsIsExpired(card, now, cfg)) card = { lapses: card.lapses, p: card.p, lastMistake: card.lastMistake };
   var interval = card && typeof card.interval === 'number' ? card.interval : 0;
   var lapses = card && typeof card.lapses === 'number' ? card.lapses : 0;
   var next = { lapses: lapses, path: path };
@@ -1302,6 +1332,7 @@ function srsNextCard(card, result, now, path, cfg) {
 */
 function trainSkipsPosition(card, now, cfg) {
   if (!card || typeof card.due !== 'number' || typeof card.interval !== 'number') return false;
+  if (srsIsExpired(card, now)) return false;  // #1052: asked, like a position with no card
   if (srsIsDeferred(card, now)) return true;  // #712: over the cap - played for you, never asked
   if (card.due <= now) return false;
   if (typeof card.lastMistake !== 'number') return true;
@@ -1389,6 +1420,7 @@ function srsPickTarget(cards, now, rootPath, reach, pathLive, boost, level) {
     var c = cards[key];
     if (!c || typeof c.due !== 'number' || c.due > now || typeof c.path !== 'string') return;
     if (srsIsDeferred(c, now)) return;  // #712
+    if (srsIsExpired(c, now)) return;  // #1052
     if (pathLive && !pathLive(c.path)) return;
     if (rootPath) {
       if (c.path.indexOf(rootPath + ' ') !== 0) return;
@@ -1463,6 +1495,7 @@ function srsPlanDeferrals(cards, now, maxDue, active, level, score) {
   Object.keys(cards || {}).forEach(function(key) {
     var c = cards[key];
     if (!c || typeof c.due !== 'number' || c.due > now || srsIsDeferred(c, now)) return;
+    if (srsIsExpired(c, now)) return;  // #1052: no longer counts toward the cap
     if (active && !active(key)) return;
     var lv = level ? level(key, c) : 1;
     if (typeof lv !== 'number') lv = TRAIN_LEVEL_CONFIG.unknownLevel;
@@ -1482,12 +1515,13 @@ function srsPlanDeferrals(cards, now, maxDue, active, level, score) {
   those whose card has interval >= learnedMinIntervalDays (with SRS_CONFIG:
   answered cleanly on a review after its first day, no miss since); due =
   those whose card is due. A card whose position has no active favorite is
-  ignored, so learned and due are always subsets of total.
+  ignored, so learned and due are always subsets of total. #1052: an expired
+  card (srsIsExpired) is counted in expired only - not learned, not due.
 */
 var REPERTOIRE_STATS = { learnedMinIntervalDays: 2 };
 
 function repertoireStats(repData, cardsByColour, now, cfg) {
-  var out = { w: { total: 0, learned: 0, due: 0, actionable: 0 }, b: { total: 0, learned: 0, due: 0, actionable: 0 } };
+  var out = { w: { total: 0, learned: 0, due: 0, actionable: 0, expired: 0 }, b: { total: 0, learned: 0, due: 0, actionable: 0, expired: 0 } };
   Object.keys(repData || {}).forEach(function(sk) {
     var colour = String(sk).split(' ')[1];
     if (colour !== 'w' && colour !== 'b') return;
@@ -1497,6 +1531,7 @@ function repertoireStats(repData, cardsByColour, now, cfg) {
     var cards = cardsByColour && cardsByColour[colour];
     var card = cards && cards[sk];
     if (!card) return;
+    if (srsIsExpired(card, now, null, cfg.learnedMinIntervalDays)) { s.expired++; return; }  // #1052
     if (typeof card.interval === 'number' && card.interval >= cfg.learnedMinIntervalDays) s.learned++;
     if (typeof card.due === 'number' && card.due <= now) {
       s.due++;
@@ -1514,7 +1549,9 @@ function repertoireStatsText(stats, firstColour) {
     var s = stats[c];
     // #712: "50/94 due" when the cap defers some (50 to do now, 94 due in all)
     var dueText = (typeof s.actionable === 'number' && s.actionable < s.due ? s.actionable + '/' : '') + s.due + ' due';
-    return (c === 'w' ? 'White ' : 'Black ') + s.learned + '/' + s.total + ' learned \u00b7 ' + dueText;
+    // #1052: "3 expired" only when some learned moves have expired
+    var expiredText = typeof s.expired === 'number' && s.expired > 0 ? ' \u00b7 ' + s.expired + ' expired' : '';
+    return (c === 'w' ? 'White ' : 'Black ') + s.learned + '/' + s.total + ' learned \u00b7 ' + dueText + expiredText;
   }).join('   ');
 }
 /* TASK_648_TRAIN_END */
