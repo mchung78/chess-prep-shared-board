@@ -181,7 +181,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "e13c7d3 \u00b7 2026-10-18 18:13 UTC";
+var BOARD_BUILD = "7065b6d \u00b7 2026-10-18 20:41 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1555,6 +1555,48 @@ function repertoireStatsText(stats, firstColour) {
   }).join('   ');
 }
 /* TASK_648_TRAIN_END */
+
+/* TASK_1057_FAVORITE_EVENTS_START - pure; the board writes these events, the coach reviews them. */
+// #1057: describe a favorite being added, switched to or revived at a position. Returns the
+// event to log, or null when nothing worth reviewing happened (a first favorite that passed
+// the guard, a plain replay of the newest favorite). `data` is the repertoire as it stood
+// BEFORE the write. info = { src: 'play'|'train', how: 'passed'|'kept'|'unchecked', loss, best }
+// where how/loss/best describe the guard's verdict for a move that was not stored yet.
+//   - new SAN, others active here  -> logged (how as given)   a widening of the repertoire
+//   - new SAN, no other favorite   -> logged only if kept or unchecked (no engine pass)
+//   - active favorite older than another -> 'switch'          deliberate preference change
+//   - stored but decayed, others active   -> 'stored'         a revival
+// prev is the newest other active favorite, when there is one.
+function favoriteChangeEvent(data, positionKey, san, info) {
+  info = info || {};
+  var plain = stripSanDecorations(san);
+  var times = trainFavoriteTimes(data, positionKey);
+  var entry = (data && data[repertoireStorageKey(positionKey)]) || {};
+  var stored = Object.keys(entry).some(function(key) { return stripSanDecorations(key) === plain; });
+  var active = Object.prototype.hasOwnProperty.call(times, plain);
+  var others = Object.keys(times).filter(function(other) { return other !== plain; });
+  var how;
+  if (stored && active) {
+    if (!trainMoveChangesPreference(data, positionKey, plain)) return null;
+    how = 'switch';
+  } else if (stored) {
+    if (!others.length) return null;
+    how = 'stored';
+  } else if (info.how === 'kept' || info.how === 'unchecked') {
+    how = info.how;
+  } else {
+    if (!others.length) return null;
+    how = 'passed';
+  }
+  var prev = null;
+  others.forEach(function(other) { if (prev === null || times[other] > times[prev]) prev = other; });
+  var event = { pos: repertoireStorageKey(positionKey), san: plain, src: info.src === 'train' ? 'train' : 'play', how: how };
+  if (prev !== null) event.prev = prev;
+  if (!stored && typeof info.loss === 'number' && isFinite(info.loss)) event.loss = Math.max(-2000, Math.min(2000, Math.round(info.loss)));
+  if (!stored && typeof info.best === 'string' && info.best.length >= 2 && info.best.length <= 12) event.best = info.best;
+  return event;
+}
+/* TASK_1057_FAVORITE_EVENTS_END */
 
 /*
   TASK_668: drill the opening mistakes from your Lichess games. This block
@@ -3497,13 +3539,27 @@ function writeTranspositions(rarity, color) {
 
 // Only moves the signed-in player actively makes, for their own side.
 // Last write refreshes the timestamp; moves are never removed here.
-function recordRepertoireMove(positionKey, move) {
+function recordRepertoireMove(positionKey, move, info) {
   if (!firebaseReady || !currentUser) return;
   if (move.color !== friendlyColorForOrientation(flipped)) return;
-  firebase.database()
-    .ref('repertoire/' + currentUser.uid + '/' + repertoireStorageKey(positionKey) + '/' + stripSanDecorations(move.san))
-    .set(firebase.database.ServerValue.TIMESTAMP)
-    .catch(function(err) { console.warn('Repertoire write failed', err); });
+  var uid = currentUser.uid;
+  var path = 'repertoire/' + uid + '/' + repertoireStorageKey(positionKey) + '/' + stripSanDecorations(move.san);
+  var stamp = firebase.database.ServerValue.TIMESTAMP;
+  function warn(err) { console.warn('Repertoire write failed', err); }
+  function favoriteAlone() { return firebase.database().ref(path).set(stamp); }
+  // #1057: callers run this before noteRepertoireMoveLocally, so repertoireData is still the
+  // state before the write. A change is logged in the same update as the favorite itself.
+  var event = favoriteChangeEvent(repertoireData, positionKey, move.san, info);
+  if (!event) { favoriteAlone().catch(warn); return; }
+  event.ts = stamp;
+  var updates = {};
+  updates[path] = stamp;
+  updates['favoriteChanges/' + uid + '/' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)] = event;
+  // If the log is refused (rules not deployed yet), the favorite itself must still be saved.
+  firebase.database().ref().update(updates).catch(function(err) {
+    console.warn('Favorite change log refused; saving the favorite alone', err);
+    return favoriteAlone();
+  }).catch(warn);
 }
 
 function repertoireMoveStored(positionKey, san) {
@@ -3525,13 +3581,16 @@ function setRepertoireNotice(text, keep) {
 
 async function guardAndRecordRepertoireMove(positionKey, fenBefore, move, trainGap) {
   if (!firebaseReady || !currentUser || move.color !== friendlyColorForOrientation(flipped)) return;
-  if (repertoireMoveStored(positionKey, move.san)) { recordRepertoireMove(positionKey, move); noteRepertoireMoveLocally(positionKey, move.san); return; }
+  var src = trainGap ? 'train' : 'play';
+  function record(info) { recordRepertoireMove(positionKey, move, Object.assign({ src: src }, info)); noteRepertoireMoveLocally(positionKey, move.san); }
+  if (repertoireMoveStored(positionKey, move.san)) { record(); return; }
   var result = await evaluateRepertoireMove(fenBefore, move);
-  if (!result) { recordRepertoireMove(positionKey, move); noteRepertoireMoveLocally(positionKey, move.san); setRepertoireNotice('Added (couldn\'t check it with the engine).'); return; }
-  if (result.loss < REPERTOIRE_GUARD.weakMoveCp) { recordRepertoireMove(positionKey, move); noteRepertoireMoveLocally(positionKey, move.san); return; }
+  if (!result) { record({ how: 'unchecked' }); setRepertoireNotice('Added (couldn\'t check it with the engine).'); return; }
+  var verdict = { loss: result.loss, best: result.bestSan };
+  if (result.loss < REPERTOIRE_GUARD.weakMoveCp) { record(Object.assign({ how: 'passed' }, verdict)); return; }
   var amount = (result.loss / 100).toFixed(1);
   setRepertoireNotice((trainGap ? '' : 'Not added to your repertoire: ') + stripSanDecorations(move.san) + ' is ' + amount + ' worse than ' + result.bestSan + '.', function() {
-    recordRepertoireMove(positionKey, move); noteRepertoireMoveLocally(positionKey, move.san);
+    record(Object.assign({ how: 'kept' }, verdict));
   });
 }
 
@@ -4562,9 +4621,9 @@ function trainGuardedAdd(t, move, fenBefore, keyBefore, pathBefore, isChange) {
   function stale() {
     return train !== t || t.lineId !== lineId || !currentUser || currentUser.uid !== uid || game.fen() !== fenAfter;
   }
-  function keep() {
+  function keep(info) {
     hideRepertoireNotice();
-    recordRepertoireMove(keyBefore, move); noteRepertoireMoveLocally(keyBefore, move.san);
+    recordRepertoireMove(keyBefore, move, Object.assign({ src: 'train' }, info)); noteRepertoireMoveLocally(keyBefore, move.san);
     t.gapPending = false;
     if (isChange) {
       trainSaveCard(t, keyBefore, 'changed', pathBefore);
@@ -4586,7 +4645,7 @@ function trainGuardedAdd(t, move, fenBefore, keyBefore, pathBefore, isChange) {
   evaluateRepertoireMove(fenBefore, move).catch(function() { return null; }).then(function(result) {
     if (stale()) return;
     if (!result || result.loss < REPERTOIRE_GUARD.weakMoveCp) {
-      keep();
+      keep(result ? { how: 'passed', loss: result.loss, best: result.bestSan } : { how: 'unchecked' });
       if (!result) setRepertoireNotice('Added (couldn\'t check it with the engine).');
       return;
     }
@@ -4598,7 +4657,7 @@ function trainGuardedAdd(t, move, fenBefore, keyBefore, pathBefore, isChange) {
       // position. A stale button (another move since, the line over, training stopped) must
       // not replay the move into whatever position the board holds now.
       if (train !== t || t.lineId !== lineId || !currentUser || currentUser.uid !== uid || t.busy || game.fen() !== fenBefore) { hideRepertoireNotice(); return; }
-      game.move(move.san); viewPly = game.history().length; keep();
+      game.move(move.san); viewPly = game.history().length; keep({ how: 'kept', loss: result.loss, best: result.bestSan });
     });
     trainScheduleHint();
   });
@@ -4645,7 +4704,7 @@ function trainOnUserMove(from, to) {
     trainGuardedAdd(t, move, fenBefore, keyBefore, pathBefore, grade === 'wrong');
     return true;
   }
-  recordRepertoireMove(keyBefore, move);
+  recordRepertoireMove(keyBefore, move, { src: 'train' });
   noteRepertoireMoveLocally(keyBefore, move.san);
   if (change) {
     trainSaveCard(t, keyBefore, 'changed', pathBefore);
