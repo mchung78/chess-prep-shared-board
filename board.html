@@ -158,6 +158,13 @@ Analysis mode
 </div>
 <div style="flex:1 1 100%; font-size:11px; color:var(--text-muted, #999);">Train drills the opening mistakes from your recent games. A change here applies at once; Close does not save it.</div>
 </div>
+<div id="settingsFavoritesReview" data-row="favoritesReview" style="margin:0 0 10px;">
+<div style="display:flex; align-items:center; gap:2px 8px; flex-wrap:wrap;">
+<div style="flex:1 1 130px; font-size:13px;">Favorites review<span style="display:block; font-size:11px; color:var(--text-secondary, #aaa);">Export your favorite changes for a coaching session.</span></div>
+<button id="settingsFavoritesExportBtn" title="Build a copyable summary of the favorites you added or changed, to paste into a coaching session.">Export</button>
+</div>
+<textarea id="settingsFavoritesExport" readonly rows="6" aria-label="Favorites review export" style="display:none; width:100%; box-sizing:border-box; margin-top:6px; font-family:monospace; font-size:11px; background:var(--bg-secondary, #222); color:var(--text-primary, #eee); border:1px solid var(--border-strong, #666);"></textarea>
+</div>
 <p id="settingsStatus" role="status" aria-live="polite" style="min-height:1.3em; margin:0 0 10px; font-size:12px; color:var(--text-secondary, #aaa);"></p>
 <div style="display:flex; gap:8px; justify-content:flex-end; flex-wrap:wrap;">
 <button id="settingsResetAllBtn">Reset all to defaults</button>
@@ -181,7 +188,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "7065b6d \u00b7 2026-10-18 20:41 UTC";
+var BOARD_BUILD = "776587a \u00b7 2026-10-18 22:22 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1597,6 +1604,48 @@ function favoriteChangeEvent(data, positionKey, san, info) {
   return event;
 }
 /* TASK_1057_FAVORITE_EVENTS_END */
+
+/* TASK_1057_FAVORITES_EXPORT_START - pure; builds the JSON a coaching session reviews. */
+var FAVORITES_EXPORT = { version: 1, maxEvents: 100, maxInferred: 50 };
+
+// #1057 phase 2: the favorite-change log (newest first) plus positions that hold two or more
+// active favorites but have no logged event (favorites from before tracking existed), marked
+// as inferred because a stored timestamp is last-played, not creation time. `rawEvents` is the
+// favoriteChanges/<uid> snapshot value (id -> event) or null; junk entries are dropped.
+function favoritesReviewExport(data, rawEvents, now) {
+  var events = [];
+  Object.keys(rawEvents && typeof rawEvents === 'object' ? rawEvents : {}).forEach(function(id) {
+    var e = rawEvents[id];
+    if (!e || typeof e !== 'object' || typeof e.pos !== 'string' || typeof e.san !== 'string' ||
+        typeof e.src !== 'string' || typeof e.how !== 'string' || typeof e.ts !== 'number') return;
+    var out = { id: id, pos: e.pos, san: e.san, src: e.src, how: e.how, ts: e.ts };
+    if (typeof e.prev === 'string') out.prev = e.prev;
+    if (typeof e.loss === 'number') out.loss = e.loss;
+    if (typeof e.best === 'string') out.best = e.best;
+    events.push(out);
+  });
+  events.sort(function(a, b) { return b.ts - a.ts || (a.id < b.id ? 1 : -1); });
+  var totalEvents = events.length;
+  // Every logged position counts, including events older than the cap: a position with a
+  // logged event is never "inferred", whether or not its event fits in the export.
+  var logged = {};
+  events.forEach(function(e) { logged[e.pos] = true; });
+  events = events.slice(0, FAVORITES_EXPORT.maxEvents);
+  var inferred = [];
+  Object.keys(data || {}).forEach(function(sk) {
+    if (logged[sk]) return;
+    var times = trainFavoriteTimes(data, sk);
+    var sans = Object.keys(times);
+    if (sans.length < 2) return;
+    sans.sort(function(a, b) { return times[b] - times[a]; });
+    inferred.push({ pos: sk, favorites: sans.map(function(san) { return { san: san, at: times[san] }; }) });
+  });
+  inferred.sort(function(a, b) { return b.favorites[0].at - a.favorites[0].at; });
+  var totalInferred = inferred.length;
+  inferred = inferred.slice(0, FAVORITES_EXPORT.maxInferred);
+  return { version: FAVORITES_EXPORT.version, exportedAt: now, totalEvents: totalEvents, totalInferred: totalInferred, events: events, inferred: inferred };
+}
+/* TASK_1057_FAVORITES_EXPORT_END */
 
 /*
   TASK_668: drill the opening mistakes from your Lichess games. This block
@@ -3280,6 +3329,43 @@ if (settingsBtnEl && settingsDialogEl) {
     writeSettings(buildSettingsUpdate(edits), 'All settings are back to their defaults.');
   });
   settingsCloseBtnEl.addEventListener('click', function() { closeSettingsDialog(); });
+}
+
+// #1057 phase 2: Export builds the favorites-review JSON and shows it selected, ready for
+// Ctrl/Cmd+C (the Clipboard API is blocked in this sandbox). A log that cannot be read still
+// exports the inferred candidates, with the failure said plainly.
+var favoritesExportBtnEl = document.getElementById('settingsFavoritesExportBtn');
+var favoritesExportEl = document.getElementById('settingsFavoritesExport');
+function showFavoritesExport(text, status, isError) {
+  favoritesExportEl.value = text;
+  favoritesExportEl.style.display = '';
+  setSettingsStatus(status, !!isError);
+  favoritesExportEl.focus();
+  favoritesExportEl.select();
+}
+var favoritesExportGen = 0;   // bumped by every export click and every Settings open: only the newest read may publish
+if (favoritesExportBtnEl && favoritesExportEl) {
+  favoritesExportBtnEl.addEventListener('click', function() {
+    if (!currentUser || !firebaseReady) return;
+    var uid = currentUser.uid;
+    var gen = ++favoritesExportGen;
+    var openGen = settingsOpenGen;
+    // A read that finishes late must not touch the dialog: not after a newer export started, not
+    // after Settings was closed or reopened (the reopen cleared the box), not after a sign-out.
+    function stale() {
+      return gen !== favoritesExportGen || openGen !== settingsOpenGen || !settingsDialogEl.open || !currentUser || currentUser.uid !== uid;
+    }
+    function build(raw, failed) {
+      if (stale()) return;
+      var payload = favoritesReviewExport(repertoireData, raw, Date.now());
+      var summary = payload.events.length + ' logged change' + (payload.events.length === 1 ? '' : 's') + ', ' + payload.inferred.length + ' inferred. Copy with Ctrl/Cmd+C and paste into a coaching session.';
+      showFavoritesExport(JSON.stringify(payload), failed ? 'Could not read the favorite log, so only inferred candidates are included. ' + summary : summary, failed);
+    }
+    setSettingsStatus('Reading your favorite log\u2026', false);
+    firebase.database().ref('favoriteChanges/' + uid).once('value').then(function(snap) { build(snap && snap.val ? snap.val() : null, false); },
+      function(err) { console.warn('Favorite log read failed', err); build(null, true); });
+  });
+  settingsBtnEl.addEventListener('click', function() { favoritesExportGen++; favoritesExportEl.style.display = 'none'; favoritesExportEl.value = ''; });
 }
 
 /*
