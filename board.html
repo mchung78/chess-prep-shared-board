@@ -188,7 +188,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "39a5a75 \u00b7 2026-10-19 01:13 UTC";
+var BOARD_BUILD = "483ea93 \u00b7 2026-10-19 02:14 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1612,7 +1612,39 @@ var FAVORITES_EXPORT = { version: 1, maxEvents: 100, maxInferred: 100 };
 // active favorites but have no logged event (favorites from before tracking existed), marked
 // as inferred because a stored timestamp is last-played, not creation time. `rawEvents` is the
 // favoriteChanges/<uid> snapshot value (id -> event) or null; junk entries are dropped.
-function favoritesReviewExport(data, rawEvents, now) {
+// #1057 D7: what the student has been drilled on through each favorite. `cards` is the
+// training/<uid> snapshot ({ color: { positionKey: card } }, a card has a SAN `path` from the
+// start and a `due` time); `pathPlies` is trainPathPlies (injected so this stays pure). The index
+// is keyed 'storageKey|san': how many cards pass through that move at that position, how many
+// are due, and the longest run in plies from that move to the end of a card's path (the move
+// itself counts as 1). Cards are what has been drilled, not the whole repertoire.
+function favoriteBranchIndex(cards, pathPlies, now) {
+  var index = {};
+  Object.keys(cards && typeof cards === 'object' ? cards : {}).forEach(function(color) {
+    var set = cards[color];
+    if (!set || typeof set !== 'object') return;
+    Object.keys(set).forEach(function(sk) {
+      var card = set[sk];
+      if (!card || typeof card !== 'object' || typeof card.path !== 'string' || !card.path) return;
+      var plies;
+      try { plies = pathPlies(card.path); } catch (error) { plies = null; }
+      if (!plies || !plies.length) return;
+      var seen = {};
+      plies.forEach(function(ply, i) {
+        var key = repertoireStorageKey(ply.posKey) + '|' + stripSanDecorations(ply.san);
+        if (seen[key]) return;
+        seen[key] = true;
+        var entry = index[key] || (index[key] = { cards: 0, due: 0, depth: 0 });
+        entry.cards++;
+        if (typeof card.due === 'number' && card.due <= now) entry.due++;
+        entry.depth = Math.max(entry.depth, plies.length - i);
+      });
+    });
+  });
+  return index;
+}
+
+function favoritesReviewExport(data, rawEvents, now, branchIndex) {
   var events = [];
   Object.keys(rawEvents && typeof rawEvents === 'object' ? rawEvents : {}).forEach(function(id) {
     var e = rawEvents[id];
@@ -1634,10 +1666,19 @@ function favoritesReviewExport(data, rawEvents, now) {
   // An event records what changed at the time. `active` is what is in the repertoire NOW at that
   // position (decayed and removed favorites excluded, newest first), so a review never mistakes a
   // removed `prev` for a live favorite and sees every other favorite there, not only `prev`.
+  // With a branchIndex (cards were read) each favorite also gets cards/due/depth, zeros when no
+  // card passes through it. Without one the fields are absent, which means unknown, not zero.
+  function withBranch(pos, list) {
+    if (!branchIndex) return list;
+    return list.map(function(f) {
+      var s = branchIndex[pos + '|' + f.san] || { cards: 0, due: 0, depth: 0 };
+      return { san: f.san, at: f.at, cards: s.cards, due: s.due, depth: s.depth };
+    });
+  }
   events.forEach(function(e) {
     var times = trainFavoriteTimes(data, e.pos);
-    e.active = Object.keys(times).sort(function(a, b) { return times[b] - times[a]; })
-      .map(function(san) { return { san: san, at: times[san] }; });
+    e.active = withBranch(e.pos, Object.keys(times).sort(function(a, b) { return times[b] - times[a]; })
+      .map(function(san) { return { san: san, at: times[san] }; }));
   });
   var inferred = [];
   Object.keys(data || {}).forEach(function(sk) {
@@ -1646,7 +1687,7 @@ function favoritesReviewExport(data, rawEvents, now) {
     var sans = Object.keys(times);
     if (sans.length < 2) return;
     sans.sort(function(a, b) { return times[b] - times[a]; });
-    inferred.push({ pos: sk, favorites: sans.map(function(san) { return { san: san, at: times[san] }; }) });
+    inferred.push({ pos: sk, favorites: withBranch(sk, sans.map(function(san) { return { san: san, at: times[san] }; })) });
   });
   inferred.sort(function(a, b) { return b.favorites[0].at - a.favorites[0].at; });
   var totalInferred = inferred.length;
@@ -3363,15 +3404,20 @@ if (favoritesExportBtnEl && favoritesExportEl) {
     function stale() {
       return gen !== favoritesExportGen || openGen !== settingsOpenGen || !settingsDialogEl.open || !currentUser || currentUser.uid !== uid;
     }
-    function build(raw, failed) {
+    function build(raw, failed, cards, cardsFailed) {
       if (stale()) return;
-      var payload = favoritesReviewExport(repertoireData, raw, Date.now());
+      var index = cardsFailed ? null : favoriteBranchIndex(cards, trainPathPlies, Date.now());
+      var payload = favoritesReviewExport(repertoireData, raw, Date.now(), index);
       var summary = payload.events.length + ' logged change' + (payload.events.length === 1 ? '' : 's') + ', ' + payload.inferred.length + ' inferred. Copy with Ctrl/Cmd+C and paste into a coaching session.';
-      showFavoritesExport(JSON.stringify(payload), failed ? 'Could not read the favorite log, so only inferred candidates are included. ' + summary : summary, failed);
+      if (cardsFailed) summary = 'Could not read your training cards, so branch coverage is not included. ' + summary;
+      showFavoritesExport(JSON.stringify(payload), failed ? 'Could not read the favorite log, so only inferred candidates are included. ' + summary : summary, failed || cardsFailed);
     }
     setSettingsStatus('Reading your favorite log\u2026', false);
-    firebase.database().ref('favoriteChanges/' + uid).once('value').then(function(snap) { build(snap && snap.val ? snap.val() : null, false); },
-      function(err) { console.warn('Favorite log read failed', err); build(null, true); });
+    var logRead = firebase.database().ref('favoriteChanges/' + uid).once('value').then(function(snap) { return { raw: snap && snap.val ? snap.val() : null, failed: false }; },
+      function(err) { console.warn('Favorite log read failed', err); return { raw: null, failed: true }; });
+    var cardsRead = firebase.database().ref('training/' + uid).once('value').then(function(snap) { return { cards: snap && snap.val ? snap.val() : null, failed: false }; },
+      function(err) { console.warn('Training cards read failed', err); return { cards: null, failed: true }; });
+    Promise.all([logRead, cardsRead]).then(function(r) { build(r[0].raw, r[0].failed, r[1].cards, r[1].failed); });
   });
   settingsBtnEl.addEventListener('click', function() { favoritesExportGen++; favoritesExportEl.style.display = 'none'; favoritesExportEl.value = ''; });
 }
