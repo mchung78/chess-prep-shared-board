@@ -188,7 +188,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "776587a \u00b7 2026-10-18 22:22 UTC";
+var BOARD_BUILD = "39a5a75 \u00b7 2026-10-19 01:13 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1606,7 +1606,7 @@ function favoriteChangeEvent(data, positionKey, san, info) {
 /* TASK_1057_FAVORITE_EVENTS_END */
 
 /* TASK_1057_FAVORITES_EXPORT_START - pure; builds the JSON a coaching session reviews. */
-var FAVORITES_EXPORT = { version: 1, maxEvents: 100, maxInferred: 50 };
+var FAVORITES_EXPORT = { version: 1, maxEvents: 100, maxInferred: 100 };
 
 // #1057 phase 2: the favorite-change log (newest first) plus positions that hold two or more
 // active favorites but have no logged event (favorites from before tracking existed), marked
@@ -1631,6 +1631,14 @@ function favoritesReviewExport(data, rawEvents, now) {
   var logged = {};
   events.forEach(function(e) { logged[e.pos] = true; });
   events = events.slice(0, FAVORITES_EXPORT.maxEvents);
+  // An event records what changed at the time. `active` is what is in the repertoire NOW at that
+  // position (decayed and removed favorites excluded, newest first), so a review never mistakes a
+  // removed `prev` for a live favorite and sees every other favorite there, not only `prev`.
+  events.forEach(function(e) {
+    var times = trainFavoriteTimes(data, e.pos);
+    e.active = Object.keys(times).sort(function(a, b) { return times[b] - times[a]; })
+      .map(function(san) { return { san: san, at: times[san] }; });
+  });
   var inferred = [];
   Object.keys(data || {}).forEach(function(sk) {
     if (logged[sk]) return;
