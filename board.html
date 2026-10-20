@@ -188,7 +188,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "e0dd9f1 \u00b7 2026-10-20 01:07 UTC";
+var BOARD_BUILD = "383d008 \u00b7 2026-10-20 01:44 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -2903,13 +2903,18 @@ async function evaluateRepertoireMove(fenBefore, move) {
   // Not every caller passes a full chess.js move (gameMistakeMeasure builds a bare one), so the
   // moving piece comes from the position when the move does not carry it.
   var mover = move.piece || ((new Chess(fenBefore).get(move.from) || {}).type);
-  var played = before && before.filter(function(pv) { return guardPvMatchesMove(pv.move, Object.assign({}, move, { piece: mover })); })[0];
+  var playedMove = Object.assign({}, move, { piece: mover });
+  var played = before && before.filter(function(pv) { return guardPvMatchesMove(pv.move, playedMove); })[0];
+  if (!best) best = await runGuardLocalEval(fenBefore);
+  // #1092: when the engine's best move IS the played move, its score is the played score. Without
+  // this, a best move from the local engine (no Cloud Eval entry) was weighed against a second,
+  // separate search of the position after it: "hxg4 is 0.6 worse than hxg4".
+  if (!played && best && guardPvMatchesMove(best.move, playedMove)) played = best;
   var afterGame = new Chess(fenBefore); afterGame.move({ from: move.from, to: move.to, promotion: move.promotion || 'q' });
   if (!played) {
     var after = await fetchGuardCloudEval(afterGame.fen());
     if (after && after[0]) played = after[0];
   }
-  if (!best) best = await runGuardLocalEval(fenBefore);
   if (!played) played = await runGuardLocalEval(afterGame.fen());
   if (!best || !played) return null;
   return { loss: repertoireGuardLoss(best, played, move.color), bestSan: uciToSan(fenBefore, best.move) || best.move };
