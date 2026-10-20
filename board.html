@@ -188,7 +188,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "483ea93 \u00b7 2026-10-19 02:14 UTC";
+var BOARD_BUILD = "e0dd9f1 \u00b7 2026-10-20 01:07 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -2886,11 +2886,24 @@ function runGuardLocalEval(fen) {
   });
 }
 
-async function evaluateRepertoireMove(fenBefore, move) {
+// #1087: does an engine line's first move (UCI) play this chess.js move? Cloud Eval spells
+// castling king-takes-rook (e1h1) while chess.js says e1g1, so a plain string compare never
+// finds a castling move in the engine's own list and the guard weighed it against a separate,
+// noisier search: "O-O is 0.6 worse than O-O".
+function guardPvMatchesMove(pvMove, move) {
   var uci = move.from + move.to + (move.promotion || '');
+  if (pvMove === uci) return true;
+  var standardTo = CASTLING_KING_TAKES_ROOK_TO_STANDARD[pvMove];
+  return !!standardTo && move.piece === 'k' && pvMove.slice(0, 2) === move.from && standardTo === move.to;
+}
+
+async function evaluateRepertoireMove(fenBefore, move) {
   var before = await fetchGuardCloudEval(fenBefore);
   var best = before && before[0];
-  var played = before && before.filter(function(pv) { return pv.move === uci; })[0];
+  // Not every caller passes a full chess.js move (gameMistakeMeasure builds a bare one), so the
+  // moving piece comes from the position when the move does not carry it.
+  var mover = move.piece || ((new Chess(fenBefore).get(move.from) || {}).type);
+  var played = before && before.filter(function(pv) { return guardPvMatchesMove(pv.move, Object.assign({}, move, { piece: mover })); })[0];
   var afterGame = new Chess(fenBefore); afterGame.move({ from: move.from, to: move.to, promotion: move.promotion || 'q' });
   if (!played) {
     var after = await fetchGuardCloudEval(afterGame.fen());
@@ -5121,7 +5134,7 @@ async function gameMistakeMeasure(scan) {
   try { move = replay.move(scan.playedSan); }
   catch (error) { return null; }
   var result = await evaluateRepertoireMove(scan.fenBefore, {
-    from: move.from, to: move.to, promotion: move.promotion, color: scan.myColor,
+    from: move.from, to: move.to, promotion: move.promotion, piece: move.piece, color: scan.myColor,
   });
   return result ? { loss: result.loss, best: result.bestSan } : null;
 }
