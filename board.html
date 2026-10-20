@@ -188,7 +188,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "383d008 \u00b7 2026-10-20 01:44 UTC";
+var BOARD_BUILD = "3def3e1 \u00b7 2026-10-20 01:48 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -2859,7 +2859,12 @@ async function fetchGuardCloudEval(fen) {
   } catch (e) { return null; }
 }
 
-function runGuardLocalEval(fen) {
+// #1094: opts.searchMove (UCI) restricts the search to that one root move, so the played move is
+// scored from the same position, side to move and depth as the unrestricted best search instead
+// of from a separate search of the position after it. opts.depth caps this search (the best
+// search's depth). The result carries the depth reached.
+function runGuardLocalEval(fen, opts) {
+  opts = opts || {};
   return new Promise(function(resolve) {
     var worker;
     try { worker = new Worker(STOCKFISH_SCRIPT_PATH); } catch (e) { resolve(null); return; }
@@ -2877,12 +2882,13 @@ function runGuardLocalEval(fen) {
       if (best) {
         if (!latest) return finish(null);
         if (fenSideToMove(fen) === 'b') { if (latest.cp !== null) latest.cp = -latest.cp; if (latest.mate !== null) latest.mate = -latest.mate; }
-        finish({ cp: latest.cp, mate: latest.mate, move: best });
+        finish({ cp: latest.cp, mate: latest.mate, move: best, depth: latest.depth });
       }
     };
     worker.onerror = function() { finish(null); };
     worker.postMessage('uci'); worker.postMessage('isready'); worker.postMessage('position fen ' + fen);
-    worker.postMessage('go depth ' + REPERTOIRE_GUARD.localDepth + ' movetime ' + REPERTOIRE_GUARD.localTimeMs);
+    worker.postMessage('go depth ' + (opts.depth || REPERTOIRE_GUARD.localDepth) + ' movetime ' + REPERTOIRE_GUARD.localTimeMs +
+      (opts.searchMove ? ' searchmoves ' + opts.searchMove : ''));  // searchmoves must come last
   });
 }
 
@@ -2905,11 +2911,17 @@ async function evaluateRepertoireMove(fenBefore, move) {
   var mover = move.piece || ((new Chess(fenBefore).get(move.from) || {}).type);
   var playedMove = Object.assign({}, move, { piece: mover });
   var played = before && before.filter(function(pv) { return guardPvMatchesMove(pv.move, playedMove); })[0];
-  if (!best) best = await runGuardLocalEval(fenBefore);
+  var bestFromLocal = false;
+  if (!best) { best = await runGuardLocalEval(fenBefore); bestFromLocal = !!best; }
   // #1092: when the engine's best move IS the played move, its score is the played score. Without
   // this, a best move from the local engine (no Cloud Eval entry) was weighed against a second,
   // separate search of the position after it: "hxg4 is 0.6 worse than hxg4".
   if (!played && best && guardPvMatchesMove(best.move, playedMove)) played = best;
+  // #1094: the best move came from the local engine, so score the played move with the same
+  // engine in the same position, restricted to that move and capped at the best search's depth.
+  if (!played && bestFromLocal) {
+    played = await runGuardLocalEval(fenBefore, { searchMove: playedMove.from + playedMove.to + (playedMove.promotion || ''), depth: best.depth });
+  }
   var afterGame = new Chess(fenBefore); afterGame.move({ from: move.from, to: move.to, promotion: move.promotion || 'q' });
   if (!played) {
     var after = await fetchGuardCloudEval(afterGame.fen());
