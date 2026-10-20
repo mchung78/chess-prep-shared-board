@@ -76,19 +76,56 @@ if(typeof module!=="undefined"&&module.exports){module.exports.Chess=globalThis.
 .sr-only { position:absolute !important; width:1px !important; height:1px !important; padding:0 !important; margin:-1px !important; overflow:hidden !important; clip:rect(0,0,0,0) !important; clip-path:inset(50%) !important; white-space:nowrap !important; border:0 !important; }
 html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, #eee); margin:0; }
 #board { grid-template-columns:repeat(8,var(--square-size,44px)); grid-template-rows:repeat(8,var(--square-size,44px)); }
+/*
+  #1098: centered three-zone layout - [left panels] [board] [moves + controls].
+  The board column is a deterministic width (not content-sized) because the
+  square size is derived from it (calculateSquareSize). Below
+  1100px the left panels drop under the board and moves (two columns), below
+  700px everything stacks (board, moves, panels). The right column is as tall
+  as the board column (contain:size keeps its content from stretching the
+  row), so the move list fills the space beside the board and scrolls.
+*/
+#boardLayout { --gap:24px; --side-min:240px; --board-col:clamp(352px, calc(100% - 2 * var(--side-min) - 2 * var(--gap)), 596px);
+  display:grid; align-items:start; column-gap:var(--gap); row-gap:16px;
+  grid-template-columns:minmax(var(--side-min), 1fr) var(--board-col) minmax(var(--side-min), 1fr);
+  grid-template-areas:"left board right"; }
+#boardPanel { grid-area:board; min-width:0; }
+#leftPanel { grid-area:left; display:flex; flex-direction:column; gap:12px; min-width:0; }
+#sidePanel { grid-area:right; display:flex; flex-direction:column; gap:12px; min-width:0; min-height:0; align-self:stretch; contain:size; overflow-y:auto; }
+.panelCard { box-sizing:border-box; padding:10px 12px; border-radius:8px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666); }
+.paneTitle { font-size:13px; font-weight:600; color:var(--text-primary, #eee); }
+#movesCard { flex:1 1 0; min-height:0; display:flex; flex-direction:column; gap:8px; }
+#movesHeader { display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:2px 10px; }
+#moveList { flex:1 1 0; min-height:120px; overflow-y:auto; font-size:14px; line-height:1.7; color:var(--text-primary, #eee); }
+.moveRow { display:grid; grid-template-columns:2.6em minmax(0, 1fr) minmax(0, 1fr); align-items:center; }
+.mvStart { display:inline-block; padding:1px 6px; margin-bottom:2px; border-radius:3px; }
+.mv:hover { background:rgba(127, 127, 127, 0.28); }
+@media (max-width: 1099px) {
+  #boardLayout { --board-col:clamp(352px, calc(100% - 260px - var(--gap)), 596px);
+    grid-template-columns:var(--board-col) minmax(0, 1fr); grid-template-areas:"board right" "left left"; }
+  #leftPanel { display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); align-items:start; }
+}
+@media (max-width: 699px) {
+  #boardLayout { grid-template-columns:minmax(0, 1fr); grid-template-areas:"board" "right" "left"; }
+  #boardPanel { width:100%; min-width:212px; max-width:596px; justify-self:center; }
+  #sidePanel { contain:none; align-self:start; overflow-y:visible; }
+  #movesCard { flex:none; }
+  #moveList { flex:none; max-height:280px; }
+  #leftPanel { display:flex; align-items:stretch; }
+}
 </style>
-<div style="padding: 1rem 0;">
+<div style="padding: 1rem 16px;">
 <h2 class="sr-only" style="position:absolute !important; width:1px !important; height:1px !important; padding:0 !important; margin:-1px !important; overflow:hidden !important; clip:rect(0,0,0,0) !important; clip-path:inset(50%) !important; white-space:nowrap !important; border:0 !important;">Interactive chess board for studying positions and sending them to Claude</h2>
-<div id="boardLayout" style="display:flex; gap:20px; flex-wrap:wrap; align-items:flex-start;">
-<div id="boardPanel" style="flex:1 1 352px; min-width:212px; max-width:596px;">
-<div style="display:flex;">
+<div id="boardLayout">
+<div id="boardPanel">
+<div id="boardRow" style="display:flex; width:max-content; margin:0 auto;">
 <div id="ranks" style="display:flex; flex-direction:column; margin-right:4px;"></div>
 <div>
 <div id="board" style="display:grid; border:0.5px solid var(--border-strong, #666); position:relative;"></div>
 <div id="files" style="display:flex; margin-top:2px;"></div>
 </div>
 </div>
-<div style="display:flex; gap:8px; margin-top:12px; align-items:center;">
+<div id="boardButtons" style="display:flex; gap:8px; margin-top:12px; align-items:center; flex-wrap:wrap; justify-content:center;">
 <button id="resetBtn">Reset</button>
 <button id="undoBtn">Undo</button>
 <button id="flipBtn">Flip board</button>
@@ -96,53 +133,65 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
   <button id="linkLichessBtn" style="display:none;" title="Link your Lichess account: Train drills the opening mistakes from your recent games.">Link Lichess</button>
   <button id="settingsBtn" style="display:none;" title="Your analysis, repertoire-check, and training settings.">Settings</button>
 </div>
-<div id="repertoireStats" style="display:none; margin-top:6px; font-size:12px; color:var(--text-secondary, #aaa); white-space:pre-wrap;" title="Learned: answered cleanly on a review after its first day, with no miss since. Due: scheduled for review now. 50/94 due: 94 are due, the cap defers all but 50 for 2 hours: lowest probability first, with positions from your own recent Lichess games ranked one level higher."></div>
-</div>
-<div style="flex:1; min-width:220px;">
-<p id="turnLabel" style="font-size:14px; color:var(--text-secondary, #aaa); margin:0 0 12px;">White to move</p>
-<div style="display:flex; align-items:center; gap:8px; margin-bottom:12px;">
-<label style="font-size:13px; color:var(--text-secondary, #aaa); display:flex; align-items:center; gap:6px; cursor:pointer; user-select:none;">
-<input id="analysisModeCheckbox" type="checkbox">
-Analysis mode
-</label>
-<span id="evalBadge" style="display:none; font-size:13px; font-weight:600; padding:2px 8px; border-radius:4px; background:var(--bg-secondary, #3a3a3c); border:1px solid #888;"></span>
-</div>
-<label for="fenInput" style="font-size:13px; color:var(--text-secondary, #aaa); display:block; margin-bottom:4px;">FEN <span style="font-weight:normal;">- click to copy, paste (or type + Enter) to load</span></label>
+<div id="fenBlock" style="margin-top:12px;">
+<label for="fenInput" style="font-size:13px; color:var(--text-secondary, #aaa); display:block; margin-bottom:6px;">FEN <span style="font-weight:normal;">- click to copy, paste (or type + Enter) to load</span></label>
 <div style="display:flex; gap:6px; margin-bottom:4px;">
 <input id="fenInput" type="text" spellcheck="false" autocomplete="off" placeholder="Full FEN or 4-field positionKey" title="Shows the position on the board. Click to select it for copying; paste a FEN or positionKey to load it (Esc reverts)." style="flex:1; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px;">
 </div>
-<p id="fenError" style="font-size:13px; color:var(--text-danger, #f66); margin:0 0 12px; display:none;">That didn't parse. Check it and try again.</p>
-<label style="font-size:13px; color:var(--text-secondary, #aaa); display:block; margin-bottom:4px;">Moves <span id="syncStatus" style="font-weight:normal;"></span></label>
-<div id="authRow" style="display:none; align-items:center; gap:8px; margin-bottom:8px;">
-<button id="authBtn"></button>
-<span id="authStatus" style="font-size:12px; color:var(--text-secondary, #aaa);"></span>
+<p id="fenError" style="font-size:13px; color:var(--text-danger, #f66); margin:6px 0 0; display:none;">That didn't parse. Check it and try again.</p>
 </div>
-<div style="display:flex; gap:6px; align-items:center; margin-bottom:8px;">
+</div>
+<div id="sidePanel">
+<section id="movesCard" class="panelCard">
+<div id="movesHeader">
+<div style="display:flex; align-items:baseline; gap:10px; min-width:0;"><span class="paneTitle">Moves</span>
+<p id="turnLabel" style="font-size:14px; color:var(--text-secondary, #aaa); margin:0;">White to move</p>
+</div>
+<span id="syncStatus" style="font-size:12px; color:var(--text-secondary, #aaa);"></span>
+</div>
+<div id="repertoireNotice" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"></div>
+<button id="removeRepertoireBtn" style="display:none; margin:0; align-self:flex-start; font-size:12px;">Remove from repertoire</button>
+<div id="moveList">Start position</div>
+<div id="navRow" style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
 <button id="navFirstBtn" title="First move (Home)" aria-label="Jump to start position">|◀</button>
 <button id="navBackBtn" title="Back one move (←)" aria-label="Step back one move">◀</button>
 <button id="navForwardBtn" title="Forward one move (→)" aria-label="Step forward one move">▶</button>
 <button id="navLiveBtn" title="Jump to the current live position (End)" aria-label="Jump to live position">Live ▶|</button>
 <span id="navStatus" style="font-size:12px; color:var(--text-secondary, #aaa);"></span>
 </div>
-<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0 0 8px; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div></div>
-<details id="missedPanel" style="display:none; margin:0 0 8px; font-size:13px;">
-<summary style="cursor:pointer; color:var(--text-secondary, #aaa);">Missed <span id="missedCount"></span></summary>
+</section>
+<div id="authRow" style="display:none; align-items:center; gap:8px; margin:0;">
+<button id="authBtn" style="flex:none; white-space:nowrap;"></button>
+<span id="authStatus" style="font-size:12px; color:var(--text-secondary, #aaa); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+</div>
+<p id="buildStamp" style="margin:0; font-size:11px; color:var(--text-muted, #999);"></p>
+</div>
+<div id="leftPanel">
+<div class="panelCard"><span class="paneTitle">Analysis</span>
+<div style="display:flex; align-items:center; gap:8px; margin-top:8px;">
+<label style="font-size:13px; color:var(--text-secondary, #aaa); display:flex; align-items:center; gap:6px; cursor:pointer; user-select:none;">
+<input id="analysisModeCheckbox" type="checkbox">
+Analysis mode
+</label>
+<span id="evalBadge" style="display:none; font-size:13px; font-weight:600; padding:2px 8px; border-radius:4px; background:var(--bg-secondary, #3a3a3c); border:1px solid #888;"></span>
+</div>
+</div>
+<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div></div>
+<div id="repertoireStats" class="panelCard" style="display:none; font-size:12px; color:var(--text-secondary, #aaa); white-space:pre-wrap;" title="Learned: answered cleanly on a review after its first day, with no miss since. Due: scheduled for review now. Expired: a learned move left overdue for 30 days (or its own interval, if longer) goes back to being new; train it again to relearn it. 50/94 due: 94 are due, the cap defers all but 50 for 2 hours: lowest probability first, with positions from your own recent Lichess games ranked one level higher."></div>
+<details id="missedPanel" class="panelCard" style="display:none; font-size:13px;">
+<summary style="cursor:pointer; color:var(--text-secondary, #aaa);">Mistakes <span id="missedCount"></span></summary>
 <ol id="missedList" style="list-style:none; padding:0; margin:0; max-height:200px; overflow-y:auto;"></ol>
 </details>
-<div id="repertoireNotice" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0 0 8px; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"></div>
-<button id="removeRepertoireBtn" style="display:none; margin:0 0 8px; font-size:12px;">Remove from repertoire</button>
-<div id="moveList" style="font-size:14px; line-height:1.7; max-height:200px; overflow-y:auto; color:var(--text-primary, #eee);">Start position</div>
-<details id="gamesPanel" style="display:none; margin-top:12px; font-size:13px;">
+<details id="gamesPanel" class="panelCard" style="display:none; font-size:13px;">
 <summary style="cursor:pointer; color:var(--text-secondary, #aaa);">Games <span id="gamesCount"></span></summary>
 <p style="margin:4px 0; font-size:12px; color:var(--text-secondary, #aaa);">Your Lichess games from the last <span id="gamesDays">90</span> days, newest first. Click one to load it; the current game is kept in History. <a href="#" id="gamesRefresh">Refresh</a></p>
 <ol id="gamesList" style="list-style:none; padding:0; margin:0; max-height:200px; overflow-y:auto;"></ol>
 </details>
-<details id="historyPanel" style="display:none; margin-top:12px; font-size:13px;">
+<details id="historyPanel" class="panelCard" style="display:none; font-size:13px;">
 <summary style="cursor:pointer; color:var(--text-secondary, #aaa);">History <span id="historyCount"></span></summary>
 <p style="margin:4px 0; font-size:12px; color:var(--text-secondary, #aaa);">Lines cleared from the shared board in the last 90 days. Click one to load it; the current game is kept here too.</p>
 <ol id="historyList" style="list-style:none; padding:0; margin:0; max-height:200px; overflow-y:auto;"></ol>
 </details>
-<p id="buildStamp" style="margin:12px 0 0; font-size:11px; color:var(--text-muted, #999);"></p>
 </div>
 </div>
 </div>
@@ -150,6 +199,21 @@ Analysis mode
 <h3 id="settingsTitle" style="margin:0 0 4px; font-size:16px;">Settings</h3>
 <p style="margin:0 0 12px; font-size:12px; color:var(--text-secondary, #aaa);">Saved to your account, so they follow you to other devices. Close saves your changes; Esc closes without saving. A setting left on its default follows any future change to that default.</p>
 <div id="settingsRows"></div>
+<div id="settingsLichess" data-row="lichess" style="display:none; align-items:center; gap:2px 8px; margin:0 0 10px; flex-wrap:wrap;">
+<div style="flex:1 1 130px; font-size:13px;">Lichess account<span id="settingsLichessState" style="display:block; font-size:11px; color:var(--text-secondary, #aaa);"></span></div>
+<div style="display:flex; align-items:center; gap:8px; flex:0 0 auto;">
+<button id="settingsLichessChangeBtn">Link</button>
+<button id="settingsLichessUnlinkBtn" style="display:none;" title="Remove the link and the games cached from this account.">Unlink</button>
+</div>
+<div style="flex:1 1 100%; font-size:11px; color:var(--text-muted, #999);">Train drills the opening mistakes from your recent games. A change here applies at once; Close does not save it.</div>
+</div>
+<div id="settingsFavoritesReview" data-row="favoritesReview" style="margin:0 0 10px;">
+<div style="display:flex; align-items:center; gap:2px 8px; flex-wrap:wrap;">
+<div style="flex:1 1 130px; font-size:13px;">Favorites review<span style="display:block; font-size:11px; color:var(--text-secondary, #aaa);">Export your favorite changes for a coaching session.</span></div>
+<button id="settingsFavoritesExportBtn" title="Build a copyable summary of the favorites you added or changed, to paste into a coaching session.">Export</button>
+</div>
+<textarea id="settingsFavoritesExport" readonly rows="6" aria-label="Favorites review export" style="display:none; width:100%; box-sizing:border-box; margin-top:6px; font-family:monospace; font-size:11px; background:var(--bg-secondary, #222); color:var(--text-primary, #eee); border:1px solid var(--border-strong, #666);"></textarea>
+</div>
 <p id="settingsStatus" role="status" aria-live="polite" style="min-height:1.3em; margin:0 0 10px; font-size:12px; color:var(--text-secondary, #aaa);"></p>
 <div style="display:flex; gap:8px; justify-content:flex-end; flex-wrap:wrap;">
 <button id="settingsResetAllBtn">Reset all to defaults</button>
@@ -173,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "PREVIEW codex/task-798-board-chessjs-1x \u00b7 dbe9c48 \u00b7 2026-10-05 05:58 UTC";
+var BOARD_BUILD = "PREVIEW claude/task-1098-centered-board-layout \u00b7 8c32961 \u00b7 2026-10-20 23:42 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -252,6 +316,12 @@ function resizeBoard() {
   document.documentElement.style.setProperty('--square-size', squareSize + 'px');
 }
 
+/*
+  #1098: the board is centered in a fixed-width column, so the #804 shrink
+  (give the unused board width to the side panel) is gone: the side columns
+  are flexible, and the FEN field now sits under the board buttons at the
+  full column width. The height budget above already counts it.
+*/
 var resizeTimer = null;
 function scheduleBoardResize() {
   clearTimeout(resizeTimer);
@@ -259,9 +329,11 @@ function scheduleBoardResize() {
 }
 if (typeof ResizeObserver === 'function') {
   new ResizeObserver(scheduleBoardResize).observe(boardPanelEl);
-} else {
-  window.addEventListener('resize', scheduleBoardResize);
 }
+// #804: always listen to the window too. The observer only sees the panel's
+// own box, which does not change when the window only gets taller or shorter
+// at the same width, so the board stayed at its old size until a width change.
+window.addEventListener('resize', scheduleBoardResize);
 requestAnimationFrame(resizeBoard);
 
 /*
@@ -315,9 +387,11 @@ function updateAuthUI() {
   if (currentUser) {
     authBtnEl.textContent = 'Sign out';
     authStatusEl.textContent = 'Signed in as ' + (currentUser.email || currentUser.uid);
+    authStatusEl.title = authStatusEl.textContent;  // #804: the full address stays readable when it is truncated
   } else {
     authBtnEl.textContent = 'Sign in with Google';
     authStatusEl.textContent = 'Sign in to move pieces for everyone watching';
+    authStatusEl.title = '';
   }
 }
 if (firebaseReady) {
@@ -1076,6 +1150,7 @@ var TRAIN_CONFIG = {
   lineEndPauseMs: 450,
   maxLinePlies: 80,
   lastMistakeToleranceMs: 60 * 1000,  // #678: server/client clock skew on lastMistake
+  changeContinuationPlies: 4,  // #830b: 2 additional full moves after a deliberate change; no settings control
 };
 
 function trainHintDelaySeconds(mistakeAt, now, cfg) {
@@ -1142,16 +1217,64 @@ function newestActiveFavorite(data, positionKey) {
   return best;
 }
 
-// "Lines 3 \u00b7 7/9 right first time (78%)" - first time means no hint and no
-// mistake. The separator is escaped: this file has no <meta charset> (it's
-// also a widget fragment), so a raw non-ASCII literal breaks wherever it's
-// served without a UTF-8 header.
+// #830: an older friendly choice lowers the whole path by one tier, once.
+// Plies come from trainPathPlies; keeping this pure also lets the cap use
+// its card's color rather than the board orientation. Tied timestamps are
+// equally preferred. Inactive/missing moves are handled by pathLive, not here.
+// #830b: the active favorites' timestamps by stripped SAN. Stored keys may
+// carry +/# decorations (repertoireFavorites strips them), so read them
+// through the stripped name; an entry without a valid timestamp is left out
+// and never creates a preference.
+function trainFavoriteTimes(data, positionKey) {
+  var active = repertoireFavorites(data, positionKey);
+  var entry = (data && data[repertoireStorageKey(positionKey)]) || {};
+  var times = {};
+  Object.keys(entry).forEach(function(san) {
+    var plain = stripSanDecorations(san);
+    var at = entry[san];
+    if (active.indexOf(plain) !== -1 && typeof at === 'number' && isFinite(at)) times[plain] = at;
+  });
+  return times;
+}
+
+// #830b: is san an active favorite older than another one here? Playing it
+// deliberately changes the preference; the same test marks an older choice on
+// a path (#830). Equal timestamps are co-preferred.
+function trainMoveChangesPreference(data, positionKey, san) {
+  var times = trainFavoriteTimes(data, positionKey);
+  var at = times[stripSanDecorations(san)];
+  if (typeof at !== 'number') return false;
+  return Object.keys(times).some(function(other) { return times[other] > at; });
+}
+
+function trainPathHasOlderFavorite(plies, data, color) {
+  return (plies || []).some(function(ply) {
+    return ply.color === color && trainMoveChangesPreference(data, ply.posKey, ply.san);
+  });
+}
+
+function trainFavoritePriorityLevel(level, older) {
+  if (!older) return level;
+  if (typeof level !== 'number') level = TRAIN_LEVEL_CONFIG.unknownLevel;
+  return Math.min(4, level + 1);
+}
+
+// "Lines 3 \u00b7 7/9 correct (78%) \u00b7 2 mistakes \u00b7 4 hints". Correct means
+// the first move played at a position was right; a hint doesn't change that.
+// Mistakes are the positions where it was wrong (correct + mistakes = quizzed).
+// Hints count the positions where the hint ring appeared, right or wrong
+// afterwards, and never affect the score. The separator is escaped: this file
+// has no <meta charset> (it's also a widget fragment), so a raw non-ASCII
+// literal breaks wherever it's served without a UTF-8 header.
 function trainSummaryText(stats) {
   var parts = ['Lines ' + stats.lines];
   if (stats.quizzed > 0) {
-    parts.push(stats.firstTry + '/' + stats.quizzed + ' right first time (' + Math.round(100 * stats.firstTry / stats.quizzed) + '%)');
+    parts.push(stats.firstTry + '/' + stats.quizzed + ' correct (' + Math.round(100 * stats.firstTry / stats.quizzed) + '%)');
   }
-  if (stats.missed.length) parts.push(stats.missed.length + ' missed');  // #675: details in the Missed list
+  var mistakes = stats.mistakes || 0;
+  var hints = stats.hints || 0;
+  if (mistakes) parts.push(mistakes + (mistakes === 1 ? ' mistake' : ' mistakes'));  // #675: details in the Mistakes list
+  if (hints) parts.push(hints + (hints === 1 ? ' hint' : ' hints'));
   return parts.join(' \u00b7 ');
 }
 
@@ -1169,12 +1292,43 @@ var SRS_CONFIG = {
   hintedFactor: 1.2,
   minCorrectDays: 1,
   wrongDays: 1,
+  changedDays: 1,  // #830b: a deliberate change of favorite restarts the card at one day
   maxIntervalDays: 365,
+  // #1052: a learned card (interval >= REPERTOIRE_STATS.learnedMinIntervalDays) left
+  // overdue for more than max(expireMinGraceDays, expireIntervalFactor x interval)
+  // days is expired - see srsIsExpired.
+  expireMinGraceDays: 30,
+  expireIntervalFactor: 1,
 };
 var SRS_DAY_MS = 24 * 60 * 60 * 1000;
 
-// result: 'correct' | 'hinted' | 'wrong'. card: the stored card or null.
+/*
+  #1052: a learned move that is not trained for a long time after it is due
+  expires: it stops counting as learned or due and Train treats it exactly like a
+  position with no card (asked like a new move; srsNextCard restarts it at one
+  day). Derived from due, interval and now - nothing is stored, so a constant
+  change re-evaluates every card and no rules change is needed. Only learned
+  cards expire: an unlearned or failed card (a Lichess game mistake is due from
+  the game's own time) stays in the queue. The learned minimum defaults to
+  REPERTOIRE_STATS's; cfg defaults to SRS_CONFIG.
+*/
+function srsIsExpired(card, now, cfg, learnedMinDays) {
+  if (!card || typeof card.due !== 'number' || typeof card.interval !== 'number') return false;
+  cfg = cfg || SRS_CONFIG;
+  var learnedMin = typeof learnedMinDays === 'number' ? learnedMinDays : REPERTOIRE_STATS.learnedMinIntervalDays;
+  if (card.interval < learnedMin) return false;
+  var graceDays = Math.max(cfg.expireMinGraceDays, cfg.expireIntervalFactor * card.interval);
+  return now > card.due + graceDays * SRS_DAY_MS;
+}
+
+// result: 'correct' | 'hinted' | 'wrong' | 'changed'. card: the stored card or null.
 function srsNextCard(card, result, now, path, cfg) {
+  // #1052: an expired card restarts as a new move: no interval. lapses and p carry
+  // over (expiry is not a lapse), and so does lastMistake: gameMistakeCard uses it
+  // as the watermark that stops the same Lichess game being counted twice (a rescan
+  // after unlink/relink). It is older than interval + 30 days, so it is outside the
+  // hint window and earlier than this review - trainSkipsPosition still sees a clean one.
+  if (srsIsExpired(card, now, cfg)) card = { lapses: card.lapses, p: card.p, lastMistake: card.lastMistake };
   var interval = card && typeof card.interval === 'number' ? card.interval : 0;
   var lapses = card && typeof card.lapses === 'number' ? card.lapses : 0;
   var next = { lapses: lapses, path: path };
@@ -1184,6 +1338,8 @@ function srsNextCard(card, result, now, path, cfg) {
     interval = cfg.wrongDays;
     next.lapses = lapses + 1;
     next.lastMistake = now;
+  } else if (result === 'changed') {
+    interval = cfg.changedDays;  // #830b: no lapse and no mistake stamp - a change is not a failure
   } else if (result === 'hinted') {
     interval = interval * cfg.hintedFactor;
   } else {
@@ -1204,6 +1360,7 @@ function srsNextCard(card, result, now, path, cfg) {
 */
 function trainSkipsPosition(card, now, cfg) {
   if (!card || typeof card.due !== 'number' || typeof card.interval !== 'number') return false;
+  if (srsIsExpired(card, now)) return false;  // #1052: asked, like a position with no card
   if (srsIsDeferred(card, now)) return true;  // #712: over the cap - played for you, never asked
   if (card.due <= now) return false;
   if (typeof card.lastMistake !== 'number') return true;
@@ -1291,6 +1448,7 @@ function srsPickTarget(cards, now, rootPath, reach, pathLive, boost, level) {
     var c = cards[key];
     if (!c || typeof c.due !== 'number' || c.due > now || typeof c.path !== 'string') return;
     if (srsIsDeferred(c, now)) return;  // #712
+    if (srsIsExpired(c, now)) return;  // #1052
     if (pathLive && !pathLive(c.path)) return;
     if (rootPath) {
       if (c.path.indexOf(rootPath + ' ') !== 0) return;
@@ -1365,6 +1523,7 @@ function srsPlanDeferrals(cards, now, maxDue, active, level, score) {
   Object.keys(cards || {}).forEach(function(key) {
     var c = cards[key];
     if (!c || typeof c.due !== 'number' || c.due > now || srsIsDeferred(c, now)) return;
+    if (srsIsExpired(c, now)) return;  // #1052: no longer counts toward the cap
     if (active && !active(key)) return;
     var lv = level ? level(key, c) : 1;
     if (typeof lv !== 'number') lv = TRAIN_LEVEL_CONFIG.unknownLevel;
@@ -1384,12 +1543,13 @@ function srsPlanDeferrals(cards, now, maxDue, active, level, score) {
   those whose card has interval >= learnedMinIntervalDays (with SRS_CONFIG:
   answered cleanly on a review after its first day, no miss since); due =
   those whose card is due. A card whose position has no active favorite is
-  ignored, so learned and due are always subsets of total.
+  ignored, so learned and due are always subsets of total. #1052: an expired
+  card (srsIsExpired) is counted in expired only - not learned, not due.
 */
 var REPERTOIRE_STATS = { learnedMinIntervalDays: 2 };
 
 function repertoireStats(repData, cardsByColour, now, cfg) {
-  var out = { w: { total: 0, learned: 0, due: 0, actionable: 0 }, b: { total: 0, learned: 0, due: 0, actionable: 0 } };
+  var out = { w: { total: 0, learned: 0, due: 0, actionable: 0, expired: 0 }, b: { total: 0, learned: 0, due: 0, actionable: 0, expired: 0 } };
   Object.keys(repData || {}).forEach(function(sk) {
     var colour = String(sk).split(' ')[1];
     if (colour !== 'w' && colour !== 'b') return;
@@ -1399,6 +1559,7 @@ function repertoireStats(repData, cardsByColour, now, cfg) {
     var cards = cardsByColour && cardsByColour[colour];
     var card = cards && cards[sk];
     if (!card) return;
+    if (srsIsExpired(card, now, null, cfg.learnedMinIntervalDays)) { s.expired++; return; }  // #1052
     if (typeof card.interval === 'number' && card.interval >= cfg.learnedMinIntervalDays) s.learned++;
     if (typeof card.due === 'number' && card.due <= now) {
       s.due++;
@@ -1416,10 +1577,145 @@ function repertoireStatsText(stats, firstColour) {
     var s = stats[c];
     // #712: "50/94 due" when the cap defers some (50 to do now, 94 due in all)
     var dueText = (typeof s.actionable === 'number' && s.actionable < s.due ? s.actionable + '/' : '') + s.due + ' due';
-    return (c === 'w' ? 'White ' : 'Black ') + s.learned + '/' + s.total + ' learned \u00b7 ' + dueText;
+    // #1052: "3 expired" only when some learned moves have expired
+    var expiredText = typeof s.expired === 'number' && s.expired > 0 ? ' \u00b7 ' + s.expired + ' expired' : '';
+    return (c === 'w' ? 'White ' : 'Black ') + s.learned + '/' + s.total + ' learned \u00b7 ' + dueText + expiredText;
   }).join('   ');
 }
 /* TASK_648_TRAIN_END */
+
+/* TASK_1057_FAVORITE_EVENTS_START - pure; the board writes these events, the coach reviews them. */
+// #1057: describe a favorite being added, switched to or revived at a position. Returns the
+// event to log, or null when nothing worth reviewing happened (a first favorite that passed
+// the guard, a plain replay of the newest favorite). `data` is the repertoire as it stood
+// BEFORE the write. info = { src: 'play'|'train', how: 'passed'|'kept'|'unchecked', loss, best }
+// where how/loss/best describe the guard's verdict for a move that was not stored yet.
+//   - new SAN, others active here  -> logged (how as given)   a widening of the repertoire
+//   - new SAN, no other favorite   -> logged only if kept or unchecked (no engine pass)
+//   - active favorite older than another -> 'switch'          deliberate preference change
+//   - stored but decayed, others active   -> 'stored'         a revival
+// prev is the newest other active favorite, when there is one.
+function favoriteChangeEvent(data, positionKey, san, info) {
+  info = info || {};
+  var plain = stripSanDecorations(san);
+  var times = trainFavoriteTimes(data, positionKey);
+  var entry = (data && data[repertoireStorageKey(positionKey)]) || {};
+  var stored = Object.keys(entry).some(function(key) { return stripSanDecorations(key) === plain; });
+  var active = Object.prototype.hasOwnProperty.call(times, plain);
+  var others = Object.keys(times).filter(function(other) { return other !== plain; });
+  var how;
+  if (stored && active) {
+    if (!trainMoveChangesPreference(data, positionKey, plain)) return null;
+    how = 'switch';
+  } else if (stored) {
+    if (!others.length) return null;
+    how = 'stored';
+  } else if (info.how === 'kept' || info.how === 'unchecked') {
+    how = info.how;
+  } else {
+    if (!others.length) return null;
+    how = 'passed';
+  }
+  var prev = null;
+  others.forEach(function(other) { if (prev === null || times[other] > times[prev]) prev = other; });
+  var event = { pos: repertoireStorageKey(positionKey), san: plain, src: info.src === 'train' ? 'train' : 'play', how: how };
+  if (prev !== null) event.prev = prev;
+  if (!stored && typeof info.loss === 'number' && isFinite(info.loss)) event.loss = Math.max(-2000, Math.min(2000, Math.round(info.loss)));
+  if (!stored && typeof info.best === 'string' && info.best.length >= 2 && info.best.length <= 12) event.best = info.best;
+  return event;
+}
+/* TASK_1057_FAVORITE_EVENTS_END */
+
+/* TASK_1057_FAVORITES_EXPORT_START - pure; builds the JSON a coaching session reviews. */
+var FAVORITES_EXPORT = { version: 1, maxEvents: 100, maxInferred: 100 };
+
+// #1057 phase 2: the favorite-change log (newest first) plus positions that hold two or more
+// active favorites but have no logged event (favorites from before tracking existed), marked
+// as inferred because a stored timestamp is last-played, not creation time. `rawEvents` is the
+// favoriteChanges/<uid> snapshot value (id -> event) or null; junk entries are dropped.
+// #1057 D7: what the student has been drilled on through each favorite. `cards` is the
+// training/<uid> snapshot ({ color: { positionKey: card } }, a card has a SAN `path` from the
+// start and a `due` time); `pathPlies` is trainPathPlies (injected so this stays pure). The index
+// is keyed 'storageKey|san': how many cards pass through that move at that position, how many
+// are due, and the longest run in plies from that move to the end of a card's path (the move
+// itself counts as 1). Cards are what has been drilled, not the whole repertoire.
+function favoriteBranchIndex(cards, pathPlies, now) {
+  var index = {};
+  Object.keys(cards && typeof cards === 'object' ? cards : {}).forEach(function(color) {
+    var set = cards[color];
+    if (!set || typeof set !== 'object') return;
+    Object.keys(set).forEach(function(sk) {
+      var card = set[sk];
+      if (!card || typeof card !== 'object' || typeof card.path !== 'string' || !card.path) return;
+      var plies;
+      try { plies = pathPlies(card.path); } catch (error) { plies = null; }
+      if (!plies || !plies.length) return;
+      var seen = {};
+      plies.forEach(function(ply, i) {
+        var key = repertoireStorageKey(ply.posKey) + '|' + stripSanDecorations(ply.san);
+        if (seen[key]) return;
+        seen[key] = true;
+        var entry = index[key] || (index[key] = { cards: 0, due: 0, depth: 0 });
+        entry.cards++;
+        if (typeof card.due === 'number' && card.due <= now) entry.due++;
+        entry.depth = Math.max(entry.depth, plies.length - i);
+      });
+    });
+  });
+  return index;
+}
+
+function favoritesReviewExport(data, rawEvents, now, branchIndex) {
+  var events = [];
+  Object.keys(rawEvents && typeof rawEvents === 'object' ? rawEvents : {}).forEach(function(id) {
+    var e = rawEvents[id];
+    if (!e || typeof e !== 'object' || typeof e.pos !== 'string' || typeof e.san !== 'string' ||
+        typeof e.src !== 'string' || typeof e.how !== 'string' || typeof e.ts !== 'number') return;
+    var out = { id: id, pos: e.pos, san: e.san, src: e.src, how: e.how, ts: e.ts };
+    if (typeof e.prev === 'string') out.prev = e.prev;
+    if (typeof e.loss === 'number') out.loss = e.loss;
+    if (typeof e.best === 'string') out.best = e.best;
+    events.push(out);
+  });
+  events.sort(function(a, b) { return b.ts - a.ts || (a.id < b.id ? 1 : -1); });
+  var totalEvents = events.length;
+  // Every logged position counts, including events older than the cap: a position with a
+  // logged event is never "inferred", whether or not its event fits in the export.
+  var logged = {};
+  events.forEach(function(e) { logged[e.pos] = true; });
+  events = events.slice(0, FAVORITES_EXPORT.maxEvents);
+  // An event records what changed at the time. `active` is what is in the repertoire NOW at that
+  // position (decayed and removed favorites excluded, newest first), so a review never mistakes a
+  // removed `prev` for a live favorite and sees every other favorite there, not only `prev`.
+  // With a branchIndex (cards were read) each favorite also gets cards/due/depth, zeros when no
+  // card passes through it. Without one the fields are absent, which means unknown, not zero.
+  function withBranch(pos, list) {
+    if (!branchIndex) return list;
+    return list.map(function(f) {
+      var s = branchIndex[pos + '|' + f.san] || { cards: 0, due: 0, depth: 0 };
+      return { san: f.san, at: f.at, cards: s.cards, due: s.due, depth: s.depth };
+    });
+  }
+  events.forEach(function(e) {
+    var times = trainFavoriteTimes(data, e.pos);
+    e.active = withBranch(e.pos, Object.keys(times).sort(function(a, b) { return times[b] - times[a]; })
+      .map(function(san) { return { san: san, at: times[san] }; }));
+  });
+  var inferred = [];
+  Object.keys(data || {}).forEach(function(sk) {
+    if (logged[sk]) return;
+    var times = trainFavoriteTimes(data, sk);
+    var sans = Object.keys(times);
+    if (sans.length < 2) return;
+    sans.sort(function(a, b) { return times[b] - times[a]; });
+    inferred.push({ pos: sk, favorites: withBranch(sk, sans.map(function(san) { return { san: san, at: times[san] }; })) });
+  });
+  inferred.sort(function(a, b) { return b.favorites[0].at - a.favorites[0].at; });
+  var totalInferred = inferred.length;
+  inferred = inferred.slice(0, FAVORITES_EXPORT.maxInferred);
+  return { version: FAVORITES_EXPORT.version, exportedAt: now, totalEvents: totalEvents, totalInferred: totalInferred, events: events, inferred: inferred };
+}
+/* TASK_1057_FAVORITES_EXPORT_END */
 
 /*
   TASK_668: drill the opening mistakes from your Lichess games. This block
@@ -2397,7 +2693,9 @@ var USER_SETTINGS = [
   { key: 'guardTimeSec', label: 'Repertoire check time limit', unit: 'seconds', min: 1, max: 10, def: 1,
     group: 'guard', short: 'time (s)' },
   { key: 'maxDue', label: 'Maximum cards due', unit: 'per side', min: 1, max: 1000, def: 25,
-    hint: 'Cards above this many are deferred 2 hours, lowest probability first (positions from your Lichess games rank one level higher).' }
+    hint: 'Cards above this many are deferred 2 hours, lowest probability first (positions from your Lichess games rank one level higher).' },
+  { key: 'allowChangingFavorites', label: 'Allow Changing Favorites', unit: 'on/off', min: 0, max: 1, def: 0, kind: 'toggle',
+    hint: 'Train: a sound alternative to a favorite becomes your newest favorite instead of counting as a mistake. Turn it on while you expand your repertoire and off for ordinary drilling. Turning it off keeps what you saved.' }
 ];
 
 // Settings that share one line in the dialog (depth and time limit side by side).
@@ -2582,7 +2880,12 @@ async function fetchGuardCloudEval(fen) {
   } catch (e) { return null; }
 }
 
-function runGuardLocalEval(fen) {
+// #1094: opts.searchMove (UCI) restricts the search to that one root move, so the played move is
+// scored from the same position, side to move and depth as the unrestricted best search instead
+// of from a separate search of the position after it. opts.depth caps this search (the best
+// search's depth). The result carries the depth reached.
+function runGuardLocalEval(fen, opts) {
+  opts = opts || {};
   return new Promise(function(resolve) {
     var worker;
     try { worker = new Worker(STOCKFISH_SCRIPT_PATH); } catch (e) { resolve(null); return; }
@@ -2600,26 +2903,51 @@ function runGuardLocalEval(fen) {
       if (best) {
         if (!latest) return finish(null);
         if (fenSideToMove(fen) === 'b') { if (latest.cp !== null) latest.cp = -latest.cp; if (latest.mate !== null) latest.mate = -latest.mate; }
-        finish({ cp: latest.cp, mate: latest.mate, move: best });
+        finish({ cp: latest.cp, mate: latest.mate, move: best, depth: latest.depth });
       }
     };
     worker.onerror = function() { finish(null); };
     worker.postMessage('uci'); worker.postMessage('isready'); worker.postMessage('position fen ' + fen);
-    worker.postMessage('go depth ' + REPERTOIRE_GUARD.localDepth + ' movetime ' + REPERTOIRE_GUARD.localTimeMs);
+    worker.postMessage('go depth ' + (opts.depth || REPERTOIRE_GUARD.localDepth) + ' movetime ' + REPERTOIRE_GUARD.localTimeMs +
+      (opts.searchMove ? ' searchmoves ' + opts.searchMove : ''));  // searchmoves must come last
   });
 }
 
-async function evaluateRepertoireMove(fenBefore, move) {
+// #1087: does an engine line's first move (UCI) play this chess.js move? Cloud Eval spells
+// castling king-takes-rook (e1h1) while chess.js says e1g1, so a plain string compare never
+// finds a castling move in the engine's own list and the guard weighed it against a separate,
+// noisier search: "O-O is 0.6 worse than O-O".
+function guardPvMatchesMove(pvMove, move) {
   var uci = move.from + move.to + (move.promotion || '');
+  if (pvMove === uci) return true;
+  var standardTo = CASTLING_KING_TAKES_ROOK_TO_STANDARD[pvMove];
+  return !!standardTo && move.piece === 'k' && pvMove.slice(0, 2) === move.from && standardTo === move.to;
+}
+
+async function evaluateRepertoireMove(fenBefore, move) {
   var before = await fetchGuardCloudEval(fenBefore);
   var best = before && before[0];
-  var played = before && before.filter(function(pv) { return pv.move === uci; })[0];
+  // Not every caller passes a full chess.js move (gameMistakeMeasure builds a bare one), so the
+  // moving piece comes from the position when the move does not carry it.
+  var mover = move.piece || ((new Chess(fenBefore).get(move.from) || {}).type);
+  var playedMove = Object.assign({}, move, { piece: mover });
+  var played = before && before.filter(function(pv) { return guardPvMatchesMove(pv.move, playedMove); })[0];
+  var bestFromLocal = false;
+  if (!best) { best = await runGuardLocalEval(fenBefore); bestFromLocal = !!best; }
+  // #1092: when the engine's best move IS the played move, its score is the played score. Without
+  // this, a best move from the local engine (no Cloud Eval entry) was weighed against a second,
+  // separate search of the position after it: "hxg4 is 0.6 worse than hxg4".
+  if (!played && best && guardPvMatchesMove(best.move, playedMove)) played = best;
+  // #1094: the best move came from the local engine, so score the played move with the same
+  // engine in the same position, restricted to that move and capped at the best search's depth.
+  if (!played && bestFromLocal) {
+    played = await runGuardLocalEval(fenBefore, { searchMove: playedMove.from + playedMove.to + (playedMove.promotion || ''), depth: best.depth });
+  }
   var afterGame = new Chess(fenBefore); afterGame.move({ from: move.from, to: move.to, promotion: move.promotion || 'q' });
   if (!played) {
     var after = await fetchGuardCloudEval(afterGame.fen());
     if (after && after[0]) played = after[0];
   }
-  if (!best) best = await runGuardLocalEval(fenBefore);
   if (!played) played = await runGuardLocalEval(afterGame.fen());
   if (!best || !played) return null;
   return { loss: repertoireGuardLoss(best, played, move.color), bestSan: uciToSan(fenBefore, best.move) || best.move };
@@ -2861,6 +3189,7 @@ function applyUserSettings(values) {
   REPERTOIRE_GUARD.localDepth = values.guardDepth;
   REPERTOIRE_GUARD.localTimeMs = values.guardTimeSec * 1000;
   trainMaxDue = values.maxDue;
+  trainAllowChange = values.allowChangingFavorites === 1;
   trainApplyDueCap();
   renderRepertoireStats();
   if (engineChanged && analysisMode) {
@@ -2873,6 +3202,10 @@ function setSettingsStatus(text, isError) {
   if (!settingsStatusEl) return;
   settingsStatusEl.textContent = text || '';
   settingsStatusEl.style.color = isError ? 'var(--text-danger, #f66)' : 'var(--text-secondary, #aaa)';
+}
+
+function settingDefaultText(def) {
+  return def.kind === 'toggle' ? (def.def === 1 ? 'on' : 'off') : String(def.def);
 }
 
 function buildSettingsRows() {
@@ -2905,23 +3238,27 @@ function buildSettingsRows() {
       caption.textContent = grouped ? def.short : '';
       var input = document.createElement('input');
       input.id = 'setting-' + def.key;
-      input.type = 'number';
-      input.step = '1';
-      input.min = String(def.min);
-      input.max = String(def.max);
-      input.setAttribute('inputmode', 'numeric');
-      input.style.cssText = 'width:' + (grouped ? '56' : '64') + 'px;';
+      if (def.kind === 'toggle') {  // #830b: on/off, stored as 1/0 like every other setting (an integer in the rules)
+        input.type = 'checkbox';
+      } else {
+        input.type = 'number';
+        input.step = '1';
+        input.min = String(def.min);
+        input.max = String(def.max);
+        input.setAttribute('inputmode', 'numeric');
+        input.style.cssText = 'width:' + (grouped ? '56' : '64') + 'px;';
+      }
       input.setAttribute('aria-describedby', 'settingState-' + r.id);
       if (grouped) cell.appendChild(caption);
       cell.appendChild(input);
-      if (!grouped) {
+      if (!grouped && def.kind !== 'toggle') {
         var unit = document.createElement('span');
         unit.style.cssText = 'font-size:12px; color:var(--text-secondary, #aaa);';
         unit.textContent = def.unit;
         cell.appendChild(unit);
       }
       controls.appendChild(cell);
-      input.addEventListener('input', function() {
+      input.addEventListener(def.kind === 'toggle' ? 'change' : 'input', function() {
         if (!settingsDirty) settingsDirty = {};
         settingsDirty[def.key] = true;
         input.removeAttribute('aria-invalid');
@@ -2932,7 +3269,7 @@ function buildSettingsRows() {
     var reset = document.createElement('button');
     reset.setAttribute('data-role', 'reset');
     reset.textContent = 'Default';
-    reset.title = 'Go back to the default' + (grouped ? 's (' + r.defs.map(function(d) { return d.def; }).join(', ') + ')' : ' (' + r.defs[0].def + ')') +
+    reset.title = 'Go back to the default' + (grouped ? 's (' + r.defs.map(settingDefaultText).join(', ') + ')' : ' (' + settingDefaultText(r.defs[0]) + ')') +
       ' and follow any future change to ' + (grouped ? 'them' : 'it');
     reset.addEventListener('click', function() {
       var edits = {};
@@ -2961,11 +3298,14 @@ function renderSettings() {
     r.defs.forEach(function(def) {
       var input = row.querySelector('[data-setting="' + def.key + '"] input');
       input.disabled = !settingsLoaded;  // unavailable: Close would have nothing to save, so don't let edits be typed and lost
-      if (!(settingsDirty && settingsDirty[def.key])) input.value = String(resolved.values[def.key]);
+      if (!(settingsDirty && settingsDirty[def.key])) {
+        if (def.kind === 'toggle') input.checked = resolved.values[def.key] === 1;
+        else input.value = String(resolved.values[def.key]);
+      }
     });
     var anyCustom = r.defs.some(function(def) { return resolved.custom[def.key]; });
     row.querySelector('[data-role="state"]').textContent = anyCustom
-      ? 'yours (default ' + r.defs.map(function(d) { return d.def; }).join(' / ') + ')' : 'default';
+      ? 'yours (default ' + r.defs.map(settingDefaultText).join(' / ') + ')' : 'default';
     row.querySelector('[data-role="reset"]').disabled = !anyCustom || !settingsLoaded;
   });
   if (settingsResetAllBtnEl) settingsResetAllBtnEl.disabled = !settingsLoaded ||
@@ -3004,7 +3344,7 @@ function saveSettingsFromDialog() {
   var inputs = {};
   USER_SETTINGS.forEach(function(def) {
     var input = settingsRowsEl.querySelector('[data-setting="' + def.key + '"] input');
-    inputs[def.key] = input.value;
+    inputs[def.key] = def.kind === 'toggle' ? (input.checked ? '1' : '0') : input.value;
     input.removeAttribute('aria-invalid');
   });
   var plan = planSettingsSave(inputs, settingsDirty, resolved);
@@ -3089,6 +3429,48 @@ if (settingsBtnEl && settingsDialogEl) {
     writeSettings(buildSettingsUpdate(edits), 'All settings are back to their defaults.');
   });
   settingsCloseBtnEl.addEventListener('click', function() { closeSettingsDialog(); });
+}
+
+// #1057 phase 2: Export builds the favorites-review JSON and shows it selected, ready for
+// Ctrl/Cmd+C (the Clipboard API is blocked in this sandbox). A log that cannot be read still
+// exports the inferred candidates, with the failure said plainly.
+var favoritesExportBtnEl = document.getElementById('settingsFavoritesExportBtn');
+var favoritesExportEl = document.getElementById('settingsFavoritesExport');
+function showFavoritesExport(text, status, isError) {
+  favoritesExportEl.value = text;
+  favoritesExportEl.style.display = '';
+  setSettingsStatus(status, !!isError);
+  favoritesExportEl.focus();
+  favoritesExportEl.select();
+}
+var favoritesExportGen = 0;   // bumped by every export click and every Settings open: only the newest read may publish
+if (favoritesExportBtnEl && favoritesExportEl) {
+  favoritesExportBtnEl.addEventListener('click', function() {
+    if (!currentUser || !firebaseReady) return;
+    var uid = currentUser.uid;
+    var gen = ++favoritesExportGen;
+    var openGen = settingsOpenGen;
+    // A read that finishes late must not touch the dialog: not after a newer export started, not
+    // after Settings was closed or reopened (the reopen cleared the box), not after a sign-out.
+    function stale() {
+      return gen !== favoritesExportGen || openGen !== settingsOpenGen || !settingsDialogEl.open || !currentUser || currentUser.uid !== uid;
+    }
+    function build(raw, failed, cards, cardsFailed) {
+      if (stale()) return;
+      var index = cardsFailed ? null : favoriteBranchIndex(cards, trainPathPlies, Date.now());
+      var payload = favoritesReviewExport(repertoireData, raw, Date.now(), index);
+      var summary = payload.events.length + ' logged change' + (payload.events.length === 1 ? '' : 's') + ', ' + payload.inferred.length + ' inferred. Copy with Ctrl/Cmd+C and paste into a coaching session.';
+      if (cardsFailed) summary = 'Could not read your training cards, so branch coverage is not included. ' + summary;
+      showFavoritesExport(JSON.stringify(payload), failed ? 'Could not read the favorite log, so only inferred candidates are included. ' + summary : summary, failed || cardsFailed);
+    }
+    setSettingsStatus('Reading your favorite log\u2026', false);
+    var logRead = firebase.database().ref('favoriteChanges/' + uid).once('value').then(function(snap) { return { raw: snap && snap.val ? snap.val() : null, failed: false }; },
+      function(err) { console.warn('Favorite log read failed', err); return { raw: null, failed: true }; });
+    var cardsRead = firebase.database().ref('training/' + uid).once('value').then(function(snap) { return { cards: snap && snap.val ? snap.val() : null, failed: false }; },
+      function(err) { console.warn('Training cards read failed', err); return { cards: null, failed: true }; });
+    Promise.all([logRead, cardsRead]).then(function(r) { build(r[0].raw, r[0].failed, r[1].cards, r[1].failed); });
+  });
+  settingsBtnEl.addEventListener('click', function() { favoritesExportGen++; favoritesExportEl.style.display = 'none'; favoritesExportEl.value = ''; });
 }
 
 /*
@@ -3186,6 +3568,7 @@ function renderRepertoireStats() {
   cache has answered.
   Needs a signed-in player, a loaded repertoire and the standard start.
 */
+var trainAllowChange;  // #830b: populated by applyUserSettings; falsy (off) before a user's settings load
 var trainMaxDue;  // populated by applyUserSettings; the default is applied before a user's settings load
 var trainCapReady;  // true once the settings read has answered (value or failure); trainApplyDueCap waits for it
 
@@ -3228,7 +3611,10 @@ function trainApplyDueCap(cardsByColour) {
     if (!cards) return;
     var keys = srsPlanDeferrals(cards, now, trainNormalizeMaxDue(trainMaxDue, TRAIN_DUE_CAP),
       function(sk) { return repertoireFavorites(repertoireData, sk).length > 0; },
-      function(sk, card) { return trainCapLevel(trainLevelFromProbability(card.p), positionReachedInGames(sk), TRAIN_DUE_CAP); },  // #758
+      function(sk, card) {
+        var level = trainCapLevel(trainLevelFromProbability(card.p), positionReachedInGames(sk), TRAIN_DUE_CAP);
+        return trainFavoritePathLevel(level, card.path, colour);
+      },  // #758 own-game boost, then #830 older-favorite penalty
       function(sk, card) {
         var reach = typeof card.path === 'string' ? trainReach({ rootPly: 0, color: colour }, card.path) : 1;
         return srsPriorityScore(card, now, reach, trainGameMistakeBoost(colour, sk));
@@ -3344,13 +3730,27 @@ function writeTranspositions(rarity, color) {
 
 // Only moves the signed-in player actively makes, for their own side.
 // Last write refreshes the timestamp; moves are never removed here.
-function recordRepertoireMove(positionKey, move) {
+function recordRepertoireMove(positionKey, move, info) {
   if (!firebaseReady || !currentUser) return;
   if (move.color !== friendlyColorForOrientation(flipped)) return;
-  firebase.database()
-    .ref('repertoire/' + currentUser.uid + '/' + repertoireStorageKey(positionKey) + '/' + stripSanDecorations(move.san))
-    .set(firebase.database.ServerValue.TIMESTAMP)
-    .catch(function(err) { console.warn('Repertoire write failed', err); });
+  var uid = currentUser.uid;
+  var path = 'repertoire/' + uid + '/' + repertoireStorageKey(positionKey) + '/' + stripSanDecorations(move.san);
+  var stamp = firebase.database.ServerValue.TIMESTAMP;
+  function warn(err) { console.warn('Repertoire write failed', err); }
+  function favoriteAlone() { return firebase.database().ref(path).set(stamp); }
+  // #1057: callers run this before noteRepertoireMoveLocally, so repertoireData is still the
+  // state before the write. A change is logged in the same update as the favorite itself.
+  var event = favoriteChangeEvent(repertoireData, positionKey, move.san, info);
+  if (!event) { favoriteAlone().catch(warn); return; }
+  event.ts = stamp;
+  var updates = {};
+  updates[path] = stamp;
+  updates['favoriteChanges/' + uid + '/' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)] = event;
+  // If the log is refused (rules not deployed yet), the favorite itself must still be saved.
+  firebase.database().ref().update(updates).catch(function(err) {
+    console.warn('Favorite change log refused; saving the favorite alone', err);
+    return favoriteAlone();
+  }).catch(warn);
 }
 
 function repertoireMoveStored(positionKey, san) {
@@ -3372,13 +3772,16 @@ function setRepertoireNotice(text, keep) {
 
 async function guardAndRecordRepertoireMove(positionKey, fenBefore, move, trainGap) {
   if (!firebaseReady || !currentUser || move.color !== friendlyColorForOrientation(flipped)) return;
-  if (repertoireMoveStored(positionKey, move.san)) { recordRepertoireMove(positionKey, move); noteRepertoireMoveLocally(positionKey, move.san); return; }
+  var src = trainGap ? 'train' : 'play';
+  function record(info) { recordRepertoireMove(positionKey, move, Object.assign({ src: src }, info)); noteRepertoireMoveLocally(positionKey, move.san); }
+  if (repertoireMoveStored(positionKey, move.san)) { record(); return; }
   var result = await evaluateRepertoireMove(fenBefore, move);
-  if (!result) { recordRepertoireMove(positionKey, move); noteRepertoireMoveLocally(positionKey, move.san); setRepertoireNotice('Added (couldn\'t check it with the engine).'); return; }
-  if (result.loss < REPERTOIRE_GUARD.weakMoveCp) { recordRepertoireMove(positionKey, move); noteRepertoireMoveLocally(positionKey, move.san); return; }
+  if (!result) { record({ how: 'unchecked' }); setRepertoireNotice('Added (couldn\'t check it with the engine).'); return; }
+  var verdict = { loss: result.loss, best: result.bestSan };
+  if (result.loss < REPERTOIRE_GUARD.weakMoveCp) { record(Object.assign({ how: 'passed' }, verdict)); return; }
   var amount = (result.loss / 100).toFixed(1);
   setRepertoireNotice((trainGap ? '' : 'Not added to your repertoire: ') + stripSanDecorations(move.san) + ' is ' + amount + ' worse than ' + result.bestSan + '.', function() {
-    recordRepertoireMove(positionKey, move); noteRepertoireMoveLocally(positionKey, move.san);
+    record(Object.assign({ how: 'kept' }, verdict));
   });
 }
 
@@ -3662,6 +4065,23 @@ function render() {
   position right after that move); the currently-viewed ply is
   highlighted so browsing has a visible "you are here".
 */
+/*
+  #1098: the move list is a two-column grid (number | White | Black), one
+  .moveRow per full move, like Lichess/ChessTempo. The whitespace text nodes
+  between cells do not render in a grid; they keep textContent readable
+  ("1. e4 e5"). The current move is scrolled into view only when it or the
+  line length changed, so a re-render from late Explorer data never fights
+  the user's own scrolling.
+*/
+var moveListScrollKey = '';
+function keepCurrentMoveVisible() {
+  var cur = moveListEl.querySelector('[data-current]');
+  if (!cur) return;
+  var c = cur.getBoundingClientRect(), l = moveListEl.getBoundingClientRect();
+  if (c.top < l.top) moveListEl.scrollTop -= (l.top - c.top) + 4;
+  else if (c.bottom > l.bottom) moveListEl.scrollTop += (c.bottom - l.bottom) + 4;
+}
+
 function renderMoveList() {
   moveListEl.innerHTML = '';
   renderRepertoireStats();  // #667
@@ -3677,24 +4097,36 @@ function renderMoveList() {
   }
   var startSpan = document.createElement('span');
   startSpan.textContent = 'Start position';
+  startSpan.className = 'mv mvStart';
   startSpan.style.cursor = 'pointer';
-  startSpan.style.marginRight = '8px';
-  if (viewPly === 0) startSpan.style.background = 'var(--border-accent, #4a9eff)';
+  if (viewPly === 0) {
+    startSpan.style.background = 'var(--border-accent, #4a9eff)';
+    startSpan.setAttribute('data-current', '1');
+  }
   startSpan.onclick = function() { goToPly(0); };
   moveListEl.appendChild(startSpan);
-  if (hist.length === 0) return;
   for (var i = 0; i < hist.length; i += 2) {
     var num = (i / 2) + 1;
+    var row = document.createElement('div');
+    row.className = 'moveRow';
     var numSpan = document.createElement('span');
     numSpan.textContent = num + '. ';
     numSpan.style.color = 'var(--text-secondary, #aaa)';
-    moveListEl.appendChild(numSpan);
-    moveListEl.appendChild(makeMoveSpan(hist[i], i + 1, rarity[i], plyReachedInGames(plies[i])));
+    row.appendChild(numSpan);
+    row.appendChild(makeMoveSpan(hist[i], i + 1, rarity[i], plyReachedInGames(plies[i])));
+    row.appendChild(document.createTextNode(' '));
     if (hist[i + 1]) {
-      moveListEl.appendChild(document.createTextNode(' '));
-      moveListEl.appendChild(makeMoveSpan(hist[i + 1], i + 2, rarity[i + 1], plyReachedInGames(plies[i + 1])));
+      row.appendChild(makeMoveSpan(hist[i + 1], i + 2, rarity[i + 1], plyReachedInGames(plies[i + 1])));
+    } else {
+      row.appendChild(document.createElement('span'));  // keeps a lone White move in its column
     }
-    moveListEl.appendChild(document.createTextNode('  '));
+    row.appendChild(document.createTextNode('  '));
+    moveListEl.appendChild(row);
+  }
+  var scrollKey = viewPly + ':' + hist.length;
+  if (scrollKey !== moveListScrollKey) {
+    moveListScrollKey = scrollKey;
+    keepCurrentMoveVisible();
   }
 }
 
@@ -3729,8 +4161,9 @@ function plyReachedInGames(ply) {
 function makeMoveSpan(san, ply, rarity, bold) {
   var span = document.createElement('span');
   span.textContent = san;
+  span.className = 'mv';
   span.style.cursor = 'pointer';
-  span.style.padding = '0 2px';
+  span.style.padding = '1px 6px';
   span.style.borderRadius = '3px';
   // TASK_620: rarity color, like the extension's move-list coloring
   if (rarity && rarity.color) span.style.color = rarity.color;
@@ -3739,6 +4172,7 @@ function makeMoveSpan(san, ply, rarity, bold) {
   if (bold) tip = (tip ? tip + '\n' : '') + 'Reached in one of your recent Lichess games';
   if (tip) span.title = tip;
   if (ply === viewPly) {
+    span.setAttribute('data-current', '1');
     span.style.background = 'var(--border-accent, #4a9eff)';
     span.style.color = '#fff';
     // keep the rarity visible on the highlighted move too
@@ -4044,10 +4478,15 @@ async function trainScorePath(path) {
 }
 
 // #701: the card's level - live stats when cached, else the stored p, else null.
-function trainCardLevel(path, card) {
+function trainFavoritePathLevel(level, path, color) {
+  return trainFavoritePriorityLevel(level,
+    trainPathHasOlderFavorite(trainPathPlies(path), repertoireData, color));
+}
+
+function trainCardLevel(path, card, color) {
   var live = trainPositionLevel(trainPathRarity(path));
-  if (live !== null) return live;
-  return trainLevelFromProbability(card && card.p);
+  var level = live !== null ? live : trainLevelFromProbability(card && card.p);
+  return trainFavoritePathLevel(level, path, color);
 }
 
 function trainPathLive(t, path) {
@@ -4071,7 +4510,7 @@ function trainChooseTarget(t) {
     function(path) { return trainReach(t, path); },
     function(path) { return trainPathLive(t, path); },
     function(sk) { return trainGameMistakeBoost(t.color, sk); },
-    trainCardLevel);
+    function(path, card) { return trainCardLevel(path, card, t.color); });
   if (key) t.target = t.cards[key].path.split(' ');
   // #678: with a target, positions you know and that aren't due are played
   // for you; with none, every position is asked (extra practice).
@@ -4135,6 +4574,7 @@ function startTraining() {
     lineId: 0,
     busy: true,  // locked until trainStep() hands the first move to the player (schedule still loading)
     gapPending: false,
+    changeEndPly: 0,  // #830b: history length at which the post-change gap allowance ends
     turn: null,
     hintSquare: null,
     hintColor: null,
@@ -4145,9 +4585,9 @@ function startTraining() {
     cards: {},
     target: null,
     hadTarget: false,
-    stats: { lines: 0, quizzed: 0, firstTry: 0, missed: [] },
+    stats: { lines: 0, quizzed: 0, firstTry: 0, mistakes: 0, hints: 0, missed: [] },
     pendingRemote: undefined,
-  };  // #675: its empty stats.missed is what the Missed list shows now
+  };  // #675: its empty stats.missed is what the Mistakes list shows now
   selected = null;
   viewPly = game.history().length;
   cancelEval();
@@ -4249,7 +4689,7 @@ function trainStep() {
     }
     t.busy = false;  // the player's move: unlock the pieces
     if (atGameMistake) t.gapPending = true;  // #668: a game mistake with no favorite - your move fills the gap (the guard applies)
-    t.turn = { hinted: false, counted: false };
+    t.turn = { hinted: false, counted: false, hintCounted: false };
     var note = trainGameMistakeNote(t);
     setTrainMessage((t.gapPending
       ? (atGameMistake ? 'Not in your repertoire - you went wrong here in a game.' : 'Not in your repertoire yet: play the move you want to keep.')
@@ -4319,6 +4759,7 @@ function trainEndLine(message) {
     if (train !== t || t.lineId !== lineId) return;
     while (game.history().length > t.rootPly) game.undo();
     t.gapPending = false;
+    t.changeEndPly = 0;  // #830b: the post-change allowance belongs to the line that made the change
     trainChooseTarget(t);
     t.busy = false;
     viewPly = game.history().length;
@@ -4331,6 +4772,15 @@ function trainHintColor() {
   var rarity = computeMoveRarity(buildRarityPlies(), explorerLookup, currentPerspective());
   var last = rarity[rarity.length - 1];
   return (last && last.color) || RARITY_LEVEL_COLORS[1];
+}
+
+// A hint counts once per position, and only for a position that was quizzed:
+// a ring that fires before the first move is counted when that move lands
+// (trainOnUserMove), one that fires after a wrong move is counted here.
+function trainNoteHint(t) {
+  if (!t.turn || !t.turn.hinted || !t.turn.counted || t.turn.hintCounted) return;
+  t.turn.hintCounted = true;
+  t.stats.hints++;
 }
 
 function trainScheduleHint() {
@@ -4355,9 +4805,84 @@ function trainScheduleHint() {
     if (!move) return;
     t.hintSquare = move.from;
     t.hintColor = trainHintColor();
-    if (t.turn) t.turn.hinted = true;
+    if (t.turn) { t.turn.hinted = true; trainNoteHint(t); }
     render();
   }, delay * 1000);
+}
+
+// The line carries on from the move just made, with a notice instead of the
+// end-of-line pause (#830b).
+function trainContinueLine(t, notice) {
+  clearTimeout(t.hintTimer);
+  t.hintSquare = null;
+  viewPly = game.history().length;
+  render();
+  setRepertoireNotice(notice);
+  trainStep();
+}
+
+// #830b: a deliberate change of favorite. The target the player left is dropped and the
+// line goes on along the new branch; gaps are allowed for changeContinuationPlies plies
+// counted from the initiating move. A later change inside that window does not restart it.
+function trainContinueAfterChange(t, notice) {
+  var length = game.history().length;
+  if (!(t.changeEndPly > length)) t.changeEndPly = length + TRAIN_CONFIG.changeContinuationPlies;
+  t.target = null;
+  t.hadTarget = false;
+  trainContinueLine(t, notice);
+}
+
+// A move at a position with no favorite (a gap) or, with Allow Changing Favorites on, an
+// alternative to the favorites (isChange): the weak-move guard decides whether it becomes a
+// favorite. A rejection never grades a failure. Every async step checks the session, line,
+// signed-in player and position, so a stale answer does nothing.
+function trainGuardedAdd(t, move, fenBefore, keyBefore, pathBefore, isChange) {
+  var lineId = t.lineId;
+  var uid = currentUser && currentUser.uid;
+  var fenAfter = game.fen();
+  function stale() {
+    return train !== t || t.lineId !== lineId || !currentUser || currentUser.uid !== uid || game.fen() !== fenAfter;
+  }
+  function keep(info) {
+    hideRepertoireNotice();
+    recordRepertoireMove(keyBefore, move, Object.assign({ src: 'train' }, info)); noteRepertoireMoveLocally(keyBefore, move.san);
+    t.gapPending = false;
+    if (isChange) {
+      trainSaveCard(t, keyBefore, 'changed', pathBefore);
+      trainContinueAfterChange(t, move.san + ' is now your newest favorite here.');
+      return;
+    }
+    trainSaveCard(t, keyBefore, 'correct', pathBefore);
+    if (game.history().length < t.changeEndPly) {  // #830b: still inside the post-change allowance
+      trainContinueLine(t, move.san + ' added to your repertoire.');
+      return;
+    }
+    trainEndLine(move.san + ' added to your repertoire.');
+  }
+  // A move you already stored (a favorite that has decayed) is not weighed again.
+  if (isChange && repertoireMoveStored(keyBefore, move.san)) { keep(); return; }
+  t.busy = true;
+  setTrainMessage('Checking…');
+  // A rejected check (not just an unavailable eval) must not leave Train stuck busy: fail open.
+  evaluateRepertoireMove(fenBefore, move).catch(function() { return null; }).then(function(result) {
+    if (stale()) return;
+    if (!result || result.loss < REPERTOIRE_GUARD.weakMoveCp) {
+      keep(result ? { how: 'passed', loss: result.loss, best: result.bestSan } : { how: 'unchecked' });
+      if (!result) setRepertoireNotice('Added (couldn\'t check it with the engine).');
+      return;
+    }
+    game.undo(); viewPly = game.history().length; t.busy = false; render();
+    var amount = (result.loss / 100).toFixed(1);
+    setTrainMessage(move.san + ' is ' + amount + ' worse than ' + result.bestSan + '. Try another move.');
+    setRepertoireNotice('Weak move was not added.', function() {
+      // Only while this attempt is still open: the same session and line, idle, at the same
+      // position. A stale button (another move since, the line over, training stopped) must
+      // not replay the move into whatever position the board holds now.
+      if (train !== t || t.lineId !== lineId || !currentUser || currentUser.uid !== uid || t.busy || game.fen() !== fenBefore) { hideRepertoireNotice(); return; }
+      game.move(move.san); viewPly = game.history().length; keep({ how: 'kept', loss: result.loss, best: result.bestSan });
+    });
+    trainScheduleHint();
+  });
 }
 
 // A move from the board while training (attemptMove's replacement).
@@ -4377,60 +4902,43 @@ function trainOnUserMove(from, to) {
   try { move = game.move({ from: from, to: to, promotion: 'q' }); }
   catch (error) { return false; }
   var grade = trainGrade(move.san, t.gapPending ? [] : favorites);
-  if (grade === 'wrong') {
+  // #830b: with Allow Changing Favorites on, a move outside the favorites is a candidate
+  // new favorite (the guard decides), and deliberately playing an older favorite changes
+  // the preference. Neither is graded as a mistake. Off: grading is unchanged.
+  var change = !t.gapPending && !!trainAllowChange && (grade === 'wrong' ||
+    (grade === 'correct' && trainMoveChangesPreference(repertoireData, keyBefore, move.san)));
+  if (grade === 'wrong' && !change) {
     game.undo();
     t.mistakesAt.set(keyBefore, Date.now());
     if (!t.turn.counted) {
       t.turn.counted = true;
       t.stats.quizzed++;
+      t.stats.mistakes++;
       trainSaveCard(t, keyBefore, 'wrong', pathBefore);
       trainNoteMiss(t, lineBefore, movesBefore, favorites);
+      trainNoteHint(t);
     }
     setTrainMessage(move.san + " isn't your repertoire move here. Try again.");
     trainScheduleHint();
     return true;
   }
-  if (grade === 'gap') {
-    t.busy = true;
-    setTrainMessage('Checking…');
-    // A rejected check (not just an unavailable eval) must not leave Train stuck busy: fail open.
-    evaluateRepertoireMove(fenBefore, move).catch(function() { return null; }).then(function(result) {
-      if (train !== t) return;
-      function keep() {
-        hideRepertoireNotice();
-        recordRepertoireMove(keyBefore, move); noteRepertoireMoveLocally(keyBefore, move.san);
-        t.gapPending = false; trainSaveCard(t, keyBefore, 'correct', pathBefore);
-        trainEndLine(move.san + ' added to your repertoire.');
-      }
-      if (!result || result.loss < REPERTOIRE_GUARD.weakMoveCp) {
-        keep();
-        if (!result) setRepertoireNotice('Added (couldn\'t check it with the engine).');
-        return;
-      }
-      game.undo(); viewPly = game.history().length; t.busy = false; render();
-      var amount = (result.loss / 100).toFixed(1);
-      setTrainMessage(move.san + ' is ' + amount + ' worse than ' + result.bestSan + '. Try another move.');
-      setRepertoireNotice('Weak move was not added.', function() {
-        // Only while this gap is still open: the same session, idle, at the same position.
-        // A stale button (another move since, the line over, training stopped) must not
-        // replay the move into whatever position the board holds now.
-        if (train !== t || t.busy || game.fen() !== fenBefore) { hideRepertoireNotice(); return; }
-        game.move(move.san); viewPly = game.history().length; keep();
-      });
-      trainScheduleHint();
-    });
+  if (grade === 'gap' || grade === 'wrong') {
+    trainGuardedAdd(t, move, fenBefore, keyBefore, pathBefore, grade === 'wrong');
     return true;
   }
-  recordRepertoireMove(keyBefore, move);
+  recordRepertoireMove(keyBefore, move, { src: 'train' });
   noteRepertoireMoveLocally(keyBefore, move.san);
+  if (change) {
+    trainSaveCard(t, keyBefore, 'changed', pathBefore);
+    trainContinueAfterChange(t, move.san + ' is now your newest favorite here.');
+    return true;
+  }
   if (!t.turn.counted) {
     t.turn.counted = true;
     t.stats.quizzed++;
     trainSaveCard(t, keyBefore, t.turn.hinted ? 'hinted' : 'correct', pathBefore);
-    if (!t.turn.hinted) t.stats.firstTry++;
-    else {
-      trainNoteMiss(t, lineBefore, movesBefore, favorites);
-    }
+    t.stats.firstTry++;
+    trainNoteHint(t);
   }
   viewPly = game.history().length;
   trainStep();
@@ -4589,50 +5097,90 @@ function saveGameMistakesState() {
   }
 }
 
+var settingsLichessEl = document.getElementById('settingsLichess');
+var settingsLichessStateEl = document.getElementById('settingsLichessState');
+var settingsLichessChangeBtn = document.getElementById('settingsLichessChangeBtn');
+var settingsLichessUnlinkBtn = document.getElementById('settingsLichessUnlinkBtn');
+var LINK_LICHESS_TITLE = 'Link your Lichess account: Train drills the opening mistakes from your recent games.';
+
+// #805: an unlinked player gets the button in the main row; once linked, the control
+// (username, change, unlink) lives in the Settings window instead. The button stays in
+// the row for a linked player only when Settings is not reachable (same test as the
+// Settings button), so the link can never be left without a control. While the link is
+// still loading (gameLinkMode 'pending') the state is unknown and neither shows it.
 function updateLinkLichessUI() {
-  if (!linkLichessBtn) return;
-  linkLichessBtn.style.display = currentUser ? '' : 'none';
-  linkLichessBtn.title = (currentUser && gameMistakesState && gameMistakesState.username)
-    ? 'Lichess: ' + gameMistakesState.username + '. Click to change or unlink.'
-    : 'Link your Lichess account: Train drills the opening mistakes from your recent games.';
+  var linked = !!(currentUser && gameMistakesState && gameMistakesState.username);
+  var unknown = !!currentUser && gameLinkMode === 'pending';
+  var settingsReachable = !!(currentUser && firebaseReady);
+  if (linkLichessBtn) {
+    linkLichessBtn.style.display = (currentUser && !unknown && !(linked && settingsReachable)) ? '' : 'none';
+    linkLichessBtn.title = linked
+      ? 'Lichess: ' + gameMistakesState.username + '. Click to change or unlink.'
+      : LINK_LICHESS_TITLE;
+  }
+  if (settingsLichessEl) {
+    settingsLichessEl.style.display = settingsReachable ? 'flex' : 'none';
+    settingsLichessStateEl.textContent = unknown ? 'Checking...'
+      : linked ? 'Linked as ' + gameMistakesState.username : 'Not linked';
+    settingsLichessChangeBtn.textContent = linked ? 'Change' : 'Link';
+    settingsLichessChangeBtn.title = linked ? 'Change the linked Lichess account.' : LINK_LICHESS_TITLE;
+    settingsLichessChangeBtn.disabled = unknown;
+    settingsLichessUnlinkBtn.style.display = linked ? '' : 'none';
+  }
 }
 
-if (linkLichessBtn) {
-  linkLichessBtn.addEventListener('click', function() {
-    if (!currentUser) return;
-    var current = (gameMistakesState && gameMistakesState.username) || '';
-    var name = null;
-    try { name = prompt('Your Lichess username (leave empty to unlink):', current); } catch (e) { /* sandboxed prompt */ }
-    if (name === null) return;  // cancelled
-    name = String(name).trim();
-    if (!gameMistakesState) gameMistakesState = { targets: {} };
-    if (name === current) { maybeSyncGameMistakes(); return; }
-    // A different (or removed) account starts its history from scratch.
-    if (name) {
-      gameMistakesState.username = name;
-      delete gameMistakesState.unlinkedAt;
-    } else {
-      delete gameMistakesState.username;
-      gameMistakesState.unlinkedAt = Date.now();
-    }
-    delete gameMistakesState.since;
-    delete gameMistakesState.gamesSince;
-    delete gameMistakesState.lastSyncAt;
-    gameMistakesState.targets = {};
-    if (gameLinkMode === 'firebase') {
-      // #684: the old account's games go in the same write as the new link.
-      var link = gameLinkOf(gameMistakesState);
-      gameLinkWritten = JSON.stringify(link);
-      gamesCache = {};
-      firebase.database().ref('lichess/' + currentUser.uid).update({ link: link, games: null })
-        .catch(function(err) { gameLinkWritten = null; console.warn('Lichess link change failed', err); });
-    }
-    saveGameMistakesState();
-    updateLinkLichessUI();
-    renderGames();
-    if (name) maybeSyncGameMistakes();
-  });
+// Link, change or unlink (name '' unlinks). A different (or removed) account starts its
+// history from scratch.
+function applyLichessLink(name, current) {
+  if (!gameMistakesState) gameMistakesState = { targets: {} };
+  if (name === current) { maybeSyncGameMistakes(); return; }
+  if (name) {
+    gameMistakesState.username = name;
+    delete gameMistakesState.unlinkedAt;
+  } else {
+    delete gameMistakesState.username;
+    gameMistakesState.unlinkedAt = Date.now();
+  }
+  delete gameMistakesState.since;
+  delete gameMistakesState.gamesSince;
+  delete gameMistakesState.lastSyncAt;
+  gameMistakesState.targets = {};
+  if (gameLinkMode === 'firebase') {
+    // #684: the old account's games go in the same write as the new link.
+    var link = gameLinkOf(gameMistakesState);
+    gameLinkWritten = JSON.stringify(link);
+    gamesCache = {};
+    firebase.database().ref('lichess/' + currentUser.uid).update({ link: link, games: null })
+      .catch(function(err) { gameLinkWritten = null; console.warn('Lichess link change failed', err); });
+  }
+  saveGameMistakesState();
+  updateLinkLichessUI();
+  renderGames();
+  if (name) maybeSyncGameMistakes();
 }
+
+function currentLichessName() { return (gameMistakesState && gameMistakesState.username) || ''; }
+
+function promptLichessLink() {
+  if (!currentUser || gameLinkMode === 'pending') return;
+  var current = currentLichessName();
+  var name = null;
+  try { name = prompt('Your Lichess username (leave empty to unlink):', current); } catch (e) { /* sandboxed prompt */ }
+  if (name === null) return;  // cancelled
+  applyLichessLink(String(name).trim(), current);
+}
+
+function confirmLichessUnlink() {
+  var current = currentLichessName();
+  if (!currentUser || gameLinkMode === 'pending' || !current) return;
+  var ok = false;
+  try { ok = confirm('Unlink Lichess account ' + current + '? The games cached from it are removed.'); } catch (e) { /* sandboxed confirm */ }
+  if (ok) applyLichessLink('', current);
+}
+
+if (linkLichessBtn) linkLichessBtn.addEventListener('click', promptLichessLink);
+if (settingsLichessChangeBtn) settingsLichessChangeBtn.addEventListener('click', promptLichessLink);
+if (settingsLichessUnlinkBtn) settingsLichessUnlinkBtn.addEventListener('click', confirmLichessUnlink);
 
 // Sync after sign-in once the repertoire has loaded, and when Train starts -
 // at most once per GAME_MISTAKES.minSyncMinutes, in the background. force
@@ -4655,7 +5203,7 @@ async function gameMistakeMeasure(scan) {
   try { move = replay.move(scan.playedSan); }
   catch (error) { return null; }
   var result = await evaluateRepertoireMove(scan.fenBefore, {
-    from: move.from, to: move.to, promotion: move.promotion, color: scan.myColor,
+    from: move.from, to: move.to, promotion: move.promotion, piece: move.piece, color: scan.myColor,
   });
   return result ? { loss: result.loss, best: result.bestSan } : null;
 }
