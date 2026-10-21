@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "PREVIEW claude/task-1098-centered-board-layout \u00b7 0a70e1d \u00b7 2026-10-21 02:35 UTC";
+var BOARD_BUILD = "PREVIEW claude/task-1098-centered-board-layout \u00b7 35e8ed8 \u00b7 2026-10-21 02:55 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -3550,9 +3550,30 @@ function loadStatsCards(user) {
   });
 }
 
+/*
+  The Train / Stop training button carries the number of moves due now for the side being
+  drilled (the board orientation, or the trained colour while a session runs): "Train (13)"
+  when the stats line reads "13/252 due" (13 to do now, the cap defers the rest) and
+  "Train (104)" with no cap in play. No number until the signed-in player's cards have loaded.
+*/
+function trainButtonLabel() {
+  var base = train ? 'Stop training' : 'Train';
+  if (!currentUser || !repertoireData || !statsCards || !REPERTOIRE_STATS) return base;
+  var colour = train ? train.color : friendlyColorForOrientation(flipped);
+  var s = repertoireStats(repertoireData, statsCards, Date.now(), REPERTOIRE_STATS)[colour];
+  if (!s) return base;
+  return base + ' (' + (typeof s.actionable === 'number' ? s.actionable : s.due) + ')';
+}
+
+function renderTrainButtonLabel() {
+  var btn = document.getElementById('trainBtn');
+  if (btn) btn.textContent = trainButtonLabel();
+}
+
 function renderRepertoireStats() {
   var el = document.getElementById('repertoireStats');
   if (!el || !REPERTOIRE_STATS) return;  // an early auth callback can beat the config's initializer
+  renderTrainButtonLabel();
   if (!currentUser || !repertoireData) {
     el.style.display = 'none'; el.textContent = '';
     return;
@@ -4370,7 +4391,7 @@ function renderMissedPanel() {
 
 function updateTrainUI() {
   var on = !!train;
-  trainBtn.textContent = on ? 'Stop training' : 'Train';
+  renderTrainButtonLabel();
   trainBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
   ['resetBtn', 'undoBtn', 'flipBtn', 'analysisModeCheckbox'].forEach(function(id) { document.getElementById(id).disabled = on; });
   if (fenInput) fenInput.disabled = on;
