@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "PREVIEW claude/task-1098-centered-board-layout \u00b7 35e8ed8 \u00b7 2026-10-21 02:55 UTC";
+var BOARD_BUILD = "PREVIEW claude/task-1098-centered-board-layout \u00b7 cc25888 \u00b7 2026-10-21 03:05 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1575,14 +1575,15 @@ function repertoireStats(repData, cardsByColour, now, cfg) {
 // charset note in TASK_648's doc).
 function repertoireStatsText(stats, firstColour) {
   var order = firstColour === 'b' ? ['b', 'w'] : ['w', 'b'];
-  return 'Repertoire  ' + order.map(function(c) {
+  // Three lines (rendered with white-space: pre-wrap): the heading, then one indented line per side.
+  return 'Repertoire\n' + order.map(function(c) {
     var s = stats[c];
     // #712: "50/94 due" when the cap defers some (50 to do now, 94 due in all)
     var dueText = (typeof s.actionable === 'number' && s.actionable < s.due ? s.actionable + '/' : '') + s.due + ' due';
     // #1052: "3 expired" only when some learned moves have expired
     var expiredText = typeof s.expired === 'number' && s.expired > 0 ? ' \u00b7 ' + s.expired + ' expired' : '';
-    return (c === 'w' ? 'White ' : 'Black ') + s.learned + '/' + s.total + ' learned \u00b7 ' + dueText + expiredText;
-  }).join('   ');
+    return '  ' + (c === 'w' ? 'White ' : 'Black ') + s.learned + '/' + s.total + ' learned \u00b7 ' + dueText + expiredText;
+  }).join('\n');
 }
 /* TASK_648_TRAIN_END */
 
