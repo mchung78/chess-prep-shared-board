@@ -123,9 +123,7 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 <div>
 <div id="board" style="display:grid; border:0.5px solid var(--border-strong, #666); position:relative;"></div>
 <div id="files" style="display:flex; margin-top:2px;"></div>
-</div>
-</div>
-<div id="boardButtons" style="display:flex; gap:8px; margin-top:12px; align-items:center; flex-wrap:wrap; justify-content:center;">
+<div id="boardButtons" style="display:flex; gap:8px; margin-top:12px; align-items:center; flex-wrap:wrap; justify-content:center; width:0; min-width:100%;">
 <button id="resetBtn">Reset</button>
 <button id="undoBtn">Undo</button>
 <button id="flipBtn">Flip board</button>
@@ -134,11 +132,13 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
   <button id="settingsBtn" style="display:none;" title="Your analysis, repertoire-check, and training settings.">Settings</button>
 </div>
 <div id="fenBlock" style="margin-top:12px;">
-<label for="fenInput" style="font-size:13px; color:var(--text-secondary, #aaa); display:block; margin-bottom:6px;">FEN <span style="font-weight:normal;">- click to copy, paste (or type + Enter) to load</span></label>
-<div style="display:flex; gap:6px; margin-bottom:4px;">
+<label for="fenInput" class="sr-only">FEN</label>
+<div style="display:flex; gap:6px;">
 <input id="fenInput" type="text" spellcheck="false" autocomplete="off" placeholder="Full FEN or 4-field positionKey" title="Shows the position on the board. Click to select it for copying; paste a FEN or positionKey to load it (Esc reverts)." style="flex:1; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px;">
 </div>
-<p id="fenError" style="font-size:13px; color:var(--text-danger, #f66); margin:6px 0 0; display:none;">That didn't parse. Check it and try again.</p>
+<p id="fenError" style="font-size:13px; color:var(--text-danger, #f66); margin:6px 0 0; display:none; width:0; min-width:100%;">That didn't parse. Check it and try again.</p>
+</div>
+</div>
 </div>
 </div>
 <div id="sidePanel">
@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "PREVIEW claude/task-1098-centered-board-layout \u00b7 a1df241 \u00b7 2026-10-21 02:10 UTC";
+var BOARD_BUILD = "PREVIEW claude/task-1098-centered-board-layout \u00b7 b8cf1af \u00b7 2026-10-21 02:18 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -319,8 +319,10 @@ function resizeBoard() {
 /*
   #1098: the board is centered in a fixed-width column, so the #804 shrink
   (give the unused board width to the side panel) is gone: the side columns
-  are flexible, and the FEN field now sits under the board buttons at the
-  full column width. The height budget above already counts it.
+  are flexible. The board buttons and the FEN field sit under the board grid
+  at the grid's width (the buttons wrap and the error line is clipped to it
+  rather than widening the column: width:0 + min-width:100%). The height
+  budget above already counts them.
 */
 var resizeTimer = null;
 function scheduleBoardResize() {
