@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "PREVIEW claude/task-1098-centered-board-layout \u00b7 b8cf1af \u00b7 2026-10-21 02:18 UTC";
+var BOARD_BUILD = "PREVIEW claude/task-1098-centered-board-layout \u00b7 0a70e1d \u00b7 2026-10-21 02:35 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -2499,6 +2499,9 @@ function attemptMove(from, to) {
   var keyBefore = samePositionKey(game);  // TASK_629 (e.p.-normalized)
   var fenBefore = game.fen();
   var move = game.move({ from: from, to: to, promotion: 'q' });
+  // A notice about an earlier move (weak, or unchecked) is gone once another move is made;
+  // a rejected weak move stays rejected unless Keep anyway was clicked while it was shown.
+  hideRepertoireNotice();
   if (move) guardAndRecordRepertoireMove(keyBefore, fenBefore, move, false);
   return true;
 }
@@ -4559,6 +4562,7 @@ function trainTargetMove(t) {
 }
 
 function startTraining() {
+  hideRepertoireNotice();  // no Keep anyway while training: a play-mode notice would still offer it
   if (train) return;
   if (!currentUser || !repertoireData) {
     setTrainMessage('Sign in to train: Train drills the repertoire you build by playing your moves on this board.');
@@ -4837,7 +4841,8 @@ function trainContinueAfterChange(t, notice) {
 // A move at a position with no favorite (a gap) or, with Allow Changing Favorites on, an
 // alternative to the favorites (isChange): the weak-move guard decides whether it becomes a
 // favorite. A rejection never grades a failure. Every async step checks the session, line,
-// signed-in player and position, so a stale answer does nothing.
+// signed-in player and position, so a stale answer does nothing. A weak move is only taken
+// back here (the train message says why); Keep anyway exists in play mode, not while training.
 function trainGuardedAdd(t, move, fenBefore, keyBefore, pathBefore, isChange) {
   var lineId = t.lineId;
   var uid = currentUser && currentUser.uid;
@@ -4875,14 +4880,9 @@ function trainGuardedAdd(t, move, fenBefore, keyBefore, pathBefore, isChange) {
     }
     game.undo(); viewPly = game.history().length; t.busy = false; render();
     var amount = (result.loss / 100).toFixed(1);
+    // While training a weak move is only rejected: no pop-up and no Keep anyway. To add a weak
+    // move, turn training off; play mode offers Keep anyway.
     setTrainMessage(move.san + ' is ' + amount + ' worse than ' + result.bestSan + '. Try another move.');
-    setRepertoireNotice('Weak move was not added.', function() {
-      // Only while this attempt is still open: the same session and line, idle, at the same
-      // position. A stale button (another move since, the line over, training stopped) must
-      // not replay the move into whatever position the board holds now.
-      if (train !== t || t.lineId !== lineId || !currentUser || currentUser.uid !== uid || t.busy || game.fen() !== fenBefore) { hideRepertoireNotice(); return; }
-      game.move(move.san); viewPly = game.history().length; keep({ how: 'kept', loss: result.loss, best: result.bestSan });
-    });
     trainScheduleHint();
   });
 }
@@ -4903,6 +4903,7 @@ function trainOnUserMove(from, to) {
   var move;
   try { move = game.move({ from: from, to: to, promotion: 'q' }); }
   catch (error) { return false; }
+  hideRepertoireNotice();  // any move made clears the previous notice
   var grade = trainGrade(move.san, t.gapPending ? [] : favorites);
   // #830b: with Allow Changing Favorites on, a move outside the favorites is a candidate
   // new favorite (the guard decides), and deliberately playing an older favorite changes
