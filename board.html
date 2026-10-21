@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "PREVIEW claude/task-1098-centered-board-layout \u00b7 cc25888 \u00b7 2026-10-21 03:05 UTC";
+var BOARD_BUILD = "PREVIEW claude/task-1098-centered-board-layout \u00b7 2138755 \u00b7 2026-10-21 23:49 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -3785,7 +3785,12 @@ function repertoireMoveStored(positionKey, san) {
   return !!(entry && Object.prototype.hasOwnProperty.call(entry, stripSanDecorations(san)));
 }
 
+// Bumped whenever the notice is cleared. A play-mode check that is still awaiting the engine
+// captures it first and drops its result (notice and Keep anyway) if it has changed: the next
+// move, or starting Train, ends the opportunity to keep an earlier rejected move.
+var repertoireNoticeGen = 0;
 function hideRepertoireNotice() {
+  repertoireNoticeGen++;
   var el = document.getElementById('repertoireNotice');
   el.innerHTML = ''; el.style.display = 'none';
 }
@@ -3802,12 +3807,16 @@ async function guardAndRecordRepertoireMove(positionKey, fenBefore, move, trainG
   var src = trainGap ? 'train' : 'play';
   function record(info) { recordRepertoireMove(positionKey, move, Object.assign({ src: src }, info)); noteRepertoireMoveLocally(positionKey, move.san); }
   if (repertoireMoveStored(positionKey, move.san)) { record(); return; }
+  var gen = repertoireNoticeGen;  // the notice has been cleared since this check started => stale
   var result = await evaluateRepertoireMove(fenBefore, move);
-  if (!result) { record({ how: 'unchecked' }); setRepertoireNotice('Added (couldn\'t check it with the engine).'); return; }
+  var stale = function() { return gen !== repertoireNoticeGen; };
+  if (!result) { record({ how: 'unchecked' }); if (!stale()) setRepertoireNotice('Added (couldn\'t check it with the engine).'); return; }
   var verdict = { loss: result.loss, best: result.bestSan };
   if (result.loss < REPERTOIRE_GUARD.weakMoveCp) { record(Object.assign({ how: 'passed' }, verdict)); return; }
+  if (stale()) return;  // a weak move stays rejected: no notice, no Keep anyway
   var amount = (result.loss / 100).toFixed(1);
   setRepertoireNotice((trainGap ? '' : 'Not added to your repertoire: ') + stripSanDecorations(move.san) + ' is ' + amount + ' worse than ' + result.bestSan + '.', function() {
+    if (stale()) return;
     record(Object.assign({ how: 'kept' }, verdict));
   });
 }
@@ -4108,6 +4117,23 @@ function keepCurrentMoveVisible() {
   if (c.top < l.top) moveListEl.scrollTop -= (l.top - c.top) + 4;
   else if (c.bottom > l.bottom) moveListEl.scrollTop += (c.bottom - l.bottom) + 4;
 }
+
+// The list's height changes without the cursor or line moving: a window resize, or the Train
+// message, a notice or the sign-in row growing above/below it. When it shrinks, the current
+// move may have fallen below the fold, so recheck then (and only then: a plain re-render or a
+// growing list never scrolls, so the user's own scrolling is left alone).
+var moveListLastHeight = 0;
+function watchMoveListSize() {
+  if (typeof ResizeObserver === 'undefined') return;
+  moveListLastHeight = moveListEl.clientHeight;
+  new ResizeObserver(function() {
+    var h = moveListEl.clientHeight;
+    var shrank = h < moveListLastHeight;
+    moveListLastHeight = h;
+    if (shrank) keepCurrentMoveVisible();
+  }).observe(moveListEl);
+}
+watchMoveListSize();
 
 function renderMoveList() {
   moveListEl.innerHTML = '';
