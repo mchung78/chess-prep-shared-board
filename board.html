@@ -76,19 +76,54 @@ if(typeof module!=="undefined"&&module.exports){module.exports.Chess=globalThis.
 .sr-only { position:absolute !important; width:1px !important; height:1px !important; padding:0 !important; margin:-1px !important; overflow:hidden !important; clip:rect(0,0,0,0) !important; clip-path:inset(50%) !important; white-space:nowrap !important; border:0 !important; }
 html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, #eee); margin:0; }
 #board { grid-template-columns:repeat(8,var(--square-size,44px)); grid-template-rows:repeat(8,var(--square-size,44px)); }
+/*
+  #1098: centered three-zone layout - [left panels] [board] [moves + controls].
+  The board column is a deterministic width (not content-sized) because the
+  square size is derived from it (calculateSquareSize). Below
+  1100px the left panels drop under the board and moves (two columns), below
+  700px everything stacks (board, moves, panels). The right column is as tall
+  as the board column (contain:size keeps its content from stretching the
+  row), so the move list fills the space beside the board and scrolls.
+*/
+#boardLayout { --gap:24px; --side-min:240px; --board-col:clamp(352px, calc(100% - 2 * var(--side-min) - 2 * var(--gap)), 596px);
+  display:grid; align-items:start; column-gap:var(--gap); row-gap:16px;
+  grid-template-columns:minmax(var(--side-min), 1fr) var(--board-col) minmax(var(--side-min), 1fr);
+  grid-template-areas:"left board right"; }
+#boardPanel { grid-area:board; min-width:0; }
+#leftPanel { grid-area:left; display:flex; flex-direction:column; gap:12px; min-width:0; }
+#sidePanel { grid-area:right; display:flex; flex-direction:column; gap:12px; min-width:0; min-height:0; align-self:stretch; contain:size; overflow-y:auto; }
+.panelCard { box-sizing:border-box; padding:10px 12px; border-radius:8px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666); }
+.paneTitle { font-size:13px; font-weight:600; color:var(--text-primary, #eee); }
+#movesCard { flex:1 1 0; min-height:0; display:flex; flex-direction:column; gap:8px; }
+#movesHeader { display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:2px 10px; }
+#moveList { flex:1 1 0; min-height:120px; overflow-y:auto; font-size:14px; line-height:1.7; color:var(--text-primary, #eee); }
+.moveRow { display:grid; grid-template-columns:2.6em minmax(0, 1fr) minmax(0, 1fr); align-items:center; }
+.mvStart { display:inline-block; padding:1px 6px; margin-bottom:2px; border-radius:3px; }
+.mv:hover { background:rgba(127, 127, 127, 0.28); }
+@media (max-width: 1099px) {
+  #boardLayout { --board-col:clamp(352px, calc(100% - 260px - var(--gap)), 596px);
+    grid-template-columns:var(--board-col) minmax(0, 1fr); grid-template-areas:"board right" "left left"; }
+  #leftPanel { display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); align-items:start; }
+}
+@media (max-width: 699px) {
+  #boardLayout { grid-template-columns:minmax(0, 1fr); grid-template-areas:"board" "right" "left"; }
+  #boardPanel { width:100%; min-width:212px; max-width:596px; justify-self:center; }
+  #sidePanel { contain:none; align-self:start; overflow-y:visible; }
+  #movesCard { flex:none; }
+  #moveList { flex:none; max-height:280px; }
+  #leftPanel { display:flex; align-items:stretch; }
+}
 </style>
-<div style="padding: 1rem 0;">
+<div style="padding: 1rem 16px;">
 <h2 class="sr-only" style="position:absolute !important; width:1px !important; height:1px !important; padding:0 !important; margin:-1px !important; overflow:hidden !important; clip:rect(0,0,0,0) !important; clip-path:inset(50%) !important; white-space:nowrap !important; border:0 !important;">Interactive chess board for studying positions and sending them to Claude</h2>
-<div id="boardLayout" style="display:flex; gap:20px; flex-wrap:wrap; align-items:flex-start;">
-<div id="boardPanel" style="flex:1 1 352px; min-width:212px; max-width:596px;">
-<div style="display:flex;">
+<div id="boardLayout">
+<div id="boardPanel">
+<div id="boardRow" style="display:flex; width:max-content; margin:0 auto;">
 <div id="ranks" style="display:flex; flex-direction:column; margin-right:4px;"></div>
 <div>
 <div id="board" style="display:grid; border:0.5px solid var(--border-strong, #666); position:relative;"></div>
 <div id="files" style="display:flex; margin-top:2px;"></div>
-</div>
-</div>
-<div id="boardButtons" style="display:flex; gap:8px; margin-top:12px; align-items:center;">
+<div id="boardButtons" style="display:flex; gap:8px; margin-top:12px; align-items:center; flex-wrap:wrap; justify-content:center; width:0; min-width:100%;">
 <button id="resetBtn">Reset</button>
 <button id="undoBtn">Undo</button>
 <button id="flipBtn">Flip board</button>
@@ -96,53 +131,67 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
   <button id="linkLichessBtn" style="display:none;" title="Link your Lichess account: Train drills the opening mistakes from your recent games.">Link Lichess</button>
   <button id="settingsBtn" style="display:none;" title="Your analysis, repertoire-check, and training settings.">Settings</button>
 </div>
-<div id="repertoireStats" style="display:none; margin-top:6px; font-size:12px; color:var(--text-secondary, #aaa); white-space:pre-wrap;" title="Learned: answered cleanly on a review after its first day, with no miss since. Due: scheduled for review now. Expired: a learned move left overdue for 30 days (or its own interval, if longer) goes back to being new; train it again to relearn it. 50/94 due: 94 are due, the cap defers all but 50 for 2 hours: lowest probability first, with positions from your own recent Lichess games ranked one level higher."></div>
-</div>
-<div id="sidePanel" style="flex:1; min-width:220px;">
-<p id="turnLabel" style="font-size:14px; color:var(--text-secondary, #aaa); margin:0 0 12px;">White to move</p>
-<div style="display:flex; align-items:center; gap:8px; margin-bottom:12px;">
-<label style="font-size:13px; color:var(--text-secondary, #aaa); display:flex; align-items:center; gap:6px; cursor:pointer; user-select:none;">
-<input id="analysisModeCheckbox" type="checkbox">
-Analysis mode
-</label>
-<span id="evalBadge" style="display:none; font-size:13px; font-weight:600; padding:2px 8px; border-radius:4px; background:var(--bg-secondary, #3a3a3c); border:1px solid #888;"></span>
-</div>
-<label for="fenInput" style="font-size:13px; color:var(--text-secondary, #aaa); display:block; margin-bottom:4px;">FEN <span style="font-weight:normal;">- click to copy, paste (or type + Enter) to load</span></label>
-<div style="display:flex; gap:6px; margin-bottom:4px;">
+<div id="fenBlock" style="margin-top:12px;">
+<label for="fenInput" class="sr-only">FEN</label>
+<div style="display:flex; gap:6px;">
 <input id="fenInput" type="text" spellcheck="false" autocomplete="off" placeholder="Full FEN or 4-field positionKey" title="Shows the position on the board. Click to select it for copying; paste a FEN or positionKey to load it (Esc reverts)." style="flex:1; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px;">
 </div>
-<p id="fenError" style="font-size:13px; color:var(--text-danger, #f66); margin:0 0 12px; display:none;">That didn't parse. Check it and try again.</p>
-<label style="font-size:13px; color:var(--text-secondary, #aaa); display:block; margin-bottom:4px;">Moves <span id="syncStatus" style="font-weight:normal;"></span></label>
-<div id="authRow" style="display:none; align-items:center; gap:8px; margin-bottom:8px;">
-<button id="authBtn" style="flex:none; white-space:nowrap;"></button>
-<span id="authStatus" style="font-size:12px; color:var(--text-secondary, #aaa); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+<p id="fenError" style="font-size:13px; color:var(--text-danger, #f66); margin:6px 0 0; display:none; width:0; min-width:100%;">That didn't parse. Check it and try again.</p>
 </div>
-<div style="display:flex; gap:6px; align-items:center; margin-bottom:8px;">
+</div>
+</div>
+</div>
+<div id="sidePanel">
+<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div></div>
+<section id="movesCard" class="panelCard">
+<div id="movesHeader">
+<div style="display:flex; align-items:baseline; gap:10px; min-width:0;"><span class="paneTitle">Moves</span>
+<p id="turnLabel" style="font-size:14px; color:var(--text-secondary, #aaa); margin:0;">White to move</p>
+</div>
+<span id="syncStatus" style="font-size:12px; color:var(--text-secondary, #aaa);"></span>
+</div>
+<div id="repertoireNotice" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"></div>
+<button id="removeRepertoireBtn" style="display:none; margin:0; align-self:flex-start; font-size:12px;">Remove from repertoire</button>
+<div id="moveList">Start position</div>
+<div id="navRow" style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
 <button id="navFirstBtn" title="First move (Home)" aria-label="Jump to start position">|◀</button>
 <button id="navBackBtn" title="Back one move (←)" aria-label="Step back one move">◀</button>
 <button id="navForwardBtn" title="Forward one move (→)" aria-label="Step forward one move">▶</button>
 <button id="navLiveBtn" title="Jump to the current live position (End)" aria-label="Jump to live position">Live ▶|</button>
 <span id="navStatus" style="font-size:12px; color:var(--text-secondary, #aaa);"></span>
 </div>
-<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0 0 8px; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div></div>
-<details id="missedPanel" style="display:none; margin:0 0 8px; font-size:13px;">
+</section>
+<div id="authRow" style="display:none; align-items:center; gap:8px; margin:0;">
+<button id="authBtn" style="flex:none; white-space:nowrap;"></button>
+<span id="authStatus" style="font-size:12px; color:var(--text-secondary, #aaa); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+</div>
+<p id="buildStamp" style="margin:0; font-size:11px; color:var(--text-muted, #999);"></p>
+</div>
+<div id="leftPanel">
+<div class="panelCard"><span class="paneTitle">Analysis</span>
+<div style="display:flex; align-items:center; gap:8px; margin-top:8px;">
+<label style="font-size:13px; color:var(--text-secondary, #aaa); display:flex; align-items:center; gap:6px; cursor:pointer; user-select:none;">
+<input id="analysisModeCheckbox" type="checkbox">
+Analysis mode
+</label>
+<span id="evalBadge" style="display:none; font-size:13px; font-weight:600; padding:2px 8px; border-radius:4px; background:var(--bg-secondary, #3a3a3c); border:1px solid #888;"></span>
+</div>
+</div>
+<div id="repertoireStats" class="panelCard" style="display:none; font-size:12px; color:var(--text-secondary, #aaa); white-space:pre-wrap;" title="Learned: answered cleanly on a review after its first day, with no miss since. Due: scheduled for review now. Expired: a learned move left overdue for 30 days (or its own interval, if longer) goes back to being new; train it again to relearn it. 50/94 due: 94 are due, the cap defers all but 50 for 2 hours: lowest probability first, with positions from your own recent Lichess games ranked one level higher."></div>
+<details id="missedPanel" class="panelCard" style="display:none; font-size:13px;">
 <summary style="cursor:pointer; color:var(--text-secondary, #aaa);">Mistakes <span id="missedCount"></span></summary>
 <ol id="missedList" style="list-style:none; padding:0; margin:0; max-height:200px; overflow-y:auto;"></ol>
 </details>
-<div id="repertoireNotice" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0 0 8px; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"></div>
-<button id="removeRepertoireBtn" style="display:none; margin:0 0 8px; font-size:12px;">Remove from repertoire</button>
-<div id="moveList" style="font-size:14px; line-height:1.7; max-height:200px; overflow-y:auto; color:var(--text-primary, #eee);">Start position</div>
-<details id="gamesPanel" style="display:none; margin-top:12px; font-size:13px;">
+<details id="gamesPanel" class="panelCard" style="display:none; font-size:13px;">
 <summary style="cursor:pointer; color:var(--text-secondary, #aaa);">Games <span id="gamesCount"></span></summary>
 <p style="margin:4px 0; font-size:12px; color:var(--text-secondary, #aaa);">Your Lichess games from the last <span id="gamesDays">90</span> days, newest first. Click one to load it; the current game is kept in History. <a href="#" id="gamesRefresh">Refresh</a></p>
 <ol id="gamesList" style="list-style:none; padding:0; margin:0; max-height:200px; overflow-y:auto;"></ol>
 </details>
-<details id="historyPanel" style="display:none; margin-top:12px; font-size:13px;">
+<details id="historyPanel" class="panelCard" style="display:none; font-size:13px;">
 <summary style="cursor:pointer; color:var(--text-secondary, #aaa);">History <span id="historyCount"></span></summary>
 <p style="margin:4px 0; font-size:12px; color:var(--text-secondary, #aaa);">Lines cleared from the shared board in the last 90 days. Click one to load it; the current game is kept here too.</p>
 <ol id="historyList" style="list-style:none; padding:0; margin:0; max-height:200px; overflow-y:auto;"></ol>
 </details>
-<p id="buildStamp" style="margin:12px 0 0; font-size:11px; color:var(--text-muted, #999);"></p>
 </div>
 </div>
 </div>
@@ -188,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "3def3e1 \u00b7 2026-10-20 01:48 UTC";
+var BOARD_BUILD = "9be56b0 \u00b7 2026-10-22 23:03 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -255,9 +304,6 @@ function calculateSquareSize(containerWidth, availableHeight) {
 */
 function resizeBoard() {
   if (!boardPanelEl || !boardEl) return;
-  // #804: always measure the plain CSS layout; fitBoardPanelToBoard() below
-  // re-applies its cap from the result, so the cap never feeds back into it.
-  boardPanelEl.style.maxWidth = '';
   var boardRect = boardEl.getBoundingClientRect();
   var below = boardPanelEl.getBoundingClientRect().bottom - boardRect.bottom;
   var layoutEl = document.getElementById('boardLayout');
@@ -268,39 +314,16 @@ function resizeBoard() {
   var availableHeight = window.innerHeight - boardRect.top - Math.ceil(below + frame);
   var squareSize = calculateSquareSize(boardPanelEl.clientWidth, availableHeight);
   document.documentElement.style.setProperty('--square-size', squareSize + 'px');
-  fitBoardPanelToBoard();
 }
 
 /*
-  #804: when the window is short the board is height-limited and ends well
-  inside #boardPanel (which stays at its 596px cap), leaving dead space to
-  the right of the board while the side panel (FEN field, sign-in row) is
-  squeezed. Shrink #boardPanel to what it holds so #sidePanel gets that
-  width. The floor is the widest thing under the board (the button row, the
-  stats line), so neither wraps differently than before. Only while the two
-  panels sit side by side: stacked (narrow) layouts keep a full-width panel,
-  and since resizeBoard() clears the cap first, wrapping is still decided by
-  the original CSS and the square size is unchanged.
+  #1098: the board is centered in a fixed-width column, so the #804 shrink
+  (give the unused board width to the side panel) is gone: the side columns
+  are flexible. The board buttons and the FEN field sit under the board grid
+  at the grid's width (the buttons wrap and the error line is clipped to it
+  rather than widening the column: width:0 + min-width:100%). The height
+  budget above already counts them.
 */
-function naturalWidth(el) {
-  if (!el || el.offsetParent === null) return 0;
-  var prev = el.style.width;
-  el.style.width = 'max-content';
-  var w = el.getBoundingClientRect().width;
-  el.style.width = prev;
-  return Math.ceil(w);
-}
-
-function fitBoardPanelToBoard() {
-  var sidePanelEl = document.getElementById('sidePanel');
-  if (!sidePanelEl || sidePanelEl.offsetTop > boardPanelEl.offsetTop) return;
-  var panelRect = boardPanelEl.getBoundingClientRect();
-  var need = Math.ceil(boardEl.getBoundingClientRect().right - panelRect.left);
-  need = Math.max(need, naturalWidth(document.getElementById('boardButtons')),
-    naturalWidth(document.getElementById('repertoireStats')));
-  if (need < panelRect.width - 1) boardPanelEl.style.maxWidth = need + 'px';
-}
-
 var resizeTimer = null;
 function scheduleBoardResize() {
   clearTimeout(resizeTimer);
@@ -1552,14 +1575,15 @@ function repertoireStats(repData, cardsByColour, now, cfg) {
 // charset note in TASK_648's doc).
 function repertoireStatsText(stats, firstColour) {
   var order = firstColour === 'b' ? ['b', 'w'] : ['w', 'b'];
-  return 'Repertoire  ' + order.map(function(c) {
+  // Three lines (rendered with white-space: pre-wrap): the heading, then one indented line per side.
+  return 'Repertoire\n' + order.map(function(c) {
     var s = stats[c];
     // #712: "50/94 due" when the cap defers some (50 to do now, 94 due in all)
     var dueText = (typeof s.actionable === 'number' && s.actionable < s.due ? s.actionable + '/' : '') + s.due + ' due';
     // #1052: "3 expired" only when some learned moves have expired
     var expiredText = typeof s.expired === 'number' && s.expired > 0 ? ' \u00b7 ' + s.expired + ' expired' : '';
-    return (c === 'w' ? 'White ' : 'Black ') + s.learned + '/' + s.total + ' learned \u00b7 ' + dueText + expiredText;
-  }).join('   ');
+    return '  ' + (c === 'w' ? 'White ' : 'Black ') + s.learned + '/' + s.total + ' learned \u00b7 ' + dueText + expiredText;
+  }).join('\n');
 }
 /* TASK_648_TRAIN_END */
 
@@ -2476,6 +2500,9 @@ function attemptMove(from, to) {
   var keyBefore = samePositionKey(game);  // TASK_629 (e.p.-normalized)
   var fenBefore = game.fen();
   var move = game.move({ from: from, to: to, promotion: 'q' });
+  // A notice about an earlier move (weak, or unchecked) is gone once another move is made;
+  // a rejected weak move stays rejected unless Keep anyway was clicked while it was shown.
+  hideRepertoireNotice();
   if (move) guardAndRecordRepertoireMove(keyBefore, fenBefore, move, false);
   return true;
 }
@@ -3524,9 +3551,30 @@ function loadStatsCards(user) {
   });
 }
 
+/*
+  The Train / Stop training button carries the number of moves due now for the side being
+  drilled (the board orientation, or the trained colour while a session runs): "Train (13)"
+  when the stats line reads "13/252 due" (13 to do now, the cap defers the rest) and
+  "Train (104)" with no cap in play. No number until the signed-in player's cards have loaded.
+*/
+function trainButtonLabel() {
+  var base = train ? 'Stop training' : 'Train';
+  if (!currentUser || !repertoireData || !statsCards || !REPERTOIRE_STATS) return base;
+  var colour = train ? train.color : friendlyColorForOrientation(flipped);
+  var s = repertoireStats(repertoireData, statsCards, Date.now(), REPERTOIRE_STATS)[colour];
+  if (!s) return base;
+  return base + ' (' + (typeof s.actionable === 'number' ? s.actionable : s.due) + ')';
+}
+
+function renderTrainButtonLabel() {
+  var btn = document.getElementById('trainBtn');
+  if (btn) btn.textContent = trainButtonLabel();
+}
+
 function renderRepertoireStats() {
   var el = document.getElementById('repertoireStats');
   if (!el || !REPERTOIRE_STATS) return;  // an early auth callback can beat the config's initializer
+  renderTrainButtonLabel();
   if (!currentUser || !repertoireData) {
     el.style.display = 'none'; el.textContent = '';
     return;
@@ -3737,7 +3785,12 @@ function repertoireMoveStored(positionKey, san) {
   return !!(entry && Object.prototype.hasOwnProperty.call(entry, stripSanDecorations(san)));
 }
 
+// Bumped whenever the notice is cleared. A play-mode check that is still awaiting the engine
+// captures it first and drops its result (notice and Keep anyway) if it has changed: the next
+// move, or starting Train, ends the opportunity to keep an earlier rejected move.
+var repertoireNoticeGen = 0;
 function hideRepertoireNotice() {
+  repertoireNoticeGen++;
   var el = document.getElementById('repertoireNotice');
   el.innerHTML = ''; el.style.display = 'none';
 }
@@ -3754,12 +3807,16 @@ async function guardAndRecordRepertoireMove(positionKey, fenBefore, move, trainG
   var src = trainGap ? 'train' : 'play';
   function record(info) { recordRepertoireMove(positionKey, move, Object.assign({ src: src }, info)); noteRepertoireMoveLocally(positionKey, move.san); }
   if (repertoireMoveStored(positionKey, move.san)) { record(); return; }
+  var gen = repertoireNoticeGen;  // the notice has been cleared since this check started => stale
   var result = await evaluateRepertoireMove(fenBefore, move);
-  if (!result) { record({ how: 'unchecked' }); setRepertoireNotice('Added (couldn\'t check it with the engine).'); return; }
+  var stale = function() { return gen !== repertoireNoticeGen; };
+  if (!result) { record({ how: 'unchecked' }); if (!stale()) setRepertoireNotice('Added (couldn\'t check it with the engine).'); return; }
   var verdict = { loss: result.loss, best: result.bestSan };
   if (result.loss < REPERTOIRE_GUARD.weakMoveCp) { record(Object.assign({ how: 'passed' }, verdict)); return; }
+  if (stale()) return;  // a weak move stays rejected: no notice, no Keep anyway
   var amount = (result.loss / 100).toFixed(1);
   setRepertoireNotice((trainGap ? '' : 'Not added to your repertoire: ') + stripSanDecorations(move.san) + ' is ' + amount + ' worse than ' + result.bestSan + '.', function() {
+    if (stale()) return;
     record(Object.assign({ how: 'kept' }, verdict));
   });
 }
@@ -4044,6 +4101,40 @@ function render() {
   position right after that move); the currently-viewed ply is
   highlighted so browsing has a visible "you are here".
 */
+/*
+  #1098: the move list is a two-column grid (number | White | Black), one
+  .moveRow per full move, like Lichess/ChessTempo. The whitespace text nodes
+  between cells do not render in a grid; they keep textContent readable
+  ("1. e4 e5"). The current move is scrolled into view only when it or the
+  line length changed, so a re-render from late Explorer data never fights
+  the user's own scrolling.
+*/
+var moveListScrollKey = '';
+function keepCurrentMoveVisible() {
+  var cur = moveListEl.querySelector('[data-current]');
+  if (!cur) return;
+  var c = cur.getBoundingClientRect(), l = moveListEl.getBoundingClientRect();
+  if (c.top < l.top) moveListEl.scrollTop -= (l.top - c.top) + 4;
+  else if (c.bottom > l.bottom) moveListEl.scrollTop += (c.bottom - l.bottom) + 4;
+}
+
+// The list's height changes without the cursor or line moving: a window resize, or the Train
+// message, a notice or the sign-in row growing above/below it. When it shrinks, the current
+// move may have fallen below the fold, so recheck then (and only then: a plain re-render or a
+// growing list never scrolls, so the user's own scrolling is left alone).
+var moveListLastHeight = 0;
+function watchMoveListSize() {
+  if (typeof ResizeObserver === 'undefined') return;
+  moveListLastHeight = moveListEl.clientHeight;
+  new ResizeObserver(function() {
+    var h = moveListEl.clientHeight;
+    var shrank = h < moveListLastHeight;
+    moveListLastHeight = h;
+    if (shrank) keepCurrentMoveVisible();
+  }).observe(moveListEl);
+}
+watchMoveListSize();
+
 function renderMoveList() {
   moveListEl.innerHTML = '';
   renderRepertoireStats();  // #667
@@ -4059,24 +4150,36 @@ function renderMoveList() {
   }
   var startSpan = document.createElement('span');
   startSpan.textContent = 'Start position';
+  startSpan.className = 'mv mvStart';
   startSpan.style.cursor = 'pointer';
-  startSpan.style.marginRight = '8px';
-  if (viewPly === 0) startSpan.style.background = 'var(--border-accent, #4a9eff)';
+  if (viewPly === 0) {
+    startSpan.style.background = 'var(--border-accent, #4a9eff)';
+    startSpan.setAttribute('data-current', '1');
+  }
   startSpan.onclick = function() { goToPly(0); };
   moveListEl.appendChild(startSpan);
-  if (hist.length === 0) return;
   for (var i = 0; i < hist.length; i += 2) {
     var num = (i / 2) + 1;
+    var row = document.createElement('div');
+    row.className = 'moveRow';
     var numSpan = document.createElement('span');
     numSpan.textContent = num + '. ';
     numSpan.style.color = 'var(--text-secondary, #aaa)';
-    moveListEl.appendChild(numSpan);
-    moveListEl.appendChild(makeMoveSpan(hist[i], i + 1, rarity[i], plyReachedInGames(plies[i])));
+    row.appendChild(numSpan);
+    row.appendChild(makeMoveSpan(hist[i], i + 1, rarity[i], plyReachedInGames(plies[i])));
+    row.appendChild(document.createTextNode(' '));
     if (hist[i + 1]) {
-      moveListEl.appendChild(document.createTextNode(' '));
-      moveListEl.appendChild(makeMoveSpan(hist[i + 1], i + 2, rarity[i + 1], plyReachedInGames(plies[i + 1])));
+      row.appendChild(makeMoveSpan(hist[i + 1], i + 2, rarity[i + 1], plyReachedInGames(plies[i + 1])));
+    } else {
+      row.appendChild(document.createElement('span'));  // keeps a lone White move in its column
     }
-    moveListEl.appendChild(document.createTextNode('  '));
+    row.appendChild(document.createTextNode('  '));
+    moveListEl.appendChild(row);
+  }
+  var scrollKey = viewPly + ':' + hist.length;
+  if (scrollKey !== moveListScrollKey) {
+    moveListScrollKey = scrollKey;
+    keepCurrentMoveVisible();
   }
 }
 
@@ -4111,8 +4214,9 @@ function plyReachedInGames(ply) {
 function makeMoveSpan(san, ply, rarity, bold) {
   var span = document.createElement('span');
   span.textContent = san;
+  span.className = 'mv';
   span.style.cursor = 'pointer';
-  span.style.padding = '0 2px';
+  span.style.padding = '1px 6px';
   span.style.borderRadius = '3px';
   // TASK_620: rarity color, like the extension's move-list coloring
   if (rarity && rarity.color) span.style.color = rarity.color;
@@ -4121,6 +4225,7 @@ function makeMoveSpan(san, ply, rarity, bold) {
   if (bold) tip = (tip ? tip + '\n' : '') + 'Reached in one of your recent Lichess games';
   if (tip) span.title = tip;
   if (ply === viewPly) {
+    span.setAttribute('data-current', '1');
     span.style.background = 'var(--border-accent, #4a9eff)';
     span.style.color = '#fff';
     // keep the rarity visible on the highlighted move too
@@ -4313,7 +4418,7 @@ function renderMissedPanel() {
 
 function updateTrainUI() {
   var on = !!train;
-  trainBtn.textContent = on ? 'Stop training' : 'Train';
+  renderTrainButtonLabel();
   trainBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
   ['resetBtn', 'undoBtn', 'flipBtn', 'analysisModeCheckbox'].forEach(function(id) { document.getElementById(id).disabled = on; });
   if (fenInput) fenInput.disabled = on;
@@ -4505,6 +4610,7 @@ function trainTargetMove(t) {
 }
 
 function startTraining() {
+  hideRepertoireNotice();  // no Keep anyway while training: a play-mode notice would still offer it
   if (train) return;
   if (!currentUser || !repertoireData) {
     setTrainMessage('Sign in to train: Train drills the repertoire you build by playing your moves on this board.');
@@ -4783,7 +4889,8 @@ function trainContinueAfterChange(t, notice) {
 // A move at a position with no favorite (a gap) or, with Allow Changing Favorites on, an
 // alternative to the favorites (isChange): the weak-move guard decides whether it becomes a
 // favorite. A rejection never grades a failure. Every async step checks the session, line,
-// signed-in player and position, so a stale answer does nothing.
+// signed-in player and position, so a stale answer does nothing. A weak move is only taken
+// back here (the train message says why); Keep anyway exists in play mode, not while training.
 function trainGuardedAdd(t, move, fenBefore, keyBefore, pathBefore, isChange) {
   var lineId = t.lineId;
   var uid = currentUser && currentUser.uid;
@@ -4821,14 +4928,9 @@ function trainGuardedAdd(t, move, fenBefore, keyBefore, pathBefore, isChange) {
     }
     game.undo(); viewPly = game.history().length; t.busy = false; render();
     var amount = (result.loss / 100).toFixed(1);
+    // While training a weak move is only rejected: no pop-up and no Keep anyway. To add a weak
+    // move, turn training off; play mode offers Keep anyway.
     setTrainMessage(move.san + ' is ' + amount + ' worse than ' + result.bestSan + '. Try another move.');
-    setRepertoireNotice('Weak move was not added.', function() {
-      // Only while this attempt is still open: the same session and line, idle, at the same
-      // position. A stale button (another move since, the line over, training stopped) must
-      // not replay the move into whatever position the board holds now.
-      if (train !== t || t.lineId !== lineId || !currentUser || currentUser.uid !== uid || t.busy || game.fen() !== fenBefore) { hideRepertoireNotice(); return; }
-      game.move(move.san); viewPly = game.history().length; keep({ how: 'kept', loss: result.loss, best: result.bestSan });
-    });
     trainScheduleHint();
   });
 }
@@ -4849,6 +4951,7 @@ function trainOnUserMove(from, to) {
   var move;
   try { move = game.move({ from: from, to: to, promotion: 'q' }); }
   catch (error) { return false; }
+  hideRepertoireNotice();  // any move made clears the previous notice
   var grade = trainGrade(move.san, t.gapPending ? [] : favorites);
   // #830b: with Allow Changing Favorites on, a move outside the favorites is a candidate
   // new favorite (the guard decides), and deliberately playing an older favorite changes
