@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "9be56b0 \u00b7 2026-10-22 23:03 UTC";
+var BOARD_BUILD = "9a88eca \u00b7 2026-10-26 01:44 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -396,29 +396,86 @@ function updateAuthUI() {
     authStatusEl.title = '';
   }
 }
+// The Firebase auth callback, named so tests can drive the real sign-out
+// path. On sign-out the Stop flush keeps the session's uid: currentUser is
+// already null when stopTraining runs, and without the override the
+// resolved-but-unflushed rating would be silently dropped (#1145).
+function handleBoardAuthChange(user) {
+  var prevUid = currentUser && currentUser.uid;
+  currentUser = user;
+  if (!user && train) stopTraining('Signed out, so training stopped.', prevUid);  // #648
+  updateAuthUI();
+  attachRepertoire(user);  // TASK_629
+  attachGameMistakes(user);  // #668: per-uid Lichess link + sync cursor
+  attachSettings(user);  // TASK_709: per-uid settings, defaults when signed out
+  if (user) pruneExpiredHistory();  // TASK_651
+  // TASK_620 (Codex review of #623): a newly signed-in player can now
+  // fill cache misses, so retry lookups that failed as not_cached while
+  // signed out. Guarded because this callback can fire before the
+  // Explorer state further down this script has initialized.
+  if (user && explorerFailures instanceof Map &&
+      clearExplorerFailuresOfKind(explorerFailures, 'notCached') > 0) {
+    renderMoveList();
+  }
+}
+// #1153 round 2: the Stop flush inside handleBoardAuthChange runs after
+// Firebase has already moved to the unauthenticated state, so the owner-only
+// rating/<uid> rules deny it in production. Flushing here, from the Sign out
+// click while the old auth is still valid, is what actually persists the
+// line's rated moves; the write completes before signOut runs. A slow or
+// failing write never blocks signing out (2 s cap). External auth loss still
+// goes through handleBoardAuthChange alone: that attempt is best-effort and
+// the server denies it, so a mid-line sign-out from another tab/device still
+// loses that line's rating. Named so hermetic tests can drive the click path.
+// Round 5 (#1153 Michael review at 1808717): the flush covers every uid box
+// with unflushed work, so a stopped session whose evaluation settled during
+// the wait is reconciled too. Hanging work still signs out on the 2 s cap
+// with nothing written for that move.
+function signOutWithRatingFlush() {
+  var deadline = Date.now() + 2000;
+  var done = false;
+  function doSignOut() {
+    if (done) return;
+    done = true;
+    firebase.auth().signOut();
+  }
+  function flushThenSignOut() {
+    if (done) return;
+    var pending = [];
+    try {
+      var self = currentUser && currentUser.uid;
+      for (var uid in ratingBoxes) {
+        if (!Object.prototype.hasOwnProperty.call(ratingBoxes, uid)) continue;
+        if (uid !== self) continue;  // another user's box: its step would skip anyway
+        var flush = ratingEnqueueFlush(uid);
+        if (flush && typeof flush.then === 'function') pending.push(flush);
+      }
+    } catch (err) { pending = []; }
+    if (!pending.length) { doSignOut(); return; }
+    var remaining = deadline - Date.now();
+    if (remaining <= 0) { doSignOut(); return; }
+    var timer = setTimeout(doSignOut, remaining);
+    var settled = 0;
+    function oneSettled() {
+      settled++;
+      if (settled >= pending.length) { clearTimeout(timer); doSignOut(); }
+    }
+    for (var j = 0; j < pending.length; j++) pending[j].then(oneSettled, oneSettled);
+  }
+  function waitForPending() {
+    if (done) return;
+    if (moveRatingPending <= 0 || Date.now() >= deadline) { flushThenSignOut(); return; }
+    setTimeout(waitForPending, 25);
+  }
+  waitForPending();
+}
 if (firebaseReady) {
   if (authRowEl) authRowEl.style.display = 'flex';
-  firebase.auth().onAuthStateChanged(function(user) {
-    currentUser = user;
-    if (!user && train) stopTraining('Signed out, so training stopped.');  // #648
-    updateAuthUI();
-    attachRepertoire(user);  // TASK_629
-    attachGameMistakes(user);  // #668: per-uid Lichess link + sync cursor
-    attachSettings(user);  // TASK_709: per-uid settings, defaults when signed out
-    if (user) pruneExpiredHistory();  // TASK_651
-    // TASK_620 (Codex review of #623): a newly signed-in player can now
-    // fill cache misses, so retry lookups that failed as not_cached while
-    // signed out. Guarded because this callback can fire before the
-    // Explorer state further down this script has initialized.
-    if (user && explorerFailures instanceof Map &&
-        clearExplorerFailuresOfKind(explorerFailures, 'notCached') > 0) {
-      renderMoveList();
-    }
-  });
+  firebase.auth().onAuthStateChanged(handleBoardAuthChange);
   if (authBtnEl) {
     authBtnEl.addEventListener('click', function() {
       if (currentUser) {
-        firebase.auth().signOut();
+        signOutWithRatingFlush();
         return;
       }
       firebase.auth().signInWithPopup(new firebase.auth.GoogleAuthProvider()).catch(function(e) {
@@ -2960,6 +3017,106 @@ async function evaluateRepertoireMove(fenBefore, move) {
 }
 /* TASK_665_REPERTOIRE_GUARD_END */
 
+/* TASK_1145_RATING_START */
+/*
+  #1145: persistent per-user move-quality rating for Train. Each eligible
+  asked move's centipawn loss vs Stockfish (measured by
+  evaluateRepertoireMove in TASK_665, which already reports it from the
+  mover's perspective with cp clamped to +/-1000 and mates as +/-1000)
+  maps to a performance, perf = clamp(2500 - 10 * cpLoss, 500, 2500), and
+  folds into a Glicko-2-style rating Kalman-style: the update shrinks RD
+  as moves accumulate, and inactivity regrows it toward the starting RD.
+  No volatility term and no rating periods in v1; one overall rating
+  starting at 1500 / RD 350. Everything here is pure (the clock is a
+  parameter, never read) so skills/chess-coach/test/board-train-rating.test.js
+  can exercise it in Node; the Firebase and Train-loop wiring lives with
+  the trainer code. Non-ASCII is escaped (no <meta charset> in this file).
+*/
+var RATING_CONFIG = {
+  start: 1500, startRd: 350, min: 500, max: 2500,
+  perfPerCp: 10,          // performance drops this much per centipawn lost
+  measureVariance: 90000, // Kalman measurement noise: one move is noisy (300^2)
+  minRd: 30,              // RD floor: a new move always moves the needle a little
+  maxRd: 350,             // RD ceiling: fully uncertain (== startRd)
+  rdGrowthPerDay: 5,      // inactivity regrowth, RD points per day
+};
+var RATING_DAY_MS = 24 * 60 * 60 * 1000;
+
+// Centipawn loss from the mover's perspective -> performance. A negative
+// loss (engine noise around a best move) plays like a best move; a
+// non-numeric loss never happens in production (evaluateRepertoireMove
+// reports a number or null, and null skips the move) and scores 2500.
+function ratingPerfFromLoss(loss) {
+  var l = (typeof loss === 'number' && !isNaN(loss)) ? loss : 0;
+  var perf = RATING_CONFIG.max - RATING_CONFIG.perfPerCp * l;
+  return Math.max(RATING_CONFIG.min, Math.min(RATING_CONFIG.max, perf));
+}
+
+// Fresh state: the starting rating, no moves yet, never updated.
+function ratingDefault() {
+  return { rating: RATING_CONFIG.start, rd: RATING_CONFIG.startRd, moves: 0, updatedAt: 0 };
+}
+
+// Anything stored (or nothing) -> a usable state. Unknown keys are dropped
+// and out-of-range values fall back per field, so a bad record can never
+// stop the rating from working; the next write repairs it.
+function resolveRatingState(stored) {
+  var src = (stored && typeof stored === 'object') ? stored : {};
+  var rating = (typeof src.rating === 'number' && isFinite(src.rating)) ? src.rating : RATING_CONFIG.start;
+  var rd = (typeof src.rd === 'number' && isFinite(src.rd) && src.rd >= 0) ? src.rd : RATING_CONFIG.startRd;
+  var moves = (typeof src.moves === 'number' && isFinite(src.moves) &&
+    Math.floor(src.moves) === src.moves && src.moves >= 0) ? src.moves : 0;
+  var updatedAt = (typeof src.updatedAt === 'number' && isFinite(src.updatedAt) && src.updatedAt > 0) ? src.updatedAt : 0;
+  return {
+    rating: Math.max(RATING_CONFIG.min, Math.min(RATING_CONFIG.max, rating)),
+    rd: Math.max(RATING_CONFIG.minRd, Math.min(RATING_CONFIG.maxRd, rd)),
+    moves: moves,
+    updatedAt: updatedAt,
+  };
+}
+
+// RD after elapsedMs of inactivity: linear regrowth toward the ceiling.
+// A future timestamp (clock skew) counts as no inactivity.
+function ratingRdAfterInactivity(rd, elapsedMs) {
+  var base = (typeof rd === 'number' && isFinite(rd) && rd >= 0) ? rd : RATING_CONFIG.startRd;
+  var elapsed = (typeof elapsedMs === 'number' && isFinite(elapsedMs) && elapsedMs > 0) ? elapsedMs : 0;
+  return Math.min(RATING_CONFIG.maxRd, base + RATING_CONFIG.rdGrowthPerDay * elapsed / RATING_DAY_MS);
+}
+
+// One measured performance -> the next state. Inactivity between the last
+// update and now regrows RD first; the Kalman gain then weighs the new
+// measurement against the grown uncertainty. Rating and RD stay in bounds.
+function ratingUpdate(state, perf, nowMs) {
+  var base = resolveRatingState(state);
+  var now = (typeof nowMs === 'number' && isFinite(nowMs)) ? nowMs : 0;
+  var grown = ratingRdAfterInactivity(base.rd, now - base.updatedAt);
+  var prior = grown * grown;
+  var gain = prior / (prior + RATING_CONFIG.measureVariance);
+  var rating = base.rating + gain * (perf - base.rating);
+  var rd = Math.sqrt((1 - gain) * prior);
+  return {
+    rating: Math.max(RATING_CONFIG.min, Math.min(RATING_CONFIG.max, rating)),
+    rd: Math.max(RATING_CONFIG.minRd, Math.min(RATING_CONFIG.maxRd, rd)),
+    moves: base.moves + 1,
+    updatedAt: now,
+  };
+}
+
+// The live rating for the stats line: 'Rating 1523 \u00b187 (+23)'. Empty
+// before the first rated move, so sessions that never rate a move (signed
+// out, no eligible move yet) render exactly the old stats line.
+function trainRatingText(state, startRating, nowMs) {
+  var current = resolveRatingState(state);
+  if (!current.moves) return '';
+  var start = (typeof startRating === 'number' && isFinite(startRating)) ? startRating : RATING_CONFIG.start;
+  var now = (typeof nowMs === 'number' && isFinite(nowMs)) ? nowMs : 0;
+  var rd = ratingRdAfterInactivity(current.rd, now - current.updatedAt);
+  var delta = Math.round(current.rating - start);
+  return 'Rating ' + Math.round(current.rating) + ' \u00b1' + Math.round(rd) +
+    ' (' + (delta >= 0 ? '+' : '') + delta + ')';
+}
+/* TASK_1145_RATING_END */
+
 try {
   analysisMode = localStorage.getItem('chessPrepBoard.analysisMode') === '1';
 } catch (e) { /* private browsing / sandboxed context - default stays off */ }
@@ -4372,7 +4529,263 @@ function trainLineText() {
 function setTrainMessage(message) {
   trainPanel.style.display = '';
   trainMessageEl.textContent = message;
-  if (train) trainStatsEl.textContent = trainSummaryText(train.stats);
+  if (train) trainStatsEl.textContent = trainStatsLine(train.stats);
+}
+
+/*
+  #1145: persistent per-user move-quality rating. Each Train session owns a
+  rating session object ({uid, epoch, state, start, pending, dirty, moves})
+  stored on t.ratingSession; every eligible asked move's centipawn loss vs
+  Stockfish folds into the session it was played in through ratingUpdate.
+  Eligible: the player's own first-attempt moves Train asks (wrong, correct,
+  gaps and deliberate changes all count — including a guard-rejected first
+  attempt, which is still a measured first attempt); excluded: opponent moves,
+  known moves played for the player (trainKnownMove never touches the rating)
+  and retries (t.turn.counted is already true on a retry, so the grading blocks
+  below never re-fire). One rated measurement per turn: t.turn.rated is set by
+  the first scored attempt, so an accepted retry after a scored rejection
+  scores nothing further (#1145 round 6). trainRatingStart snapshots the rating when the
+  session starts, for the live session delta. Writes go to rating/<uid> at
+  line end and on Stop (trainSaveRating); an engine answer that lands after
+  its session stopped or was superseded (Stop then Train again) still counts:
+  it applies to the session object it started with and writes through that
+  session's own uid, independently of whatever session is current. A new
+  session never resets or shares the old one's counter (#1153 round 3).
+  The moveRating/moveRatingUid/trainRatingStart globals mirror the current
+  session for the stats line; moveRatingPending is the total outstanding
+  across all sessions so the Sign out path can wait for every session.
+  Round 5 (#1153 Michael review at 1808717): overlapping sessions must not
+  last-writer-wins each other. Each resolved measurement is recorded as a
+  perf on its uid's shared box ({committed, unflushed, queue, dirty} in
+  ratingBoxes, sequence-numbered by ratingPerfSeq); every persist drains the
+  box's unflushed perfs in sequence order onto the last committed state and
+  writes once through a per-uid promise queue, so concurrent sessions are
+  serialized and both moves count no matter which resolves first. A failed
+  write restores the pre-flush state and re-queues its perfs (fail open,
+  retried by the next flush). Session-local sess.state still drives the live
+  display only and is never written directly. Scope note (Codex P2 at
+  e022616): the queue serializes overlapping sessions within one page.
+  Sequential use across tabs/devices is safe (each load adopts the latest
+  server state); truly concurrent training in two clients can still
+  last-writer-wins — server-side transactions are the future fix if that
+  corner ever matters (v1 out of scope).
+*/
+var moveRating = ratingDefault();
+var moveRatingUid = null;
+var moveRatingEpoch = 0;
+var moveRatingPending = 0;
+var trainRatingStart = RATING_CONFIG.start;
+var moveRatingSession = null;
+var ratingBoxes = {};  // uid -> { uid, committed, unflushed: [{seq, perf}], queue, dirty }
+var ratingPerfSeq = 0;
+
+function ratingBoxFor(uid) {
+  if (!uid) return null;
+  var box = ratingBoxes[uid];
+  if (!box) box = ratingBoxes[uid] = { uid: uid, committed: ratingDefault(), unflushed: [], queue: Promise.resolve(), dirty: false };
+  return box;
+}
+
+// Adopt a freshly loaded server state as the box's committed base, but never
+// regress past writes the box already made (a late load resolving after a
+// flush must not rewind the committed state).
+function ratingAdoptLoaded(uid, loaded) {
+  var box = ratingBoxFor(uid);
+  if (!box || !loaded) return;
+  var cur = box.committed;
+  if (loaded.moves > cur.moves || (loaded.moves === cur.moves && loaded.updatedAt >= cur.updatedAt)) box.committed = loaded;
+}
+
+// Persist a uid's unflushed perfs, serialized with every other persist for
+// the same uid. Returns the step promise — or, when there is nothing new to
+// flush, the box's live queue (never null for a known uid, and it never
+// rejects). Handing back the live queue matters: a write enqueued by an
+// earlier Stop/line-end may still be in flight after draining the box, and
+// sign-out must wait for it instead of signing out underneath it, or the
+// owner-only rules can reject the write once the auth is gone (#1153
+// round 7, Codex P2 at da5a8ad).
+function ratingEnqueueFlush(uid, uidOverride) {
+  var box = (uid && ratingBoxes[uid]) || null;
+  if (!box) return null;
+  if (!box.unflushed.length && !box.dirty) return box.queue;
+  function step() {
+    try {
+      if (!firebaseReady) return null;
+      var useUid = uidOverride || (currentUser && currentUser.uid);
+      if (!useUid || useUid !== box.uid) return null;  // perfs stay queued for a later authorized flush
+      var perfs = box.unflushed;
+      box.unflushed = [];
+      if (!perfs.length && !box.dirty) return null;
+      perfs.sort(function(a, b) { return a.seq - b.seq; });
+      var prev = box.committed;
+      var next = prev;
+      var now = Date.now();
+      for (var i = 0; i < perfs.length; i++) next = ratingUpdate(next, perfs[i].perf, now);
+      box.committed = next;
+      box.dirty = false;
+      var state = { rating: next.rating, rd: next.rd, moves: next.moves, updatedAt: next.updatedAt };
+      return firebase.database().ref('rating/' + box.uid).set(state).then(function() {
+        return state;
+      }).catch(function(err) {
+        console.warn('Move rating write failed', err);
+        box.committed = prev;
+        box.unflushed = perfs.concat(box.unflushed);
+        box.dirty = true;
+        return null;
+      });
+    } catch (err) {
+      console.warn('Move rating flush failed', err);
+      return null;
+    }
+  }
+  var run = box.queue.then(step, step);
+  run = run.then(function(v) { return v; }, function() { return null; });
+  box.queue = run;
+  return run;
+}
+
+// The stats line with the live rating appended when there is one to show.
+function trainStatsLine(stats) {
+  var line = trainSummaryText(stats);
+  var rating = trainRatingText(moveRating, trainRatingStart, Date.now());
+  return rating ? line + ' \u00b7 ' + rating : line;
+}
+
+function trainLoadRating(t) {
+  var uid = currentUser && currentUser.uid;
+  var sess = { uid: uid || null, epoch: ++moveRatingEpoch, state: ratingDefault(),
+    start: RATING_CONFIG.start, pending: 0, dirty: false, moves: 0 };
+  t.ratingSession = sess;
+  moveRatingSession = sess;
+  moveRatingUid = sess.uid;
+  moveRating = sess.state;
+  trainRatingStart = sess.start;
+  t.ratingMoves = 0;
+  t.ratingDirty = false;
+  ratingBoxFor(uid);  // the per-uid reconciling box exists before any async work
+  if (!firebaseReady || !uid) return Promise.resolve();
+  return firebase.database().ref('rating/' + uid).once('value').then(function(snapshot) {
+    if (!currentUser || currentUser.uid !== uid || sess.uid !== uid) return;
+    var loaded = resolveRatingState(snapshot && snapshot.val ? snapshot.val() : null);
+    ratingAdoptLoaded(uid, loaded);  // newer committed state wins; never rewinds a flush
+    if (train !== t || t.ratingSession !== sess) return;
+    sess.state = loaded;
+    sess.start = loaded.rating;
+    if (train === t && t.ratingSession === sess) {
+      moveRating = sess.state;
+      trainRatingStart = sess.start;
+    }
+  }).catch(function(err) { console.warn('Move rating unavailable', err); });
+}
+
+// Fold one measured loss into the session it was played in and record it on
+// the uid's shared box. A late engine answer (the session already stopped or
+// was superseded by Stop then Train) still counts: its perf joins the box
+// and is persisted through the serialized per-uid queue, reconciled with
+// whatever the current session wrote — never a last-writer-wins overwrite.
+// The current session's display mirrors only its own session object, so a
+// late answer for an old session never corrupts the new one.
+function trainApplyRatingLoss(t, loss, sess) {
+  sess = sess || (t && t.ratingSession);
+  if (!sess) return;
+  var perf = ratingPerfFromLoss(loss);
+  sess.state = ratingUpdate(sess.state, perf, Date.now());
+  sess.moves++;
+  var box = ratingBoxFor(sess.uid);
+  if (box) {
+    box.unflushed.push({ seq: ++ratingPerfSeq, perf: perf });
+    box.dirty = true;
+  }
+  sess.dirty = true;
+  if (t) {
+    t.ratingMoves = (t.ratingMoves || 0) + 1;
+    t.ratingDirty = true;
+  }
+  if (t && train === t && t.ratingSession === sess) {
+    moveRating = sess.state;
+    if (train) trainStatsEl.textContent = trainStatsLine(train.stats);
+    return;
+  }
+  ratingEnqueueFlush(sess.uid);  // stopped/superseded: reconcile now, fire-and-forget
+}
+
+// One rated measurement per turn: the first measured attempt, whether the
+// guard accepts it or takes it back (#1145 round 6, Codex P2 at e022616).
+// A guard-rejected first attempt is still a played, measured first attempt,
+// so it counts (wrong first attempts already do); the eventual accepted
+// retry then scores nothing further. Grading, stats and hints are untouched:
+// only rating consumption is gated here.
+function trainScoreFirstAttempt(t, move, fenBefore, loss) {
+  if (!t || !t.turn || t.turn.rated) return false;
+  t.turn.rated = true;
+  if (typeof loss === 'number') trainApplyRatingLoss(t, loss);
+  else trainScoreMoveForRating(t, move, fenBefore);
+  return true;
+}
+
+// Fire-and-forget engine scoring for one eligible asked move. Never blocks
+// or breaks Train: when both eval sources fail the move is skipped, and an
+// answer that arrives after sign-out (or a player switch) is dropped.
+// window.__ratingEvals counts rating lookups separately from the guard's,
+// so specs can tell the two engine consumers apart (#1153 follow-up).
+// The pending count lives on the session object and in the global total:
+// a new session never resets the old one's counter (#1153 round 3).
+function trainScoreMoveForRating(t, move, fenBefore) {
+  var sess = t && t.ratingSession;
+  var uid = currentUser && currentUser.uid;
+  if (!sess || !uid || uid !== sess.uid) return;
+  window.__ratingEvals = (window.__ratingEvals || 0) + 1;
+  sess.pending++;
+  moveRatingPending++;
+  evaluateRepertoireMove(fenBefore, move).catch(function() { return null; }).then(function(result) {
+    try {
+      if (!result || typeof result.loss !== 'number') return;
+      if (!currentUser || currentUser.uid !== uid || sess.uid !== uid) return;
+      trainApplyRatingLoss(t, result.loss, sess);
+    } finally {
+      sess.pending--;
+      if (sess.pending < 0) sess.pending = 0;
+      moveRatingPending--;
+      if (moveRatingPending < 0) moveRatingPending = 0;
+    }
+  });
+}
+
+function trainPushRatingForSession(sess, uidOverride) {
+  // uidOverride carries the session uid across sign-out: the auth callback
+  // clears currentUser before stopping Train, so the Stop flush would
+  // otherwise drop a resolved-but-unflushed rating (#1153 follow-up). The
+  // box-uid check still refuses cross-user writes. Persists through the
+  // serialized per-uid queue (round 5: overlapping sessions reconcile
+  // instead of overwriting). Returns the step promise (null when skipped)
+  // so the sign-out click path can complete the flush while the auth is
+  // still valid before calling signOut.
+  if (!sess) return null;
+  return ratingEnqueueFlush(sess.uid, uidOverride);
+}
+
+function trainPushRating(uidOverride) {
+  var sess = moveRatingSession;
+  if (!sess) {
+    var uid0 = uidOverride || (currentUser && currentUser.uid);
+    if (!firebaseReady || !uid0 || uid0 !== moveRatingUid) return null;
+    var state0 = { rating: moveRating.rating, rd: moveRating.rd, moves: moveRating.moves, updatedAt: moveRating.updatedAt };
+    return firebase.database().ref('rating/' + uid0).set(state0).catch(function(err) { console.warn('Move rating write failed', err); });
+  }
+  return trainPushRatingForSession(sess, uidOverride);
+}
+
+function trainSaveRating(t, uidOverride) {
+  var sess = t && t.ratingSession;
+  if (!sess) {
+    if (!t || !t.ratingDirty) return null;
+    t.ratingDirty = false;
+    return trainPushRating(uidOverride);
+  }
+  if (!sess.dirty && !t.ratingDirty) return null;
+  sess.dirty = false;
+  t.ratingDirty = false;
+  return trainPushRatingForSession(sess, uidOverride);
 }
 
 /*
@@ -4651,13 +5064,15 @@ function startTraining() {
   setTrainMessage('Loading your schedule...');
   var t = train;
   trainLoadCards(t).then(function() {
+    return trainLoadRating(t);
+  }).then(function() {
     if (train !== t) return;
     trainChooseTarget(t);
     trainStep();
   });
 }
 
-function stopTraining(message) {
+function stopTraining(message, uidOverride) {
   var t = train;
   if (!t) return;
   train = null;
@@ -4671,8 +5086,9 @@ function stopTraining(message) {
   selected = null;
   trainPanel.style.display = '';
   trainMessageEl.textContent = message || 'Training stopped.';
-  trainStatsEl.textContent = 'Session: ' + trainSummaryText(t.stats);
+  trainStatsEl.textContent = 'Session: ' + trainStatsLine(t.stats);
   lastTrainMissed = t.stats.missed;  // #675: kept after Stop, jumpable now
+  trainSaveRating(t, uidOverride);  // #1145: flush rated moves, if any
   updateTrainUI();
   render();
   if (t.pendingRemote !== undefined) applyRemoteState(t.pendingRemote);
@@ -4743,7 +5159,10 @@ function trainStep() {
     }
     t.busy = false;  // the player's move: unlock the pieces
     if (atGameMistake) t.gapPending = true;  // #668: a game mistake with no favorite - your move fills the gap (the guard applies)
-    t.turn = { hinted: false, counted: false, hintCounted: false };
+    // #1145 round 6: rated tracks rating only (one measured attempt per
+    // turn, even a guard-rejected one); counted keeps driving grading,
+    // stats and hints exactly as before.
+    t.turn = { hinted: false, counted: false, hintCounted: false, rated: false };
     var note = trainGameMistakeNote(t);
     setTrainMessage((t.gapPending
       ? (atGameMistake ? 'Not in your repertoire - you went wrong here in a game.' : 'Not in your repertoire yet: play the move you want to keep.')
@@ -4804,6 +5223,7 @@ function trainEndLine(message) {
   }
   t.stats.lines++;
   t.lineId++;
+  trainSaveRating(t);  // #1145: flush the line's rated moves, if any
   t.busy = true;
   clearTimeout(t.hintTimer);
   t.hintSquare = null;
@@ -4901,6 +5321,12 @@ function trainGuardedAdd(t, move, fenBefore, keyBefore, pathBefore, isChange) {
   function keep(info) {
     hideRepertoireNotice();
     recordRepertoireMove(keyBefore, move, Object.assign({ src: 'train' }, info)); noteRepertoireMoveLocally(keyBefore, move.san);
+    // #1145: the guard already measured this move: reuse its loss instead
+    // of a second engine lookup. Without a measurement (unchecked, or an
+    // already-stored favorite) score it like any other eligible move.
+    // Round 6: the helper rates only the turn's first measured attempt, so
+    // an accepted retry after a scored rejection rates nothing further.
+    trainScoreFirstAttempt(t, move, fenBefore, info && typeof info.loss === 'number' ? info.loss : null);
     t.gapPending = false;
     if (isChange) {
       trainSaveCard(t, keyBefore, 'changed', pathBefore);
@@ -4930,6 +5356,11 @@ function trainGuardedAdd(t, move, fenBefore, keyBefore, pathBefore, isChange) {
     var amount = (result.loss / 100).toFixed(1);
     // While training a weak move is only rejected: no pop-up and no Keep anyway. To add a weak
     // move, turn training off; play mode offers Keep anyway.
+    // #1145 round 6: the rejected move is still a measured first attempt, so
+    // it counts (wrong first attempts already do); the turn's rated flag
+    // keeps the eventual accepted retry from scoring again. Grading, stats
+    // and hints are unchanged.
+    trainScoreFirstAttempt(t, move, fenBefore, result.loss);
     setTrainMessage(move.san + ' is ' + amount + ' worse than ' + result.bestSan + '. Try another move.');
     trainScheduleHint();
   });
@@ -4968,6 +5399,7 @@ function trainOnUserMove(from, to) {
       trainSaveCard(t, keyBefore, 'wrong', pathBefore);
       trainNoteMiss(t, lineBefore, movesBefore, favorites);
       trainNoteHint(t);
+      trainScoreFirstAttempt(t, move, fenBefore, null);  // #1145: a wrong first attempt still rates the move played
     }
     setTrainMessage(move.san + " isn't your repertoire move here. Try again.");
     trainScheduleHint();
@@ -4980,6 +5412,14 @@ function trainOnUserMove(from, to) {
   recordRepertoireMove(keyBefore, move, { src: 'train' });
   noteRepertoireMoveLocally(keyBefore, move.san);
   if (change) {
+    // #1145 round 2: a deliberate switch to an older stored favorite is an
+    // eligible first attempt like any other correct move, so it is scored
+    // exactly once here. Retries (a wrong first attempt already set counted)
+    // score nothing further.
+    if (!t.turn.counted) {
+      t.turn.counted = true;
+      trainScoreFirstAttempt(t, move, fenBefore, null);
+    }
     trainSaveCard(t, keyBefore, 'changed', pathBefore);
     trainContinueAfterChange(t, move.san + ' is now your newest favorite here.');
     return true;
@@ -4987,10 +5427,11 @@ function trainOnUserMove(from, to) {
   if (!t.turn.counted) {
     t.turn.counted = true;
     t.stats.quizzed++;
-    trainSaveCard(t, keyBefore, t.turn.hinted ? 'hinted' : 'correct', pathBefore);
-    t.stats.firstTry++;
-    trainNoteHint(t);
-  }
+      trainSaveCard(t, keyBefore, t.turn.hinted ? 'hinted' : 'correct', pathBefore);
+      t.stats.firstTry++;
+      trainNoteHint(t);
+      trainScoreFirstAttempt(t, move, fenBefore, null);  // #1145: fire-and-forget, Train never waits on it
+    }
   viewPly = game.history().length;
   trainStep();
   return true;
