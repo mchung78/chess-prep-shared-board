@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "PREVIEW claude-sonnet/rating-penalize-mistakes \u00b7 0b9ebe3 \u00b7 2026-11-01 13:49 UTC";
+var BOARD_BUILD = "PREVIEW claude/task-1533-train-count-live-paths \u00b7 2ebca2f \u00b7 2026-11-06 22:53 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1340,7 +1340,9 @@ function trainSummaryText(stats) {
 /*
   #648 PR 2: spaced repetition. One card per position where it's your move,
   stored at training/<uid>/<w|b>/<posKey> = { due, interval (days), lapses,
-  lastMistake?, path } (rules: infra/rules.json). path is the SAN line from
+  lastMistake?, streak?, path } (rules: infra/rules.json). streak is the correct
+  plays in a row (0 after a mistake or a change), feeding the Train rating's
+  repetition credit; cards from before it existed lack it (see srsStreak). path is the SAN line from
   the standard start position, so a card can be replayed; cards are only
   written for lines that start there (like the transposition store).
   Grading (#648): correct with no hint -> interval x 2.5 (min 1 day);
@@ -1358,6 +1360,10 @@ var SRS_CONFIG = {
   // days is expired - see srsIsExpired.
   expireMinGraceDays: 30,
   expireIntervalFactor: 1,
+  // Repetition credit (Train rating): the card's streak counts the correct plays in a
+  // row; a card from before the field existed has it derived from its interval.
+  maxStreak: 1000,
+  streakToleranceMs: 60 * 1000,  // server/client clock skew on lastMistake
 };
 var SRS_DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -1380,6 +1386,39 @@ function srsIsExpired(card, now, cfg, learnedMinDays) {
   return now > card.due + graceDays * SRS_DAY_MS;
 }
 
+// Correct plays in a row on a card's position (0 for no card). The stored streak
+// is exact. A card written before the field existed has none, so it is read back
+// from the interval (x correctFactor per correct play: 1, 2.5, 6.25, ... days),
+// conservatively: a card whose last review was a mistake counts 0, and any other
+// card that has ever had a mistake counts one less, since the interval cannot tell
+// a streak that restarted at that mistake from one that did not.
+function srsStreak(card, cfg) {
+  cfg = cfg || SRS_CONFIG;
+  if (!card) return 0;
+  if (typeof card.streak === 'number' && isFinite(card.streak) && card.streak >= 0) return Math.min(cfg.maxStreak, Math.floor(card.streak));
+  if (typeof card.interval !== 'number' || !isFinite(card.interval) || card.interval < 1) return 0;
+  var hasMistake = typeof card.lastMistake === 'number';
+  if (hasMistake && typeof card.due === 'number') {
+    var reviewedAt = card.due - card.interval * SRS_DAY_MS;
+    if (card.lastMistake >= reviewedAt - cfg.streakToleranceMs) return 0;
+  }
+  var derived = Math.floor(Math.log(card.interval) / Math.log(cfg.correctFactor) + 0.5) + 1;
+  return Math.max(0, hasMistake ? derived - 1 : derived);
+}
+
+// The streak a review leaves on the card, from the streak before it. The one
+// rule for both the card (srsNextCard) and the Train rating's repetition credit
+// (trainScoreFirstAttempt), so the credit always matches what is persisted:
+// correct +1 (capped), hinted keeps it, anything else (wrong, changed, or a
+// rejected attempt that writes no card) earns no credit.
+function srsStreakAfter(streak, result, cfg) {
+  cfg = cfg || SRS_CONFIG;
+  var n = (typeof streak === 'number' && isFinite(streak) && streak > 0) ? Math.floor(streak) : 0;
+  if (result === 'correct') return Math.min(cfg.maxStreak, n + 1);
+  if (result === 'hinted') return Math.min(cfg.maxStreak, n);
+  return 0;
+}
+
 // result: 'correct' | 'hinted' | 'wrong' | 'changed'. card: the stored card or null.
 function srsNextCard(card, result, now, path, cfg) {
   // #1052: an expired card restarts as a new move: no interval. lapses and p carry
@@ -1387,7 +1426,7 @@ function srsNextCard(card, result, now, path, cfg) {
   // as the watermark that stops the same Lichess game being counted twice (a rescan
   // after unlink/relink). It is older than interval + 30 days, so it is outside the
   // hint window and earlier than this review - trainSkipsPosition still sees a clean one.
-  if (srsIsExpired(card, now, cfg)) card = { lapses: card.lapses, p: card.p, lastMistake: card.lastMistake };
+  if (srsIsExpired(card, now, cfg)) card = { lapses: card.lapses, p: card.p, lastMistake: card.lastMistake, streak: 0 };
   var interval = card && typeof card.interval === 'number' ? card.interval : 0;
   var lapses = card && typeof card.lapses === 'number' ? card.lapses : 0;
   var next = { lapses: lapses, path: path };
@@ -1400,10 +1439,11 @@ function srsNextCard(card, result, now, path, cfg) {
   } else if (result === 'changed') {
     interval = cfg.changedDays;  // #830b: no lapse and no mistake stamp - a change is not a failure
   } else if (result === 'hinted') {
-    interval = interval * cfg.hintedFactor;
+    interval = interval * cfg.hintedFactor;  // a hinted play keeps the streak but does not extend it
   } else {
     interval = Math.max(cfg.minCorrectDays, interval * cfg.correctFactor);
   }
+  next.streak = srsStreakAfter(srsStreak(card, cfg), result === 'wrong' || result === 'changed' || result === 'hinted' ? result : 'correct', cfg);
   next.interval = Math.min(cfg.maxIntervalDays, Math.round(interval * 1000) / 1000);
   next.due = now + next.interval * SRS_DAY_MS;
   return next;
@@ -1439,7 +1479,7 @@ function trainSkipsPosition(card, now, cfg) {
 function gameMistakeCard(card, gameTime, path, cfg) {
   if (card && typeof card.lastMistake === 'number' && card.lastMistake >= gameTime) return null;
   var lapses = card && typeof card.lapses === 'number' ? card.lapses : 0;
-  var next = { lapses: lapses + 1, lastMistake: gameTime, interval: cfg.wrongDays, due: gameTime, path: path };
+  var next = { lapses: lapses + 1, lastMistake: gameTime, interval: cfg.wrongDays, due: gameTime, path: path, streak: 0 };
   if (card && trainValidProbability(card.p)) next.p = card.p;  // #701
   return next;
 }
@@ -1583,7 +1623,7 @@ function srsPlanDeferrals(cards, now, maxDue, active, level, score) {
     var c = cards[key];
     if (!c || typeof c.due !== 'number' || c.due > now || srsIsDeferred(c, now)) return;
     if (srsIsExpired(c, now)) return;  // #1052: no longer counts toward the cap
-    if (active && !active(key)) return;
+    if (active && !active(key, c)) return;
     var lv = level ? level(key, c) : 1;
     if (typeof lv !== 'number') lv = TRAIN_LEVEL_CONFIG.unknownLevel;
     counted.push({ key: key, level: lv, score: score ? score(key, c) : 1, due: c.due });
@@ -1607,7 +1647,7 @@ function srsPlanDeferrals(cards, now, maxDue, active, level, score) {
 */
 var REPERTOIRE_STATS = { learnedMinIntervalDays: 2 };
 
-function repertoireStats(repData, cardsByColour, now, cfg) {
+function repertoireStats(repData, cardsByColour, now, cfg, isLive) {
   var out = { w: { total: 0, learned: 0, due: 0, actionable: 0, expired: 0 }, b: { total: 0, learned: 0, due: 0, actionable: 0, expired: 0 } };
   Object.keys(repData || {}).forEach(function(sk) {
     var colour = String(sk).split(' ')[1];
@@ -1622,7 +1662,9 @@ function repertoireStats(repData, cardsByColour, now, cfg) {
     if (typeof card.interval === 'number' && card.interval >= cfg.learnedMinIntervalDays) s.learned++;
     if (typeof card.due === 'number' && card.due <= now) {
       s.due++;
-      if (!srsIsDeferred(card, now)) s.actionable++;  // #712: due and not deferred by the cap
+      // #712: due and not deferred by the cap. #1533: and Train could pick it (isLive, optional):
+      // a card whose path is no longer live is never a target, so it must not be counted as work to do.
+      if (!srsIsDeferred(card, now) && (!isLive || isLive(card, sk, colour))) s.actionable++;
     }
   });
   return out;
@@ -3048,11 +3090,9 @@ var RATING_CONFIG = {
   downGainCap: 0.5,
   // Repetition credit: a rating gain is scaled by plays / fullCreditPlays (capped
   // at 1), where plays counts the times this position's move was played correctly
-  // in a row, this play included: 1 play = 20%, 2 = 40%, 3 = 60%, 5+ = 100%. Only
+  // in a row (the card's streak, see srsStreak), this play included: 1 play = 20%, 2 = 40%, 3 = 60%, 5+ = 100%. Only
   // gains are scaled; a move worse than the rating cuts it at full strength.
   fullCreditPlays: 5,
-  mistakeToleranceMs: 60 * 1000,  // server/client clock skew on a card's lastMistake
-  playsPerInterval: 2.5,          // SRS_CONFIG.correctFactor: one correct play multiplies the interval by this
 };
 var RATING_DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -3064,20 +3104,6 @@ function ratingPerfFromLoss(loss) {
   var l = (typeof loss === 'number' && !isNaN(loss)) ? loss : 0;
   var perf = RATING_CONFIG.max - RATING_CONFIG.perfPerCp * l;
   return Math.max(RATING_CONFIG.min, Math.min(RATING_CONFIG.max, perf));
-}
-
-// Correct plays in a row on a position, from its spaced-repetition card (null or
-// expired = never played). The card's interval grows by playsPerInterval on each
-// correct play (1, 2.5, 6.25, ... days) and restarts after a mistake, so the
-// count is read back from it and needs no stored field. A card whose last
-// review was a mistake (lastMistake at or after it) counts 0.
-function ratingPlaysFromCard(card) {
-  if (!card || typeof card.interval !== 'number' || !isFinite(card.interval) || card.interval < 1) return 0;
-  if (typeof card.lastMistake === 'number' && typeof card.due === 'number') {
-    var reviewedAt = card.due - card.interval * RATING_DAY_MS;
-    if (card.lastMistake >= reviewedAt - RATING_CONFIG.mistakeToleranceMs) return 0;
-  }
-  return Math.floor(Math.log(card.interval) / Math.log(RATING_CONFIG.playsPerInterval) + 0.5) + 1;
 }
 
 // Share of a rating gain earned after this many correct plays: plays / 5, 0..1.
@@ -3750,11 +3776,16 @@ function loadStatsCards(user) {
   when the stats line reads "13/252 due" (13 to do now, the cap defers the rest) and
   "Train (104)" with no cap in play. No number until the signed-in player's cards have loaded.
 */
+// #1533: a card Train can never aim at (its path no longer follows your active favorites).
+function trainCardPickable(card, sk, colour) {
+  return typeof card.path !== 'string' || trainPathLiveFor(colour, card.path);
+}
+
 function trainButtonLabel() {
   var base = train ? 'Stop training' : 'Train';
   if (!currentUser || !repertoireData || !statsCards || !REPERTOIRE_STATS) return base;
   var colour = train ? train.color : friendlyColorForOrientation(flipped);
-  var s = repertoireStats(repertoireData, statsCards, Date.now(), REPERTOIRE_STATS)[colour];
+  var s = repertoireStats(repertoireData, statsCards, Date.now(), REPERTOIRE_STATS, trainCardPickable)[colour];
   if (!s) return base;
   return base + ' (' + (typeof s.actionable === 'number' ? s.actionable : s.due) + ')';
 }
@@ -3772,7 +3803,7 @@ function renderRepertoireStats() {
     el.style.display = 'none'; el.textContent = '';
     return;
   }
-  var stats = repertoireStats(repertoireData, statsCards || {}, Date.now(), REPERTOIRE_STATS);
+  var stats = repertoireStats(repertoireData, statsCards || {}, Date.now(), REPERTOIRE_STATS, trainCardPickable);
   el.textContent = repertoireStatsText(stats, friendlyColorForOrientation(flipped));
   el.style.display = '';
 }
@@ -3830,7 +3861,7 @@ function trainApplyDueCap(cardsByColour) {
     var cards = cardsByColour[colour];
     if (!cards) return;
     var keys = srsPlanDeferrals(cards, now, trainNormalizeMaxDue(trainMaxDue, TRAIN_DUE_CAP),
-      function(sk) { return repertoireFavorites(repertoireData, sk).length > 0; },
+      function(sk, card) { return repertoireFavorites(repertoireData, sk).length > 0 && trainCardPickable(card, sk, colour); },  // #1533: a dead path is never a target, so it must not use up the cap
       function(sk, card) {
         var level = trainCapLevel(trainLevelFromProbability(card.p), positionReachedInGames(sk), TRAIN_DUE_CAP);
         return trainFavoritePathLevel(level, card.path, colour);
@@ -4751,13 +4782,16 @@ function trainApplyRatingLoss(t, loss, sess, weight) {
 // so it counts (wrong first attempts already do); the eventual accepted
 // retry then scores nothing further. Grading, stats and hints are untouched:
 // only rating consumption is gated here.
-function trainScoreFirstAttempt(t, move, fenBefore, loss, played) {
+// result is the turn's graded SRS outcome ('correct' | 'hinted' | 'changed' |
+// 'wrong'), or null for a guard-rejected attempt (no card is written).
+function trainScoreFirstAttempt(t, move, fenBefore, loss, result) {
   if (!t || !t.turn || t.turn.rated) return false;
   t.turn.rated = true;
-  // Repetition credit: the position's correct plays before this turn, plus this
-  // one when the move is accepted (played). A wrong or rejected attempt is not
-  // a correct play.
-  var weight = ratingCreditWeight((t.turn.plays || 0) + (played ? 1 : 0));
+  // Repetition credit: the streak this play leaves on the card (srsStreakAfter,
+  // the same rule srsNextCard persists) from the position's streak before the
+  // turn. Only a clean correct play extends it; a hinted play keeps it; a
+  // change, a wrong or a rejected attempt earns no credit.
+  var weight = ratingCreditWeight(srsStreakAfter(t.turn.plays || 0, result));
   if (typeof loss === 'number') trainApplyRatingLoss(t, loss, null, weight);
   else trainScoreMoveForRating(t, move, fenBefore, weight);
   return true;
@@ -4996,10 +5030,14 @@ function trainCardLevel(path, card, color) {
 }
 
 function trainPathLive(t, path) {
+  return trainPathLiveFor(t.color, path);
+}
+
+function trainPathLiveFor(colour, path) {
   var replay = new Chess(normalizeFen(baseFen));
   var moves = path ? path.split(' ') : [];
   for (var i = 0; i < moves.length; i++) {
-    if (replay.turn() === t.color && repertoireFavorites(repertoireData, samePositionKey(replay)).indexOf(stripSanDecorations(moves[i])) === -1) return false;
+    if (replay.turn() === colour && repertoireFavorites(repertoireData, samePositionKey(replay)).indexOf(stripSanDecorations(moves[i])) === -1) return false;
     try { replay.move(moves[i]); }
     catch (error) { return false; }
   }
@@ -5366,7 +5404,7 @@ function trainGuardedAdd(t, move, fenBefore, keyBefore, pathBefore, isChange) {
     // already-stored favorite) score it like any other eligible move.
     // Round 6: the helper rates only the turn's first measured attempt, so
     // an accepted retry after a scored rejection rates nothing further.
-    trainScoreFirstAttempt(t, move, fenBefore, info && typeof info.loss === 'number' ? info.loss : null, true);
+    trainScoreFirstAttempt(t, move, fenBefore, info && typeof info.loss === 'number' ? info.loss : null, isChange ? 'changed' : 'correct');
     t.gapPending = false;
     if (isChange) {
       trainSaveCard(t, keyBefore, 'changed', pathBefore);
@@ -5400,7 +5438,7 @@ function trainGuardedAdd(t, move, fenBefore, keyBefore, pathBefore, isChange) {
     // it counts (wrong first attempts already do); the turn's rated flag
     // keeps the eventual accepted retry from scoring again. Grading, stats
     // and hints are unchanged.
-    trainScoreFirstAttempt(t, move, fenBefore, result.loss, false);
+    trainScoreFirstAttempt(t, move, fenBefore, result.loss, null);
     setTrainMessage(move.san + ' is ' + amount + ' worse than ' + result.bestSan + '. Try another move.');
     trainScheduleHint();
   });
@@ -5427,7 +5465,7 @@ function trainOnUserMove(from, to) {
   // card write below moves them. Taken once per turn (a retry keeps the first).
   if (typeof t.turn.plays !== 'number') {
     var priorCard = t.cards && t.cards[repertoireStorageKey(keyBefore)];
-    t.turn.plays = ratingPlaysFromCard(priorCard && !srsIsExpired(priorCard, Date.now()) ? priorCard : null);
+    t.turn.plays = srsStreak(priorCard && !srsIsExpired(priorCard, Date.now()) ? priorCard : null);
   }
   var grade = trainGrade(move.san, t.gapPending ? [] : favorites);
   // #830b: with Allow Changing Favorites on, a move outside the favorites is a candidate
@@ -5445,7 +5483,7 @@ function trainOnUserMove(from, to) {
       trainSaveCard(t, keyBefore, 'wrong', pathBefore);
       trainNoteMiss(t, lineBefore, movesBefore, favorites);
       trainNoteHint(t);
-      trainScoreFirstAttempt(t, move, fenBefore, null, false);  // #1145: a wrong first attempt still rates the move played
+      trainScoreFirstAttempt(t, move, fenBefore, null, 'wrong');  // #1145: a wrong first attempt still rates the move played
     }
     setTrainMessage(move.san + " isn't your repertoire move here. Try again.");
     trainScheduleHint();
@@ -5464,7 +5502,7 @@ function trainOnUserMove(from, to) {
     // score nothing further.
     if (!t.turn.counted) {
       t.turn.counted = true;
-      trainScoreFirstAttempt(t, move, fenBefore, null, true);
+      trainScoreFirstAttempt(t, move, fenBefore, null, 'changed');
     }
     trainSaveCard(t, keyBefore, 'changed', pathBefore);
     trainContinueAfterChange(t, move.san + ' is now your newest favorite here.');
@@ -5473,10 +5511,11 @@ function trainOnUserMove(from, to) {
   if (!t.turn.counted) {
     t.turn.counted = true;
     t.stats.quizzed++;
-      trainSaveCard(t, keyBefore, t.turn.hinted ? 'hinted' : 'correct', pathBefore);
+      var graded = t.turn.hinted ? 'hinted' : 'correct';
+      trainSaveCard(t, keyBefore, graded, pathBefore);
       t.stats.firstTry++;
       trainNoteHint(t);
-      trainScoreFirstAttempt(t, move, fenBefore, null, true);  // #1145: fire-and-forget, Train never waits on it
+      trainScoreFirstAttempt(t, move, fenBefore, null, graded);  // #1145: fire-and-forget, Train never waits on it
     }
   viewPly = game.history().length;
   trainStep();
