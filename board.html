@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "c958f35 \u00b7 2026-11-01 17:23 UTC";
+var BOARD_BUILD = "772375a \u00b7 2026-11-07 06:19 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1623,7 +1623,7 @@ function srsPlanDeferrals(cards, now, maxDue, active, level, score) {
     var c = cards[key];
     if (!c || typeof c.due !== 'number' || c.due > now || srsIsDeferred(c, now)) return;
     if (srsIsExpired(c, now)) return;  // #1052: no longer counts toward the cap
-    if (active && !active(key)) return;
+    if (active && !active(key, c)) return;
     var lv = level ? level(key, c) : 1;
     if (typeof lv !== 'number') lv = TRAIN_LEVEL_CONFIG.unknownLevel;
     counted.push({ key: key, level: lv, score: score ? score(key, c) : 1, due: c.due });
@@ -1647,7 +1647,7 @@ function srsPlanDeferrals(cards, now, maxDue, active, level, score) {
 */
 var REPERTOIRE_STATS = { learnedMinIntervalDays: 2 };
 
-function repertoireStats(repData, cardsByColour, now, cfg) {
+function repertoireStats(repData, cardsByColour, now, cfg, isLive) {
   var out = { w: { total: 0, learned: 0, due: 0, actionable: 0, expired: 0 }, b: { total: 0, learned: 0, due: 0, actionable: 0, expired: 0 } };
   Object.keys(repData || {}).forEach(function(sk) {
     var colour = String(sk).split(' ')[1];
@@ -1662,7 +1662,9 @@ function repertoireStats(repData, cardsByColour, now, cfg) {
     if (typeof card.interval === 'number' && card.interval >= cfg.learnedMinIntervalDays) s.learned++;
     if (typeof card.due === 'number' && card.due <= now) {
       s.due++;
-      if (!srsIsDeferred(card, now)) s.actionable++;  // #712: due and not deferred by the cap
+      // #712: due and not deferred by the cap. #1533: and Train could pick it (isLive, optional):
+      // a card whose path is no longer live is never a target, so it must not be counted as work to do.
+      if (!srsIsDeferred(card, now) && (!isLive || isLive(card, sk, colour))) s.actionable++;
     }
   });
   return out;
@@ -3774,11 +3776,16 @@ function loadStatsCards(user) {
   when the stats line reads "13/252 due" (13 to do now, the cap defers the rest) and
   "Train (104)" with no cap in play. No number until the signed-in player's cards have loaded.
 */
+// #1533: a card Train can never aim at (its path no longer follows your active favorites).
+function trainCardPickable(card, sk, colour) {
+  return typeof card.path !== 'string' || trainPathLiveFor(colour, card.path);
+}
+
 function trainButtonLabel() {
   var base = train ? 'Stop training' : 'Train';
   if (!currentUser || !repertoireData || !statsCards || !REPERTOIRE_STATS) return base;
   var colour = train ? train.color : friendlyColorForOrientation(flipped);
-  var s = repertoireStats(repertoireData, statsCards, Date.now(), REPERTOIRE_STATS)[colour];
+  var s = repertoireStats(repertoireData, statsCards, Date.now(), REPERTOIRE_STATS, trainCardPickable)[colour];
   if (!s) return base;
   return base + ' (' + (typeof s.actionable === 'number' ? s.actionable : s.due) + ')';
 }
@@ -3796,7 +3803,7 @@ function renderRepertoireStats() {
     el.style.display = 'none'; el.textContent = '';
     return;
   }
-  var stats = repertoireStats(repertoireData, statsCards || {}, Date.now(), REPERTOIRE_STATS);
+  var stats = repertoireStats(repertoireData, statsCards || {}, Date.now(), REPERTOIRE_STATS, trainCardPickable);
   el.textContent = repertoireStatsText(stats, friendlyColorForOrientation(flipped));
   el.style.display = '';
 }
@@ -3854,7 +3861,7 @@ function trainApplyDueCap(cardsByColour) {
     var cards = cardsByColour[colour];
     if (!cards) return;
     var keys = srsPlanDeferrals(cards, now, trainNormalizeMaxDue(trainMaxDue, TRAIN_DUE_CAP),
-      function(sk) { return repertoireFavorites(repertoireData, sk).length > 0; },
+      function(sk, card) { return repertoireFavorites(repertoireData, sk).length > 0 && trainCardPickable(card, sk, colour); },  // #1533: a dead path is never a target, so it must not use up the cap
       function(sk, card) {
         var level = trainCapLevel(trainLevelFromProbability(card.p), positionReachedInGames(sk), TRAIN_DUE_CAP);
         return trainFavoritePathLevel(level, card.path, colour);
@@ -5023,10 +5030,14 @@ function trainCardLevel(path, card, color) {
 }
 
 function trainPathLive(t, path) {
+  return trainPathLiveFor(t.color, path);
+}
+
+function trainPathLiveFor(colour, path) {
   var replay = new Chess(normalizeFen(baseFen));
   var moves = path ? path.split(' ') : [];
   for (var i = 0; i < moves.length; i++) {
-    if (replay.turn() === t.color && repertoireFavorites(repertoireData, samePositionKey(replay)).indexOf(stripSanDecorations(moves[i])) === -1) return false;
+    if (replay.turn() === colour && repertoireFavorites(repertoireData, samePositionKey(replay)).indexOf(stripSanDecorations(moves[i])) === -1) return false;
     try { replay.move(moves[i]); }
     catch (error) { return false; }
   }
