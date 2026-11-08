@@ -142,7 +142,7 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 </div>
 </div>
 <div id="sidePanel">
-<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div></div>
+<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainNextStep" style="display:none; margin-top:6px;"><div id="trainNextStepText"></div><div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px;"><button id="trainMoreBtn" type="button"></button><button id="trainSwitchBtn" type="button">Switch color</button><button id="trainKeepBtn" type="button">Keep re-training</button></div></div></div>
 <section id="movesCard" class="panelCard">
 <div id="movesHeader">
 <div style="display:flex; align-items:baseline; gap:10px; min-width:0;"><span class="paneTitle">Moves</span>
@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "PREVIEW claude/task-1533-train-count-live-paths \u00b7 2ebca2f \u00b7 2026-11-06 22:53 UTC";
+var BOARD_BUILD = "PREVIEW claude-code/task-1746-drop-paint-first \u00b7 22cd494 \u00b7 2026-11-08 01:33 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1636,6 +1636,31 @@ function srsPlanDeferrals(cards, now, maxDue, active, level, score) {
 }
 
 /*
+  #1144: the cards "Train 25 more" pulls forward: due, expired excluded, still
+  deferred by the cap (deferUntil in the future) and active(key, card). The first n
+  in the cap's own order (lowest level, then highest score, then oldest due), so
+  the most useful ones come back first. Never returns a card that is not due.
+*/
+function srsPickDeferred(cards, now, n, active, level, score) {
+  var pool = [];
+  Object.keys(cards || {}).forEach(function(key) {
+    var c = cards[key];
+    if (!c || typeof c.due !== 'number' || c.due > now || !srsIsDeferred(c, now)) return;
+    if (srsIsExpired(c, now)) return;
+    if (active && !active(key, c)) return;
+    var lv = level ? level(key, c) : 1;
+    if (typeof lv !== 'number') lv = TRAIN_LEVEL_CONFIG.unknownLevel;
+    pool.push({ key: key, level: lv, score: score ? score(key, c) : 1, due: c.due });
+  });
+  pool.sort(function(a, b) {
+    return (a.level - b.level) || (b.score - a.score) || (a.due - b.due) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+  });
+  return pool.slice(0, Math.max(0, n)).map(function(e) { return e.key; });
+}
+
+var TRAIN_PULL_MORE = 25;  // #1144: fixed batch for "Train 25 more due moves"
+
+/*
   #667: repertoire statistics, per colour. total = positions where it's that
   colour's move with at least one active favorite (several favorites at one
   position count once, like the one-card-per-position SRS store); learned =
@@ -2693,7 +2718,7 @@ function onCustomDragMove(ev) {
     if (Math.sqrt(dx * dx + dy * dy) < DRAG_THRESHOLD_PX) return;
     dragCtx.moved = true;
     selected = dragCtx.fromSq;
-    render();  // safe here - no native drag session tied to a DOM node to break
+    renderBoard();  // #1746: board only; safe here - no native drag session tied to a DOM node to break
     dragCtx.ghostEl = createGhostEl(dragCtx.fromSq);
     document.body.appendChild(dragCtx.ghostEl);
   }
@@ -2705,6 +2730,32 @@ function onCustomDragMove(ev) {
   }
 }
 
+/*
+  #1746: a drop paints the piece on its target square FIRST. The floating
+  ghost is snapped onto the destination (a style write, no rebuild), then the
+  browser gets a frame to paint it, and only then does everything else run:
+  the move itself and its side effects (repertoire guard, Train grading and
+  rating, card writes), the board redraw, the shared-state write and the move
+  list. Lifting and selecting are ignored (dropPending) for the frame or two this takes.
+  A hidden tab never fires requestAnimationFrame, so a timer backs it up.
+*/
+var dropPending = false;
+
+function afterNextPaint(fn) {
+  var done = false;
+  function once() { if (done) return; done = true; fn(); }
+  requestAnimationFrame(function() { setTimeout(once, 0); });
+  setTimeout(once, 250);
+}
+
+function snapGhostToSquare(ghost, sq) {
+  var cellEl = boardEl.querySelector('[data-square="' + sq + '"]');
+  if (!ghost || !cellEl) return;
+  var rect = cellEl.getBoundingClientRect();
+  ghost.style.left = (rect.left + rect.width / 2 - ghost.offsetWidth / 2) + 'px';
+  ghost.style.top = (rect.top + rect.height / 2 - ghost.offsetHeight / 2) + 'px';
+}
+
 function onCustomDragUp(ev) {
   document.removeEventListener('mousemove', onCustomDragMove);
   document.removeEventListener('mouseup', onCustomDragUp);
@@ -2712,16 +2763,28 @@ function onCustomDragUp(ev) {
   var wasMoved = dragCtx.moved;
   var fromSq = dragCtx.fromSq;
   var dropSq = dragCtx.hoverSq;
-  if (dragCtx.ghostEl) dragCtx.ghostEl.remove();
+  var ghost = dragCtx.ghostEl;
   hideHoverHighlight();
   dragCtx = null;
-  if (!wasMoved) return;  // below the movement threshold - let the ordinary click event handle it
+  if (!wasMoved) { if (ghost) ghost.remove(); return; }  // below the movement threshold - let the ordinary click event handle it
   selected = null;
-  var moved = false;
-  if (dropSq && dropSq !== fromSq) { moved = attemptMove(fromSq, dropSq); }
-  if (moved) viewPly = game.history().length;  // TASK_613: follow the move just made, same as the click-to-move path
-  render();
-  if (moved) pushSharedState();
+  var legal = !!dropSq && dropSq !== fromSq &&
+    game.moves({ square: fromSq, verbose: true }).some(function(m) { return m.to === dropSq; });
+  if (!legal) {  // dropped back, off the board, or on an illegal square: nothing to commit
+    if (ghost) ghost.remove();
+    renderBoard();
+    return;
+  }
+  snapGhostToSquare(ghost, dropSq);  // the piece is visibly on its target now
+  dropPending = true;
+  afterNextPaint(function() {
+    if (ghost) ghost.remove();
+    dropPending = false;
+    var moved = attemptMove(fromSq, dropSq);
+    if (moved) viewPly = game.history().length;  // TASK_613: follow the move just made, same as the click-to-move path
+    renderBoard();
+    if (moved) { pushSharedState(); renderSecondaryDeferred(); }
+  });
 }
 
 /*
@@ -3849,6 +3912,17 @@ function trainMirrorDeferral(colour, sk, until) {
   });
 }
 
+// #758 own-game boost, then #830 older-favorite penalty (shared with #1144's "Train 25 more").
+function trainCapCardLevel(colour, sk, card) {
+  var level = trainCapLevel(trainLevelFromProbability(card.p), positionReachedInGames(sk), TRAIN_DUE_CAP);
+  return trainFavoritePathLevel(level, card.path, colour);
+}
+
+function trainCapCardScore(colour, sk, card, now) {
+  var reach = typeof card.path === 'string' ? trainReach({ rootPly: 0, color: colour }, card.path) : 1;
+  return srsPriorityScore(card, now, reach, trainGameMistakeBoost(colour, sk));
+}
+
 // cardsByColour: { w: {sk: card}, b: {...} } (defaults to the stats copy).
 function trainApplyDueCap(cardsByColour) {
   cardsByColour = cardsByColour || statsCards;
@@ -3862,14 +3936,8 @@ function trainApplyDueCap(cardsByColour) {
     if (!cards) return;
     var keys = srsPlanDeferrals(cards, now, trainNormalizeMaxDue(trainMaxDue, TRAIN_DUE_CAP),
       function(sk, card) { return repertoireFavorites(repertoireData, sk).length > 0 && trainCardPickable(card, sk, colour); },  // #1533: a dead path is never a target, so it must not use up the cap
-      function(sk, card) {
-        var level = trainCapLevel(trainLevelFromProbability(card.p), positionReachedInGames(sk), TRAIN_DUE_CAP);
-        return trainFavoritePathLevel(level, card.path, colour);
-      },  // #758 own-game boost, then #830 older-favorite penalty
-      function(sk, card) {
-        var reach = typeof card.path === 'string' ? trainReach({ rootPly: 0, color: colour }, card.path) : 1;
-        return srsPriorityScore(card, now, reach, trainGameMistakeBoost(colour, sk));
-      });
+      function(sk, card) { return trainCapCardLevel(colour, sk, card); },
+      function(sk, card) { return trainCapCardScore(colour, sk, card, now); });
     keys.forEach(function(sk) {
       cards[sk].deferUntil = until;
       trainMirrorDeferral(colour, sk, until);
@@ -4218,7 +4286,29 @@ function animateMoveOnBoard(move) {
   });
 }
 
+/*
+  #1746: render() redraws the board AND the move list, nav controls and eval.
+  Picking a piece up (or putting it back) only changes the board, and the
+  move list alone cost ~70 ms of a ~90 ms render() on a long, signed-in game,
+  so the drag paths call renderBoard() and, for a committed move, defer the
+  rest to the next task (renderSecondaryDeferred) so the piece lands first.
+  Any full render() in between cancels the deferred pass and does it itself.
+*/
+var secondaryTimer = null;
+function renderSecondary(displayGame) {
+  renderMoveList();
+  renderNavControls();
+  if (analysisMode && !train) scheduleEval(displayGame.fen());  // TASK_614: evaluate the VIEWED position, except during a drill
+}
+function renderSecondaryDeferred() {
+  if (secondaryTimer !== null) return;
+  secondaryTimer = setTimeout(function() { secondaryTimer = null; renderSecondary(buildViewGame()); }, 0);
+}
 function render() {
+  if (secondaryTimer !== null) { clearTimeout(secondaryTimer); secondaryTimer = null; }
+  renderSecondary(renderBoard());
+}
+function renderBoard() {
   boardEl.innerHTML = '';
   renderCoords();
   var displayGame = buildViewGame();
@@ -4264,7 +4354,7 @@ function render() {
         span.onmousedown = (function(fromSq) {
           return function(ev) {
             if (!isAtLive()) return;  // TASK_613: browsing history is read-only
-            if (piecesLocked()) return;  // Train is auto-playing: nothing can be lifted
+            if (piecesLocked() || dropPending) return;  // Train is auto-playing, or a dropped piece is still being committed (#1746): nothing can be lifted
             var p = game.get(fromSq);
             if (!p || p.color !== game.turn()) return;
             ev.preventDefault();
@@ -4312,9 +4402,7 @@ function render() {
   var animateMove = pendingMoveAnimation;
   pendingMoveAnimation = null;
   if (animateMove && isAtLive()) animateMoveOnBoard(animateMove);  // #689
-  renderMoveList();
-  renderNavControls();
-  if (analysisMode && !train) scheduleEval(displayGame.fen());  // TASK_614: evaluate the VIEWED position, except during a drill
+  return displayGame;
 }
 
 /*
@@ -4480,7 +4568,7 @@ function renderNavControls() {
 
 function onSquareClick(sq) {
   if (!isAtLive()) return;  // TASK_613: browsing history is read-only
-  if (piecesLocked()) {  // Train is auto-playing: nothing can be selected
+  if (piecesLocked() || dropPending) {  // Train is auto-playing (or a drop is being committed, #1746): nothing can be selected
     if (selected) { selected = null; render(); }
     return;
   }
@@ -5154,6 +5242,7 @@ function stopTraining(message, uidOverride) {
   var t = train;
   if (!t) return;
   train = null;
+  trainHideNextStep();
   clearTimeout(t.hintTimer);
   clearTimeout(t.opponentTimer);
   clearTimeout(t.lineTimer);
@@ -5313,11 +5402,89 @@ function trainEndLine(message) {
     t.gapPending = false;
     t.changeEndPly = 0;  // #830b: the post-change allowance belongs to the line that made the change
     trainChooseTarget(t);
+    if (!t.target && trainShowNextStep(t)) return;  // #1144: nothing actionable left - ask what next (busy stays on)
     t.busy = false;
     viewPly = game.history().length;
     render();
     trainStep();
   }, TRAIN_CONFIG.lineEndPauseMs);
+}
+
+/*
+  #1144: when a line ends and nothing actionable is due for the side being trained,
+  stop and ask once per side per Train session: pull 25 more deferred due moves,
+  switch colour, or keep re-training (today's extra practice).
+*/
+var trainNextStepAsked = { w: false, b: false };
+var trainNextStepEl = document.getElementById('trainNextStep');
+
+function trainHideNextStep() {
+  if (trainNextStepEl) trainNextStepEl.style.display = 'none';
+}
+
+function trainPullCandidates(t) {
+  var now = Date.now();
+  return srsPickDeferred(t.cards, now, TRAIN_PULL_MORE,
+    function(sk, card) { return repertoireFavorites(repertoireData, sk).length > 0 && trainCardPickable(card, sk, t.color); },
+    function(sk, card) { return trainCapCardLevel(t.color, sk, card); },
+    function(sk, card) { return trainCapCardScore(t.color, sk, card, now); });
+}
+
+// Returns true when the prompt is up (the caller must not continue the line).
+function trainShowNextStep(t) {
+  if (trainNextStepAsked[t.color] || !srsAvailable() || !trainNextStepEl) return false;
+  trainNextStepAsked[t.color] = true;
+  var more = trainPullCandidates(t).length;
+  var side = t.color === 'w' ? 'White' : 'Black';
+  document.getElementById('trainNextStepText').textContent = 'No due ' + side + ' moves left. What next?';
+  var moreBtn = document.getElementById('trainMoreBtn');
+  moreBtn.style.display = more ? '' : 'none';
+  moreBtn.textContent = 'Train ' + more + ' more due move' + (more === 1 ? '' : 's');
+  moreBtn.onclick = function() { trainNextStepMore(t); };
+  document.getElementById('trainSwitchBtn').onclick = function() { trainNextStepSwitch(t); };
+  document.getElementById('trainKeepBtn').onclick = function() { trainNextStepResume(t); };
+  trainNextStepEl.style.display = '';
+  setTrainMessage('Nothing due for ' + side + ' right now.');
+  return true;
+}
+
+function trainNextStepResume(t) {
+  if (train !== t) return;
+  trainHideNextStep();
+  t.busy = false;
+  viewPly = game.history().length;
+  render();
+  trainStep();
+}
+
+function trainNextStepMore(t) {
+  if (train !== t) return;
+  var keys = trainPullCandidates(t);
+  var updates = {};
+  keys.forEach(function(sk) {
+    delete t.cards[sk].deferUntil;
+    if (statsCards && statsCards[t.color] && statsCards[t.color][sk]) delete statsCards[t.color][sk].deferUntil;
+    updates['training/' + currentUser.uid + '/' + t.color + '/' + sk + '/deferUntil'] = null;
+  });
+  if (keys.length) firebase.database().ref().update(updates).catch(function(err) { console.warn('Pulling deferred cards failed', err); });
+  renderRepertoireStats();
+  trainChooseTarget(t);
+  trainNextStepResume(t);
+}
+
+function trainNextStepSwitch(t) {
+  if (train !== t) return;
+  var other = t.color === 'w' ? 'b' : 'w';
+  var original = t.saved;  // the shared line to put back on Stop; Train is private, so nothing is pushed
+  stopTraining('Switched to ' + (other === 'w' ? 'White' : 'Black') + '.');
+  game = new Chess();
+  baseFen = STANDARD_FEN;
+  selected = null;
+  viewPly = 0;
+  flipped = other === 'b';
+  render();
+  startTraining();
+  if (train) train.saved = original;
 }
 
 function trainHintColor() {
@@ -5524,7 +5691,10 @@ function trainOnUserMove(from, to) {
 
 trainBtn.onclick = function() {
   if (train) stopTraining();
-  else startTraining();
+  else {
+    trainNextStepAsked = { w: false, b: false };  // #1144: a fresh Train session asks again
+    startTraining();
+  }
 };
 
 /*
