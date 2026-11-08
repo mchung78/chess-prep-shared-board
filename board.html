@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "ab221a0 \u00b7 2026-11-08 01:25 UTC";
+var BOARD_BUILD = "5e64709 \u00b7 2026-11-08 01:40 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -2730,6 +2730,32 @@ function onCustomDragMove(ev) {
   }
 }
 
+/*
+  #1746: a drop paints the piece on its target square FIRST. The floating
+  ghost is snapped onto the destination (a style write, no rebuild), then the
+  browser gets a frame to paint it, and only then does everything else run:
+  the move itself and its side effects (repertoire guard, Train grading and
+  rating, card writes), the board redraw, the shared-state write and the move
+  list. Lifting and selecting are ignored (dropPending) for the frame or two this takes.
+  A hidden tab never fires requestAnimationFrame, so a timer backs it up.
+*/
+var dropPending = false;
+
+function afterNextPaint(fn) {
+  var done = false;
+  function once() { if (done) return; done = true; fn(); }
+  requestAnimationFrame(function() { setTimeout(once, 0); });
+  setTimeout(once, 250);
+}
+
+function snapGhostToSquare(ghost, sq) {
+  var cellEl = boardEl.querySelector('[data-square="' + sq + '"]');
+  if (!ghost || !cellEl) return;
+  var rect = cellEl.getBoundingClientRect();
+  ghost.style.left = (rect.left + rect.width / 2 - ghost.offsetWidth / 2) + 'px';
+  ghost.style.top = (rect.top + rect.height / 2 - ghost.offsetHeight / 2) + 'px';
+}
+
 function onCustomDragUp(ev) {
   document.removeEventListener('mousemove', onCustomDragMove);
   document.removeEventListener('mouseup', onCustomDragUp);
@@ -2737,16 +2763,35 @@ function onCustomDragUp(ev) {
   var wasMoved = dragCtx.moved;
   var fromSq = dragCtx.fromSq;
   var dropSq = dragCtx.hoverSq;
-  if (dragCtx.ghostEl) dragCtx.ghostEl.remove();
+  var ghost = dragCtx.ghostEl;
   hideHoverHighlight();
   dragCtx = null;
-  if (!wasMoved) return;  // below the movement threshold - let the ordinary click event handle it
+  if (!wasMoved) { if (ghost) ghost.remove(); return; }  // below the movement threshold - let the ordinary click event handle it
   selected = null;
-  var moved = false;
-  if (dropSq && dropSq !== fromSq) { moved = attemptMove(fromSq, dropSq); }
-  if (moved) viewPly = game.history().length;  // TASK_613: follow the move just made, same as the click-to-move path
-  renderBoard();  // #1746: the piece lands first; the move list and eval follow in the next task
-  if (moved) { renderSecondaryDeferred(); pushSharedState(); }
+  var legal = !!dropSq && dropSq !== fromSq &&
+    game.moves({ square: fromSq, verbose: true }).some(function(m) { return m.to === dropSq; });
+  if (!legal) {  // dropped back, off the board, or on an illegal square: nothing to commit
+    if (ghost) ghost.remove();
+    renderBoard();
+    return;
+  }
+  snapGhostToSquare(ghost, dropSq);  // the piece is visibly on its target now
+  dropPending = true;
+  var trainAtDrop = train, fenAtDrop = game.fen();
+  if (trainAtDrop) clearTimeout(trainAtDrop.hintTimer);  // the answer is in: a hint timer firing before the commit must not grade it as hinted
+  afterNextPaint(function() {
+    if (ghost) ghost.remove();
+    dropPending = false;
+    if (train !== trainAtDrop || game.fen() !== fenAtDrop) {  // Stop/Train started, or a remote echo changed the game, during the frame: the drop is stale
+      renderBoard();
+      return;
+    }
+    var moved = attemptMove(fromSq, dropSq);
+    if (moved) viewPly = game.history().length;  // TASK_613: follow the move just made, same as the click-to-move path
+    renderBoard();
+    if (!moved && trainAtDrop && train === trainAtDrop && !trainAtDrop.busy) trainScheduleHint();  // rejected without its own reschedule: restore the hint timer cleared above
+    if (moved) { pushSharedState(); renderSecondaryDeferred(); }
+  });
 }
 
 /*
@@ -4316,7 +4361,7 @@ function renderBoard() {
         span.onmousedown = (function(fromSq) {
           return function(ev) {
             if (!isAtLive()) return;  // TASK_613: browsing history is read-only
-            if (piecesLocked()) return;  // Train is auto-playing: nothing can be lifted
+            if (piecesLocked() || dropPending) return;  // Train is auto-playing, or a dropped piece is still being committed (#1746): nothing can be lifted
             var p = game.get(fromSq);
             if (!p || p.color !== game.turn()) return;
             ev.preventDefault();
@@ -4530,7 +4575,7 @@ function renderNavControls() {
 
 function onSquareClick(sq) {
   if (!isAtLive()) return;  // TASK_613: browsing history is read-only
-  if (piecesLocked()) {  // Train is auto-playing: nothing can be selected
+  if (piecesLocked() || dropPending) {  // Train is auto-playing (or a drop is being committed, #1746): nothing can be selected
     if (selected) { selected = null; render(); }
     return;
   }
