@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "PREVIEW claude-code/task-1746-drop-paint-first \u00b7 22cd494 \u00b7 2026-11-08 01:33 UTC";
+var BOARD_BUILD = "PREVIEW claude-code/task-1751-stats-memo \u00b7 6d5913b \u00b7 2026-11-08 02:04 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -2777,12 +2777,19 @@ function onCustomDragUp(ev) {
   }
   snapGhostToSquare(ghost, dropSq);  // the piece is visibly on its target now
   dropPending = true;
+  var trainAtDrop = train, fenAtDrop = game.fen();
+  if (trainAtDrop) clearTimeout(trainAtDrop.hintTimer);  // the answer is in: a hint timer firing before the commit must not grade it as hinted
   afterNextPaint(function() {
     if (ghost) ghost.remove();
     dropPending = false;
+    if (train !== trainAtDrop || game.fen() !== fenAtDrop) {  // Stop/Train started, or a remote echo changed the game, during the frame: the drop is stale
+      renderBoard();
+      return;
+    }
     var moved = attemptMove(fromSq, dropSq);
     if (moved) viewPly = game.history().length;  // TASK_613: follow the move just made, same as the click-to-move path
     renderBoard();
+    if (!moved && trainAtDrop && train === trainAtDrop && !trainAtDrop.busy) trainScheduleHint();  // rejected without its own reschedule: restore the hint timer cleared above
     if (moved) { pushSharedState(); renderSecondaryDeferred(); }
   });
 }
@@ -3840,8 +3847,34 @@ function loadStatsCards(user) {
   "Train (104)" with no cap in play. No number until the signed-in player's cards have loaded.
 */
 // #1533: a card Train can never aim at (its path no longer follows your active favorites).
+/*
+  #1751: the move list redraw (and the 60 s timer) count the cards Train could
+  pick, and that replays every due card's whole path with chess.js, twice per
+  redraw (the stats line and the Train button label): ~70 ms on a real
+  repertoire. Whether a path is live depends only on repertoireData, baseFen,
+  the colour and the path, none of which a redraw changes, so the answer is
+  remembered per (colour, path). The memo is dropped when repertoireData or
+  baseFen is replaced or when a local edit calls bumpRepertoireGen(), and it
+  also expires after 30 s, so a missed edit shows a slightly stale label count
+  at worst. Train's own target picking still calls trainPathLiveFor directly.
+*/
+var repertoireGen = 0;
+var PATH_LIVE_MEMO_MS = 30000;
+var pathLiveMemo = null;
+function bumpRepertoireGen() { repertoireGen++; }
+function trainPathLiveMemoized(colour, path) {
+  var now = Date.now();
+  if (!pathLiveMemo || pathLiveMemo.gen !== repertoireGen || pathLiveMemo.data !== repertoireData ||
+      pathLiveMemo.base !== baseFen || now - pathLiveMemo.at > PATH_LIVE_MEMO_MS) {
+    pathLiveMemo = { gen: repertoireGen, data: repertoireData, base: baseFen, at: now, live: Object.create(null) };
+  }
+  var key = colour + '|' + path;
+  if (!(key in pathLiveMemo.live)) pathLiveMemo.live[key] = trainPathLiveFor(colour, path);
+  return pathLiveMemo.live[key];
+}
+
 function trainCardPickable(card, sk, colour) {
-  return typeof card.path !== 'string' || trainPathLiveFor(colour, card.path);
+  return typeof card.path !== 'string' || trainPathLiveMemoized(colour, card.path);
 }
 
 function trainButtonLabel() {
@@ -4119,6 +4152,7 @@ function removeViewedRepertoireMove() {
   var entry = repertoireData[info.sk];
   delete entry[info.san];
   if (!Object.keys(entry).length) delete repertoireData[info.sk];
+  bumpRepertoireGen();  // #1751
   var updates = {}; updates['repertoire/' + currentUser.uid + '/' + info.sk + '/' + info.san] = null;
   if (!repertoireData[info.sk]) updates['training/' + currentUser.uid + '/' + info.color + '/' + info.sk] = null;
   firebase.database().ref().update(updates).catch(function(err) { console.warn('Repertoire remove failed', err); });
@@ -4666,6 +4700,7 @@ function noteRepertoireMoveLocally(positionKey, san) {
   var entry = Object.assign({}, repertoireData[sk]);
   entry[stripSanDecorations(san)] = Date.now();
   repertoireData[sk] = entry;
+  bumpRepertoireGen();  // #1751
 }
 
 function trainLineText() {
