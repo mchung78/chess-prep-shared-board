@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "7954055 \u00b7 2026-11-08 20:57 UTC";
+var BOARD_BUILD = "ae7f55c \u00b7 2026-11-08 22:36 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -2870,7 +2870,9 @@ var USER_SETTINGS = [
   { key: 'maxDue', label: 'Maximum cards due', unit: 'per side', min: 1, max: 1000, def: 25,
     hint: 'Cards above this many are deferred 2 hours, lowest probability first (positions from your Lichess games rank one level higher).' },
   { key: 'allowChangingFavorites', label: 'Allow Changing Favorites', unit: 'on/off', min: 0, max: 1, def: 0, kind: 'toggle',
-    hint: 'Train: a sound alternative to a favorite becomes your newest favorite instead of counting as a mistake. Turn it on while you expand your repertoire and off for ordinary drilling. Turning it off keeps what you saved.' }
+    hint: 'Train: a sound alternative to a favorite becomes your newest favorite instead of counting as a mistake. Turn it on while you expand your repertoire and off for ordinary drilling. Turning it off keeps what you saved.' },
+  { key: 'highlightBestMove', label: 'Highlight the best move (experimental)', unit: 'on/off', min: 0, max: 1, def: 1, kind: 'toggle',
+    hint: 'Train: when a move is rejected as worse than the engine\'s best ("... Try another move."), ring the best move\'s piece and target square so you need not read the message.' }
 ];
 
 // Settings that share one line in the dialog (depth and time limit side by side).
@@ -3125,7 +3127,7 @@ async function evaluateRepertoireMove(fenBefore, move) {
   }
   if (!played) played = await runGuardLocalEval(afterGame.fen());
   if (!best || !played) return null;
-  return { loss: repertoireGuardLoss(best, played, move.color), bestSan: uciToSan(fenBefore, best.move) || best.move };
+  return { loss: repertoireGuardLoss(best, played, move.color), bestSan: uciToSan(fenBefore, best.move) || best.move, bestUci: best.move };
 }
 /* TASK_665_REPERTOIRE_GUARD_END */
 
@@ -3485,6 +3487,8 @@ function applyUserSettings(values) {
   REPERTOIRE_GUARD.localTimeMs = values.guardTimeSec * 1000;
   trainMaxDue = values.maxDue;
   trainAllowChange = values.allowChangingFavorites === 1;
+  trainHighlightBest = values.highlightBestMove === 1;
+  if (!trainHighlightBest && train && train.bestMove) { train.bestMove = null; render(); }  // turned off while rings are showing
   trainApplyDueCap();
   renderRepertoireStats();
   if (engineChanged && analysisMode) {
@@ -3916,6 +3920,7 @@ function renderRepertoireStats() {
   Needs a signed-in player, a loaded repertoire and the standard start.
 */
 var trainAllowChange;  // #830b: populated by applyUserSettings; falsy (off) before a user's settings load
+var trainHighlightBest = true;  // highlightBestMove setting (experimental, on by default)
 var trainMaxDue;  // populated by applyUserSettings; the default is applied before a user's settings load
 var trainCapReady;  // true once the settings read has answered (value or failure); trainApplyDueCap waits for it
 
@@ -4348,6 +4353,7 @@ function renderBoard() {
   var displayGame = buildViewGame();
   syncFenField(displayGame.fen());  // TASK_646: the field shows the viewed position
   var board = displayGame.board();
+  var bestMove = trainHighlightBest && train && train.bestMove && train.bestMove.fen === displayGame.fen() ? train.bestMove : null;  // only on the position it was computed for
   for (var r = 0; r < 8; r++) {
     for (var f = 0; f < 8; f++) {
       var boardRow = flipped ? 7 - r : r;
@@ -4399,6 +4405,10 @@ function renderBoard() {
       }
       if (selected === sq && !(dragCtx && dragCtx.moved)) {
         cell.style.boxShadow = 'inset 0 0 0 2px var(--border-accent, #4a9eff)';
+      }
+      if (bestMove && (bestMove.from === sq || bestMove.to === sq)) {
+        cell.style.boxShadow = 'inset 0 0 0 4px ' + bestMove.color;
+        cell.dataset[bestMove.from === sq ? 'bestFrom' : 'bestTo'] = 'true';
       }
       if (train && train.hintSquare === sq) {  // #648: ring the piece to move, in the position's rarity color
         cell.style.boxShadow = 'inset 0 0 0 4px ' + train.hintColor;
@@ -5245,6 +5255,7 @@ function startTraining() {
     changeEndPly: 0,  // #830b: history length at which the post-change gap allowance ends
     turn: null,
     hintSquare: null,
+    bestMove: null,
     hintColor: null,
     hintTimer: null,
     opponentTimer: null,
@@ -5537,6 +5548,21 @@ function trainNoteHint(t) {
   t.stats.hints++;
 }
 
+// Squares of the engine's best move (UCI) in the position fen, or null. Goes through chess.js
+// so the castling king-takes-rook spelling lands on the king's real target square.
+function bestMoveSquares(fen, uci) {
+  if (!fen || !uci || uci.length < 4) return null;
+  try {
+    var from = uci.slice(0, 2), to = uci.slice(2, 4);
+    var chess = new Chess(normalizeFen(fen));
+    var remapped = CASTLING_KING_TAKES_ROOK_TO_STANDARD[from + to];
+    var piece = chess.get(from);
+    if (remapped && piece && piece.type === 'k') to = remapped;
+    var m = chess.move(uci.length > 4 ? { from: from, to: to, promotion: uci[4] } : { from: from, to: to });
+    return m ? { from: m.from, to: m.to } : null;
+  } catch (e) { return null; }
+}
+
 function trainScheduleHint() {
   var t = train;
   clearTimeout(t.hintTimer);
@@ -5643,6 +5669,10 @@ function trainGuardedAdd(t, move, fenBefore, keyBefore, pathBefore, isChange) {
     trainScoreFirstAttempt(t, move, fenBefore, result.loss, null);
     setTrainMessage(move.san + ' is ' + amount + ' worse than ' + result.bestSan + '. Try another move.');
     trainScheduleHint();
+    // Experimental: ring the best move's piece and target, so the message need not be read.
+    var bestSquares = trainHighlightBest ? bestMoveSquares(game.fen(), result.bestUci) : null;
+    t.bestMove = bestSquares ? { from: bestSquares.from, to: bestSquares.to, fen: game.fen(), color: trainHintColor() } : null;
+    if (t.bestMove) render();
   });
 }
 
@@ -5651,6 +5681,7 @@ function trainOnUserMove(from, to) {
   var t = train;
   if (t.busy || game.turn() !== t.color) return false;
   if (!game.moves({ square: from, verbose: true }).some(function(m) { return m.to === to; })) return false;
+  t.bestMove = null;
   var keyBefore = samePositionKey(game);
   var favorites = repertoireFavorites(repertoireData, keyBefore);
   var lineBefore = trainLineText();
