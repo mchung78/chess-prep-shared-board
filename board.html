@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "a0b3b7e \u00b7 2026-11-14 14:57 UTC";
+var BOARD_BUILD = "dca2197 \u00b7 2026-11-14 21:30 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1206,6 +1206,7 @@ var TRAIN_CONFIG = {
   mistakeHintDelayMaxSeconds: 2,
   mistakeWindowDays: 7,
   opponentDelayMs: 450,
+  explorerWaitMs: 1500,  // longest the opponent waits for Explorer stats; the fetch keeps going and fills the cache for next time
   lineEndPauseMs: 450,
   maxLinePlies: 80,
   lastMistakeToleranceMs: 60 * 1000,  // #678: server/client clock skew on lastMistake
@@ -3792,7 +3793,90 @@ var explorerInFlight = false;
 var explorerRetryTimer = null;
 var explorerLastCallTime = 0;
 
-function explorerLookup(key) { return explorerStats.get(key); }
+/*
+  Persistent Explorer cache. Stats are public data and change slowly, so each
+  answer is kept in localStorage (default 90 days, so a reload or a new
+  session does not re-ask the Worker for positions already seen). Failures
+  are never persisted. A read hydrates the in-memory Map; anything corrupt,
+  expired or malformed is ignored and dropped. Entries are capped; the oldest
+  go first (also when storage is full). Override the lifetime in days with
+  localStorage chessPrepBoard.explorerCacheDays.
+*/
+var EXPLORER_CACHE_PREFIX = 'chessPrepBoard.explorer.v1:';
+var EXPLORER_CACHE_DEFAULT_DAYS = 90;
+var EXPLORER_CACHE_MAX_ENTRIES = 3000;
+var explorerCacheCount = null;  // entries in storage; null until the first write scans it
+
+function explorerCacheTtlMs() {
+  try {
+    var days = Number(localStorage.getItem('chessPrepBoard.explorerCacheDays'));
+    if (days > 0 && days <= 3650) return days * 24 * 3600 * 1000;
+  } catch (e) { /* storage unavailable */ }
+  return EXPLORER_CACHE_DEFAULT_DAYS * 24 * 3600 * 1000;
+}
+
+function explorerCacheGet(key) {
+  var name = EXPLORER_CACHE_PREFIX + key;
+  try {
+    var raw = localStorage.getItem(name);
+    if (raw === null) return null;
+    var entry = JSON.parse(raw);
+    var fresh = entry && typeof entry.t === 'number' && Date.now() - entry.t < explorerCacheTtlMs() && entry.t <= Date.now() + 60000;
+    if (fresh && entry.s && Array.isArray(entry.s.moves)) return entry.s;
+    localStorage.removeItem(name);
+  } catch (e) { /* unreadable: treat as a miss */ }
+  return null;
+}
+
+// Drops expired entries, then the oldest so at most maxKeep remain.
+// Returns how many entries are left (-1 when storage is unusable).
+function explorerCachePrune(maxKeep) {
+  try {
+    var ttl = explorerCacheTtlMs();
+    var now = Date.now();
+    var entries = [];
+    for (var i = localStorage.length - 1; i >= 0; i--) {
+      var name = localStorage.key(i);
+      if (!name || name.indexOf(EXPLORER_CACHE_PREFIX) !== 0) continue;
+      var t = 0;
+      try { t = JSON.parse(localStorage.getItem(name)).t; } catch (e) { /* corrupt: oldest */ }
+      if (typeof t !== 'number' || now - t >= ttl) localStorage.removeItem(name);
+      else entries.push({ name: name, t: t });
+    }
+    entries.sort(function(a, b) { return a.t - b.t; });
+    var extra = Math.max(0, entries.length - maxKeep);
+    for (var j = 0; j < extra; j++) localStorage.removeItem(entries[j].name);
+    return entries.length - extra;
+  } catch (e) { return -1; }
+}
+
+function explorerCachePut(key, stats) {
+  var name = EXPLORER_CACHE_PREFIX + key;
+  var value = JSON.stringify({ t: Date.now(), s: stats });
+  try {
+    if (explorerCacheCount === null) explorerCacheCount = Math.max(0, explorerCachePrune(EXPLORER_CACHE_MAX_ENTRIES - 1));
+    var isNew = localStorage.getItem(name) === null;
+    localStorage.setItem(name, value);
+    if (isNew) explorerCacheCount++;
+    if (explorerCacheCount > EXPLORER_CACHE_MAX_ENTRIES) {  // keep the cap all session, in batches
+      explorerCacheCount = Math.max(0, explorerCachePrune(Math.floor(EXPLORER_CACHE_MAX_ENTRIES * 0.9)));
+    }
+  } catch (e) {
+    try {  // storage full: drop the oldest half of what is there, once
+      explorerCacheCount = Math.max(0, explorerCachePrune(Math.floor((explorerCacheCount || 0) / 2)));
+      localStorage.setItem(name, value);
+      explorerCacheCount++;
+    } catch (e2) { /* no persistence this time; the in-memory copy still works */ }
+  }
+}
+
+function explorerLookup(key) {
+  var stats = explorerStats.get(key);
+  if (stats) return stats;
+  stats = explorerCacheGet(key);
+  if (stats) { explorerStats.set(key, stats); explorerFailures.delete(key); }
+  return stats || undefined;
+}
 
 /*
   TASK_629: the signed-in player's repertoire (repertoire/<uid>), kept live
@@ -4193,6 +4277,7 @@ async function explorerAuthHeader() {
 }
 
 async function fetchExplorerStats(key) {
+  if (explorerLookup(key)) return;  // in memory or in the persistent cache: no request
   var wait = EXPLORER_MIN_SPACING_MS - (Date.now() - explorerLastCallTime);
   if (wait > 0) await new Promise(function(resolve) { setTimeout(resolve, wait); });
   explorerLastCallTime = Date.now();
@@ -4209,6 +4294,7 @@ async function fetchExplorerStats(key) {
       if (body && body.stats && Array.isArray(body.stats.moves)) {
         explorerStats.set(key, body.stats);
         explorerFailures.delete(key);
+        explorerCachePut(key, body.stats);
         return;
       }
     } catch (e) { /* fall through to the error path */ }
@@ -5101,7 +5187,7 @@ function trainReach(t, path) {
   var p = 1;
   for (var i = 0; i < moves.length; i++) {
     if (i >= t.rootPly && replay.turn() !== t.color) {
-      var stats = explorerStats.get(explorerPositionKey(replay.fen()));
+      var stats = explorerLookup(explorerPositionKey(replay.fen()));
       if (stats) p *= explorerMoveShare(stats, moves[i]);
     }
     try { replay.move(moves[i]); }
@@ -5405,7 +5491,16 @@ async function trainOpponentMove(t, lineId) {
     return;
   }
   var key = explorerPositionKey(game.fen());
-  if (!explorerStats.has(key) && !explorerBlocked(key)) await fetchExplorerStats(key);
+  if (!explorerStats.has(key) && !explorerBlocked(key)) {
+    // A slow or failing Explorer (the Worker waits up to 8s on Lichess) must not
+    // stall the opponent: past explorerWaitMs, move as if there were no stats.
+    var waitTimer;
+    await Promise.race([
+      fetchExplorerStats(key),
+      new Promise(function(resolve) { waitTimer = setTimeout(resolve, TRAIN_CONFIG.explorerWaitMs); })
+    ]);
+    clearTimeout(waitTimer);
+  }
   if (train !== t || t.lineId !== lineId) return;
   var legal = game.moves({ verbose: true }).map(function(m) {
     var probe = new Chess(game.fen());
