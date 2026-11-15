@@ -142,7 +142,7 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 </div>
 </div>
 <div id="sidePanel">
-<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="sparRow" style="margin-top:6px; font-size:12px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;"><label style="display:flex; gap:4px; align-items:center;" title="After a line ends, play on against Lichess-Explorer-weighted moves, then against agent-chess."><input type="checkbox" id="sparToggle"> Spar after each line</label><button id="sparLogBtn" type="button" style="display:none;" title="Download the last spar game: PGN plus the per-move explanation log (JSON).">Game log</button><button id="sparMemExportBtn" type="button" title="Download agent-chess memory (JSON).">Export memory</button><button id="sparMemImportBtn" type="button" title="Replace agent-chess memory from a JSON file.">Import memory</button><button id="sparMemResetBtn" type="button" title="Forget everything agent-chess has learned.">Reset memory</button><input type="file" id="sparMemImportFile" accept="application/json,.json" style="display:none;"><span id="sparStatus" style="color:var(--text-secondary, #aaa);"></span></div><div id="trainNextStep" style="display:none; margin-top:6px;"><div id="trainNextStepText"></div><div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px;"><button id="trainMoreBtn" type="button"></button><button id="trainSwitchBtn" type="button">Switch color</button><button id="trainKeepBtn" type="button">Keep re-training</button></div></div></div>
+<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="sparRow" style="margin-top:6px; font-size:12px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;"><label style="display:flex; gap:4px; align-items:center;" title="After a line ends, play on against Lichess-Explorer-weighted moves, then against agent-chess."><input type="checkbox" id="sparToggle"> Spar after each line</label><button id="sparLogBtn" type="button" style="display:none;" title="Download the last spar game: PGN plus the per-move explanation log (JSON).">Game log</button><button id="sparPgnBtn" type="button" style="display:none;" title="Copy the last spar game as PGN.">Copy PGN</button><button id="sparLichessBtn" type="button" style="display:none;" title="Open the last spar game in Lichess analysis (sends its PGN to lichess.org).">Open in Lichess</button><button id="sparMemExportBtn" type="button" title="Download agent-chess memory (JSON).">Export memory</button><button id="sparMemImportBtn" type="button" title="Replace agent-chess memory from a JSON file.">Import memory</button><button id="sparMemResetBtn" type="button" title="Forget everything agent-chess has learned.">Reset memory</button><input type="file" id="sparMemImportFile" accept="application/json,.json" style="display:none;"><span id="sparStatus" style="color:var(--text-secondary, #aaa);"></span></div><div id="trainNextStep" style="display:none; margin-top:6px;"><div id="trainNextStepText"></div><div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px;"><button id="trainMoreBtn" type="button"></button><button id="trainSwitchBtn" type="button">Switch color</button><button id="trainKeepBtn" type="button">Keep re-training</button></div></div></div>
 <section id="movesCard" class="panelCard">
 <div id="movesHeader">
 <div style="display:flex; align-items:baseline; gap:10px; min-width:0;"><span class="paneTitle">Moves</span>
@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "fdb8ab9 \u00b7 2026-11-15 20:59 UTC";
+var BOARD_BUILD = "045ca34 \u00b7 2026-11-15 21:29 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -6179,8 +6179,43 @@ if (sparToggleEl) {
     try { localStorage.setItem(SPAR_MODE_KEY, sparToggleEl.checked ? '1' : '0'); } catch (e) { /* session only */ }
   };
 }
+function sparShowGameButtons(show) {
+  ['sparLogBtn', 'sparPgnBtn', 'sparLichessBtn'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.style.display = show ? '' : 'none';
+  });
+}
+// The download is compact and keeps the top candidates per move (sparSlimGame): about a third of the full pretty-printed log.
 if (sparLogBtn) sparLogBtn.onclick = function() {
-  if (sparLastGame) sparDownload('spar-' + sparLastGame.id + '.json', JSON.stringify(sparLastGame, null, 1));
+  if (sparLastGame) sparDownload('spar-' + sparLastGame.id + '.json', JSON.stringify(sparSlimGame(sparLastGame)));
+};
+document.getElementById('sparPgnBtn').onclick = function() {
+  if (!sparLastGame) return;
+  var text = sparLastGame.pgn;
+  var done = function(ok) { sparStatus(ok ? 'PGN copied.' : 'Could not copy; use Game log.'); };
+  var fallback = function() {
+    var ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { /* no clipboard */ }
+    document.body.removeChild(ta);
+    done(ok);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(function() { done(true); }, fallback);
+  else fallback();
+};
+// Lichess imports a PGN posted to /import and redirects to the analysis board; a form POST in a new tab does that without an API token.
+document.getElementById('sparLichessBtn').onclick = function() {
+  if (!sparLastGame) return;
+  var form = document.createElement('form');
+  form.method = 'POST'; form.action = 'https://lichess.org/import'; form.target = '_blank'; form.rel = 'noopener';
+  var field = document.createElement('input');
+  field.type = 'hidden'; field.name = 'pgn'; field.value = sparLastGame.pgn;
+  form.appendChild(field);
+  document.body.appendChild(form);
+  form.submit();
+  document.body.removeChild(form);
 };
 document.getElementById('sparMemExportBtn').onclick = function() {
   sparDownload('agent-chess-memory.json', JSON.stringify(sparLoadMemory(), null, 1));
@@ -6227,7 +6262,7 @@ function sparBegin(t, message) {
   t.hintSquare = null;
   t.bestMove = null;
   sparStatus('');
-  if (sparLogBtn) sparLogBtn.style.display = 'none';
+  sparShowGameButtons(false);
   setTrainMessage(message + ' Spar mode: play on.');
   sparStep(t);
   return true;
@@ -6365,7 +6400,7 @@ function sparFinish(t, result) {
     v: SPAR_CONFIG.logVersion, id: sp.id, seed: sp.seed, engine: SPAR_CONFIG.version, engine_color: sp.engineColor,
     result_for_engine: result, start_fen: sp.startFen, handoff: sp.handoff, pgn: game.pgn(), moves: sp.log
   };
-  if (sparLogBtn) sparLogBtn.style.display = '';
+  sparShowGameButtons(true);
   sparStatus('Memory: ' + mem.games.length + ' games.');
   sparUploadGame(sparLastGame);
   t.busy = true;
