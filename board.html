@@ -61,6 +61,13 @@ if(typeof module!=="undefined"&&module.exports){module.exports.Chess=globalThis.
 <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-database-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-auth-compat.js"></script>
 <style>
+/* Settings dialog: tabs, and each pane flows into two columns when the dialog is wide enough. */
+.settingsPane { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 0 24px; align-content: start; min-height: 150px; }
+.settingsPane[hidden] { display: none; }
+#settingsTabs button { background: none; border: 1px solid transparent; border-bottom: none; border-radius: 4px 4px 0 0; padding: 4px 12px; color: var(--text-secondary, #aaa); cursor: pointer; }
+#settingsTabs button[aria-selected="true"] { color: var(--text-primary, #eee); border-color: var(--border-strong, #666); background: var(--bg-secondary, #262626); margin-bottom: -1px; }
+.srOnly { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.hasTip { text-decoration: underline dotted; text-underline-offset: 3px; cursor: help; }
 /*
   Defined locally rather than assumed from a host stylesheet - confirmed
   2026-09-06 that when this file is served as a plain static page (e.g.
@@ -142,7 +149,7 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 </div>
 </div>
 <div id="sidePanel">
-<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="sparRow" style="margin-top:6px; font-size:12px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;"><label style="display:flex; gap:4px; align-items:center;" title="After a line ends, play on against Lichess-Explorer-weighted moves, then against agent-chess."><input type="checkbox" id="sparToggle"> Spar after each line</label><button id="sparResignBtn" type="button" style="display:none;" title="Resign the spar game in progress (click twice to confirm). It counts as a win for agent-chess.">Resign</button><button id="sparLogBtn" type="button" style="display:none;" title="Download the last spar game: PGN plus the per-move explanation log (JSON).">Game log</button><button id="sparPgnBtn" type="button" style="display:none;" title="Copy the last spar game as PGN.">Copy PGN</button><button id="sparLichessBtn" type="button" style="display:none;" title="Open the last spar game in Lichess analysis (sends its PGN to lichess.org).">Open in Lichess</button><button id="sparMemExportBtn" type="button" title="Download agent-chess memory (JSON).">Export memory</button><button id="sparMemImportBtn" type="button" title="Replace agent-chess memory from a JSON file.">Import memory</button><button id="sparMemResetBtn" type="button" title="Forget everything agent-chess has learned.">Reset memory</button><input type="file" id="sparMemImportFile" accept="application/json,.json" style="display:none;"><span id="sparStatus" style="color:var(--text-secondary, #aaa);"></span></div><div id="trainNextStep" style="display:none; margin-top:6px;"><div id="trainNextStepText"></div><div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px;"><button id="trainMoreBtn" type="button"></button><button id="trainSwitchBtn" type="button">Switch color</button><button id="trainKeepBtn" type="button">Keep re-training</button></div></div></div>
+<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="sparRow" style="margin-top:6px; font-size:12px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;"><button id="sparResignBtn" type="button" style="display:none;" title="Resign the spar game in progress (click twice to confirm). It counts as a win for agent-chess.">Resign</button><button id="sparLogBtn" type="button" style="display:none;" title="Download the last spar game: PGN plus the per-move explanation log (JSON).">Game log</button><button id="sparPgnBtn" type="button" style="display:none;" title="Copy the last spar game as PGN.">Copy PGN</button><button id="sparLichessBtn" type="button" style="display:none;" title="Open the last spar game in Lichess analysis (sends its PGN to lichess.org).">Open in Lichess</button><span id="sparStatus" style="color:var(--text-secondary, #aaa);"></span></div><div id="trainNextStep" style="display:none; margin-top:6px;"><div id="trainNextStepText"></div><div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px;"><button id="trainMoreBtn" type="button"></button><button id="trainSwitchBtn" type="button">Switch color</button><button id="trainKeepBtn" type="button">Keep re-training</button></div></div></div>
 <section id="movesCard" class="panelCard">
 <div id="movesHeader">
 <div style="display:flex; align-items:baseline; gap:10px; min-width:0;"><span class="paneTitle">Moves</span>
@@ -195,17 +202,30 @@ Analysis mode
 </div>
 </div>
 </div>
-<dialog id="settingsDialog" aria-labelledby="settingsTitle" style="width:calc(100% - 32px); max-width:460px; box-sizing:border-box; background:var(--bg-primary, #18181b); color:var(--text-primary, #eee); border:1px solid var(--border-strong, #666); border-radius:8px; padding:16px;">
-<h3 id="settingsTitle" style="margin:0 0 4px; font-size:16px;">Settings</h3>
-<p style="margin:0 0 12px; font-size:12px; color:var(--text-secondary, #aaa);">Saved to your account, so they follow you to other devices. Close saves your changes; Esc closes without saving. A setting left on its default follows any future change to that default.</p>
-<div id="settingsRows"></div>
-<div id="settingsLichess" data-row="lichess" style="display:none; align-items:center; gap:2px 8px; margin:0 0 10px; flex-wrap:wrap;">
+<dialog id="settingsDialog" aria-labelledby="settingsTitle" style="width:calc(100% - 32px); max-width:640px; box-sizing:border-box; background:var(--bg-primary, #18181b); color:var(--text-primary, #eee); border:1px solid var(--border-strong, #666); border-radius:8px; padding:16px;">
+<h3 id="settingsTitle" style="margin:0 0 4px; font-size:16px;">Settings <span title="Saved to your account, so they follow you to other devices. Close saves your changes; Esc closes without saving. A setting left on its default follows any future change to that default." style="font-size:11px; color:var(--text-secondary, #aaa); cursor:help; border:1px solid var(--border-strong, #666); border-radius:50%; padding:0 5px; vertical-align:middle;">?</span></h3>
+<div id="settingsTabs" role="tablist" aria-label="Settings sections" style="display:flex; gap:4px; margin:8px 0 12px; border-bottom:1px solid var(--border-strong, #666);">
+<button type="button" role="tab" id="settingsTab-analysis" data-tab="analysis" aria-controls="settingsPane-analysis">Analysis</button>
+<button type="button" role="tab" id="settingsTab-training" data-tab="training" aria-controls="settingsPane-training">Training</button>
+<button type="button" role="tab" id="settingsTab-account" data-tab="account" aria-controls="settingsPane-account">Account</button>
+</div>
+<div id="settingsRows">
+<div role="tabpanel" id="settingsPane-analysis" data-pane="analysis" aria-labelledby="settingsTab-analysis" class="settingsPane"></div>
+<div role="tabpanel" id="settingsPane-training" data-pane="training" aria-labelledby="settingsTab-training" class="settingsPane">
+<div data-row="spar" style="grid-column:1 / -1; margin:0 0 6px; padding-top:8px; border-top:1px solid var(--border-strong, #666);">
+<div style="font-size:13px; margin-bottom:4px;" title="After a Train line ends the board plays on: first Lichess-Explorer-weighted replies, then agent-chess, a home-grown engine that learns from the games it loses. These apply at once on this device; Close does not save them.">Spar vs agent-chess</div>
+<label style="display:flex; gap:6px; align-items:center; font-size:13px; margin-bottom:6px;" title="After a line ends, play on against Lichess-Explorer-weighted moves, then against agent-chess."><input type="checkbox" id="sparToggle"> Spar after each line</label>
+<div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center; font-size:12px;">
+<button id="sparMemExportBtn" type="button" title="Download agent-chess memory (JSON).">Export memory</button><button id="sparMemImportBtn" type="button" title="Replace agent-chess memory from a JSON file.">Import memory</button><button id="sparMemResetBtn" type="button" title="Forget everything agent-chess has learned.">Reset memory</button><input type="file" id="sparMemImportFile" accept="application/json,.json" style="display:none;"><span id="sparMemStatus" role="status" aria-live="polite" style="color:var(--text-secondary, #aaa);"></span>
+</div></div>
+</div>
+<div role="tabpanel" id="settingsPane-account" data-pane="account" aria-labelledby="settingsTab-account" class="settingsPane">
+<div id="settingsLichess" data-row="lichess" title="Train drills the opening mistakes from your recent games. A change here applies at once; Close does not save it." style="display:none; align-items:center; gap:2px 8px; margin:0 0 10px; flex-wrap:wrap;">
 <div style="flex:1 1 130px; font-size:13px;">Lichess account<span id="settingsLichessState" style="display:block; font-size:11px; color:var(--text-secondary, #aaa);"></span></div>
 <div style="display:flex; align-items:center; gap:8px; flex:0 0 auto;">
 <button id="settingsLichessChangeBtn">Link</button>
 <button id="settingsLichessUnlinkBtn" style="display:none;" title="Remove the link and the games cached from this account.">Unlink</button>
 </div>
-<div style="flex:1 1 100%; font-size:11px; color:var(--text-muted, #999);">Train drills the opening mistakes from your recent games. A change here applies at once; Close does not save it.</div>
 </div>
 <div id="settingsFavoritesReview" data-row="favoritesReview" style="margin:0 0 10px;">
 <div style="display:flex; align-items:center; gap:2px 8px; flex-wrap:wrap;">
@@ -213,6 +233,8 @@ Analysis mode
 <button id="settingsFavoritesExportBtn" title="Build a copyable summary of the favorites you added or changed, to paste into a coaching session.">Export</button>
 </div>
 <textarea id="settingsFavoritesExport" readonly rows="6" aria-label="Favorites review export" style="display:none; width:100%; box-sizing:border-box; margin-top:6px; font-family:monospace; font-size:11px; background:var(--bg-secondary, #222); color:var(--text-primary, #eee); border:1px solid var(--border-strong, #666);"></textarea>
+</div>
+</div>
 </div>
 <p id="settingsStatus" role="status" aria-live="polite" style="min-height:1.3em; margin:0 0 10px; font-size:12px; color:var(--text-secondary, #aaa);"></p>
 <div style="display:flex; gap:8px; justify-content:flex-end; flex-wrap:wrap;">
@@ -237,7 +259,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "ebd548c \u00b7 2026-11-15 23:41 UTC";
+var BOARD_BUILD = "ac7cc8d \u00b7 2026-11-15 23:55 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -4159,6 +4181,9 @@ var settingsDialogEl = document.getElementById('settingsDialog');
 var settingsRowsEl = document.getElementById('settingsRows');
 var settingsStatusEl = document.getElementById('settingsStatus');
 var settingsResetAllBtnEl = document.getElementById('settingsResetAllBtn');
+var settingsRowsBuilt = false;
+// Which tab each row lives on (a row id is its group name, or the key of a lone setting).
+var SETTINGS_ROW_TAB = { analysis: 'analysis', guardWeakMoveCp: 'analysis', guard: 'analysis', maxDue: 'training', allowChangingFavorites: 'training', highlightBestMove: 'training' };
 var settingsCloseBtnEl = document.getElementById('settingsCloseBtn');
 
 // Pushes resolved values into the engine/guard variables that the code
@@ -4184,6 +4209,36 @@ function applyUserSettings(values) {
   }
 }
 
+// Tabs: one pane visible at a time; arrow keys, Home and End move between them.
+function settingsShowTab(name) {
+  var tabs = settingsDialogEl ? settingsDialogEl.querySelectorAll('[role="tab"]') : [];
+  Array.prototype.forEach.call(tabs, function(tab) {
+    var on = tab.getAttribute('data-tab') === name;
+    tab.setAttribute('aria-selected', on ? 'true' : 'false');
+    tab.tabIndex = on ? 0 : -1;
+    var pane = document.getElementById(tab.getAttribute('aria-controls'));
+    if (pane) pane.hidden = !on;
+  });
+}
+if (settingsDialogEl) {
+  var settingsTabEls = settingsDialogEl.querySelectorAll('[role="tab"]');
+  Array.prototype.forEach.call(settingsTabEls, function(tab, i) {
+    tab.addEventListener('click', function() { settingsShowTab(tab.getAttribute('data-tab')); });
+    tab.addEventListener('keydown', function(ev) {
+      var n = settingsTabEls.length, to = -1;
+      if (ev.key === 'ArrowRight') to = (i + 1) % n;
+      else if (ev.key === 'ArrowLeft') to = (i + n - 1) % n;
+      else if (ev.key === 'Home') to = 0;
+      else if (ev.key === 'End') to = n - 1;
+      if (to < 0) return;
+      ev.preventDefault();
+      settingsShowTab(settingsTabEls[to].getAttribute('data-tab'));
+      settingsTabEls[to].focus();
+    });
+  });
+  settingsShowTab('analysis');
+}
+
 function setSettingsStatus(text, isError) {
   if (!settingsStatusEl) return;
   settingsStatusEl.textContent = text || '';
@@ -4195,7 +4250,8 @@ function settingDefaultText(def) {
 }
 
 function buildSettingsRows() {
-  if (!settingsRowsEl || settingsRowsEl.firstChild) return;
+  if (!settingsRowsEl || settingsRowsBuilt) return;
+  settingsRowsBuilt = true;
   settingsRows().forEach(function(r) {
     var grouped = r.defs.length > 1;
     var row = document.createElement('div');
@@ -4234,7 +4290,7 @@ function buildSettingsRows() {
         input.setAttribute('inputmode', 'numeric');
         input.style.cssText = 'width:' + (grouped ? '56' : '64') + 'px;';
       }
-      input.setAttribute('aria-describedby', 'settingState-' + r.id);
+      input.setAttribute('aria-describedby', 'settingState-' + r.id + ' settingHint-' + r.id);
       if (grouped) cell.appendChild(caption);
       cell.appendChild(input);
       if (!grouped && def.kind !== 'toggle') {
@@ -4263,11 +4319,20 @@ function buildSettingsRows() {
       writeSettings(buildSettingsUpdate(edits), grouped ? 'Back to the defaults.' : 'Back to the default.');
     });
     controls.appendChild(reset);
+    // The explanation is a tooltip on the title (and stays in the page, hidden, for screen readers), not a line of its own.
     var hint = document.createElement('div');
-    hint.style.cssText = 'flex:1 1 100%; font-size:11px; color:var(--text-muted, #999);';
+    hint.id = 'settingHint-' + r.id;
+    hint.className = 'srOnly';
     hint.textContent = r.hint;
+    head.title = r.hint;
+    head.firstChild.nodeValue = '';
+    var titleEl = document.createElement('span');
+    titleEl.className = 'hasTip';
+    titleEl.textContent = r.title;
+    head.insertBefore(titleEl, head.firstChild);
     row.appendChild(head); row.appendChild(controls); row.appendChild(hint);
-    settingsRowsEl.appendChild(row);
+    var pane = settingsRowsEl.querySelector('[data-pane="' + (SETTINGS_ROW_TAB[r.id] || 'training') + '"]');
+    pane.insertBefore(row, pane.firstChild && pane.querySelector('[data-row="spar"]') ? pane.querySelector('[data-row="spar"]') : null);
   });
 }
 
@@ -4340,7 +4405,9 @@ function saveSettingsFromDialog() {
     });
     var first = plan.errors[0];
     setSettingsStatus(userSettingDef(first.key).label + ': ' + first.error, true);
-    settingsRowsEl.querySelector('[data-setting="' + first.key + '"] input').focus();
+    var firstInput = settingsRowsEl.querySelector('[data-setting="' + first.key + '"] input');
+    settingsShowTab(firstInput.closest('[data-pane]').getAttribute('data-pane'));
+    firstInput.focus();
     return Promise.resolve(false);
   }
   plan.unchanged.forEach(function(key) { delete settingsDirty[key]; });  // already their stored choice
@@ -4407,6 +4474,9 @@ if (settingsBtnEl && settingsDialogEl) {
     settingsOpenGen = (settingsOpenGen || 0) + 1;
     setSettingsStatus(settingsLoaded ? '' : SETTINGS_UNAVAILABLE_TEXT, !settingsLoaded);
     renderSettings();
+    settingsShowTab('analysis');
+    var memStatus = document.getElementById('sparMemStatus');
+    if (memStatus) memStatus.textContent = '';
     settingsDialogEl.showModal();
   });
   settingsResetAllBtnEl.addEventListener('click', function() {
@@ -6273,6 +6343,7 @@ function sparEnabled() {
   return SPAR_CONFIG.defaultOn;
 }
 
+function sparMemStatus(text) { var el = document.getElementById('sparMemStatus'); if (el) el.textContent = text || ''; }
 function sparStatus(text) { if (sparStatusEl) sparStatusEl.textContent = text || ''; }
 
 function sparLoadMemory() {
@@ -6396,21 +6467,21 @@ document.getElementById('sparMemExportBtn').onclick = function() {
 document.getElementById('sparMemResetBtn').onclick = function() {
   sparMemory = sparMemoryNew();
   sparSaveMemory();
-  sparStatus('agent-chess memory cleared.');
+  sparMemStatus('agent-chess memory cleared.');
 };
 document.getElementById('sparMemImportBtn').onclick = function() { document.getElementById('sparMemImportFile').click(); };
 document.getElementById('sparMemImportFile').onchange = function(ev) {
   var file = ev.target.files && ev.target.files[0];
   ev.target.value = '';
   if (!file) return;
-  if (file.size > 5 * 1024 * 1024) { sparStatus('That memory file is too large.'); return; }
+  if (file.size > 5 * 1024 * 1024) { sparMemStatus('That memory file is too large.'); return; }
   var reader = new FileReader();
   reader.onload = function() {
     var parsed = sparMemoryParse(String(reader.result));
-    if (!parsed) { sparStatus('That is not an agent-chess memory file; nothing changed.'); return; }
+    if (!parsed) { sparMemStatus('That is not an agent-chess memory file; nothing changed.'); return; }
     sparMemory = parsed;
     sparSaveMemory();
-    sparStatus('Imported memory: ' + parsed.games.length + ' games, ' + Object.keys(parsed.positions).length + ' positions.');
+    sparMemStatus('Imported memory: ' + parsed.games.length + ' games, ' + Object.keys(parsed.positions).length + ' positions.');
   };
   reader.readAsText(file);
 };
