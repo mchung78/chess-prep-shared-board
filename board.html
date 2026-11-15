@@ -142,7 +142,7 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 </div>
 </div>
 <div id="sidePanel">
-<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainNextStep" style="display:none; margin-top:6px;"><div id="trainNextStepText"></div><div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px;"><button id="trainMoreBtn" type="button"></button><button id="trainSwitchBtn" type="button">Switch color</button><button id="trainKeepBtn" type="button">Keep re-training</button></div></div></div>
+<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="sparRow" style="margin-top:6px; font-size:12px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;"><label style="display:flex; gap:4px; align-items:center;" title="After a line ends, play on against Lichess-Explorer-weighted moves, then against agent-chess."><input type="checkbox" id="sparToggle"> Spar after each line</label><button id="sparLogBtn" type="button" style="display:none;" title="Download the last spar game: PGN plus the per-move explanation log (JSON).">Game log</button><button id="sparMemExportBtn" type="button" title="Download agent-chess memory (JSON).">Export memory</button><button id="sparMemImportBtn" type="button" title="Replace agent-chess memory from a JSON file.">Import memory</button><button id="sparMemResetBtn" type="button" title="Forget everything agent-chess has learned.">Reset memory</button><input type="file" id="sparMemImportFile" accept="application/json,.json" style="display:none;"><span id="sparStatus" style="color:var(--text-secondary, #aaa);"></span></div><div id="trainNextStep" style="display:none; margin-top:6px;"><div id="trainNextStepText"></div><div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px;"><button id="trainMoreBtn" type="button"></button><button id="trainSwitchBtn" type="button">Switch color</button><button id="trainKeepBtn" type="button">Keep re-training</button></div></div></div>
 <section id="movesCard" class="panelCard">
 <div id="movesHeader">
 <div style="display:flex; align-items:baseline; gap:10px; min-width:0;"><span class="paneTitle">Moves</span>
@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "dca2197 \u00b7 2026-11-14 21:30 UTC";
+var BOARD_BUILD = "b565760 \u00b7 2026-11-15 18:41 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1711,6 +1711,482 @@ function repertoireStatsText(stats, firstColour) {
   }).join('\n');
 }
 /* TASK_648_TRAIN_END */
+
+/* TASK_1918_SPAR_START - pure; spar mode and the agent-chess engine (needs the global Chess). */
+/*
+  #1918 Spar mode: after a Train line ends the game goes on against an opponent that plays
+  Explorer-weighted moves while the Explorer has data, then hands off to agent-chess
+  (a small classical engine: no LLM, no tokens). Iteration 1: chess.js move generation, a
+  shallow alpha-beta search, material + piece-square evaluation, softmax selection, a JSON
+  per-move log and a JSON memory. Design: docs/tasks/TASK_1918_spar_mode_agent_chess.md.
+  Everything below is deterministic given (position, config, seed, memory).
+*/
+var SPAR_CONFIG = {
+  version: 'agent-chess/0.1.0',
+  logVersion: 1,
+  defaultOn: true,
+  minGames: 10,            // Explorer hand-off: fewer games than this at the position
+  strength: 1400,          // nominal level, 800-2000
+  maxPlies: 160,           // spar plies before the game is called a draw
+  moveDelayMs: 450,        // same pacing as the trainer's opponent
+  engine: { maxDepth: 4, nodeCap: 30000, capMs: 400, qDepth: 6 },
+  memory: { maxGames: 200, maxPositions: 4000, perBlame: 80, maxBonus: 60, maxPenalty: 400, winCredit: 0.15, lossScale: 300 },
+  logRing: 400
+};
+var SPAR_MATE = 30000;
+
+var SPAR_VALUE = { p: 100, n: 320, b: 330, r: 500, q: 900, k: 0 };
+// Piece-square tables from White's side, a8..h1 (the order chess.js board() returns).
+var SPAR_PST = {
+  p: [0,0,0,0,0,0,0,0, 50,50,50,50,50,50,50,50, 10,10,20,30,30,20,10,10, 5,5,10,25,25,10,5,5,
+      0,0,0,20,20,0,0,0, 5,-5,-10,0,0,-10,-5,5, 5,10,10,-20,-20,10,10,5, 0,0,0,0,0,0,0,0],
+  n: [-50,-40,-30,-30,-30,-30,-40,-50, -40,-20,0,0,0,0,-20,-40, -30,0,10,15,15,10,0,-30, -30,5,15,20,20,15,5,-30,
+      -30,0,15,20,20,15,0,-30, -30,5,10,15,15,10,5,-30, -40,-20,0,5,5,0,-20,-40, -50,-40,-30,-30,-30,-30,-40,-50],
+  b: [-20,-10,-10,-10,-10,-10,-10,-20, -10,0,0,0,0,0,0,-10, -10,0,5,10,10,5,0,-10, -10,5,5,10,10,5,5,-10,
+      -10,0,10,10,10,10,0,-10, -10,10,10,10,10,10,10,-10, -10,5,0,0,0,0,5,-10, -20,-10,-10,-10,-10,-10,-10,-20],
+  r: [0,0,0,0,0,0,0,0, 5,10,10,10,10,10,10,5, -5,0,0,0,0,0,0,-5, -5,0,0,0,0,0,0,-5,
+      -5,0,0,0,0,0,0,-5, -5,0,0,0,0,0,0,-5, -5,0,0,0,0,0,0,-5, 0,0,0,5,5,0,0,0],
+  q: [-20,-10,-10,-5,-5,-10,-10,-20, -10,0,0,0,0,0,0,-10, -10,0,5,5,5,5,0,-10, -5,0,5,5,5,5,0,-5,
+      0,0,5,5,5,5,0,-5, -10,5,5,5,5,5,0,-10, -10,0,5,0,0,0,0,-10, -20,-10,-10,-5,-5,-10,-10,-20],
+  k: [-30,-40,-40,-50,-50,-40,-40,-30, -30,-40,-40,-50,-50,-40,-40,-30, -30,-40,-40,-50,-50,-40,-40,-30,
+      -30,-40,-40,-50,-50,-40,-40,-30, -20,-30,-30,-40,-40,-30,-30,-20, -10,-20,-20,-20,-20,-20,-20,-10,
+      20,20,0,0,0,0,20,20, 20,30,10,0,0,10,30,20]
+};
+
+function sparMulberry32(seed) {
+  var a = seed >>> 0;
+  return function() {
+    a = (a + 0x6D2B79F5) >>> 0;
+    var t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// The seed for one move of a game: replaying (game seed, ply) reproduces the draw.
+function sparMoveSeed(gameSeed, ply) {
+  return (Math.imul((gameSeed >>> 0) ^ 0x9E3779B9, 2654435761) + Math.imul(ply + 1, 40503)) >>> 0;
+}
+
+// Position key for memory: placement, side, castling, en passant (no move counters).
+function sparPositionKey(fen) { return fen.split(' ').slice(0, 4).join(' '); }
+
+/* ---------- Explorer phase ---------- */
+
+// Explorer-weighted choices among the legal SANs, or { handoff: reason } when the Explorer
+// cannot be used. Weights are the Explorer's game counts, so a draw of rnd in [0,1) over the
+// cumulative weights reproduces Lichess's frequencies.
+function sparExplorerChoices(legalSans, stats, minGames) {
+  if (!stats || !Array.isArray(stats.moves)) return { handoff: 'explorer-unavailable' };
+  var total = stats.white + stats.draws + stats.black;
+  if (!(total >= minGames)) return { handoff: 'total<min_games', total: total || 0 };
+  var legal = {};
+  legalSans.forEach(function(san) { legal[stripSanDecorations(san)] = san; });
+  var moves = [];
+  stats.moves.forEach(function(m) {
+    var key = stripSanDecorations(m.san);
+    var n = m.white + m.draws + m.black;
+    if (legal[key] && n > 0) moves.push({ san: legal[key], n: n });
+  });
+  if (!moves.length) return { handoff: 'no-legal-explorer-move', total: total };
+  var sum = moves.reduce(function(s, m) { return s + m.n; }, 0);
+  moves.forEach(function(m) { m.p = Math.round(m.n / sum * 10000) / 10000; });
+  return { total: total, moves: moves, sum: sum };
+}
+
+function sparExplorerPick(choice, draw) {
+  var x = draw * choice.sum;
+  for (var i = 0; i < choice.moves.length; i++) {
+    x -= choice.moves[i].n;
+    if (x < 0) return choice.moves[i];
+  }
+  return choice.moves[choice.moves.length - 1];
+}
+
+/* ---------- Evaluation (named terms, centipawns from White's point of view) ---------- */
+
+function sparEvalTerms(chess) {
+  var board = chess._board;  // chess.js 1.4.0 internal 0x88 array (pinned; the tests check it exists)
+  var material = 0, pst = 0, bishops = { w: 0, b: 0 }, queens = 0, kings = { w: null, b: null };
+  for (var i = 0; i < 128; i++) {
+    if (i & 0x88) { i += 7; continue; }
+    var sq = board[i];
+    if (!sq) continue;
+    var r = i >> 4, c = i & 7;
+    var sign = sq.color === 'w' ? 1 : -1;
+    material += sign * SPAR_VALUE[sq.type];
+    if (sq.type === 'b') bishops[sq.color]++;
+    else if (sq.type === 'q') queens++;
+    if (sq.type === 'k') kings[sq.color] = [r, c];
+    else pst += sign * SPAR_PST[sq.type][sq.color === 'w' ? r * 8 + c : (7 - r) * 8 + c];
+  }
+  // King: middlegame table while queens are on, else walk to the centre.
+  var king = 0;
+  ['w', 'b'].forEach(function(color) {
+    var pos = kings[color];
+    if (!pos) return;
+    var sign = color === 'w' ? 1 : -1;
+    if (queens > 0) king += sign * SPAR_PST.k[color === 'w' ? pos[0] * 8 + pos[1] : (7 - pos[0]) * 8 + pos[1]];
+    else king += sign * Math.round(30 - 10 * Math.max(Math.abs(pos[0] - 3.5), Math.abs(pos[1] - 3.5)));
+  });
+  var bishopPair = (bishops.w >= 2 ? 30 : 0) - (bishops.b >= 2 ? 30 : 0);
+  return { material: material, pst: pst + king, bishop_pair: bishopPair };
+}
+
+function sparEvalTotal(terms) { return terms.material + terms.pst + terms.bishop_pair; }
+
+/* ---------- Search ---------- */
+
+function sparMoveOrderScore(m) {
+  var s = 0;
+  if (m.captured) s += 10 * SPAR_VALUE[m.captured] - SPAR_VALUE[m.piece] / 10 + 1000;
+  if (m.promotion) s += SPAR_VALUE[m.promotion] + 900;
+  return s;
+}
+
+function sparSortMoves(moves) {
+  moves.sort(function(a, b) { return sparMoveOrderScore(b) - sparMoveOrderScore(a); });
+  return moves;
+}
+
+// Strength (800-2000) -> selection parameters. Weaker = hotter softmax and a wider pool.
+function sparStrengthParams(strength) {
+  var s = Math.max(800, Math.min(2000, strength));
+  var x = (s - 800) / 1200;  // 0..1
+  return { temperature: Math.round(120 - 105 * x), window: Math.round(300 - 250 * x) };
+}
+
+// Pick among candidates [{ uci, total }] sorted by total, descending; draw in [0, 1).
+// Pure, so a logged selection can be replayed.
+function sparSelect(cands, temperature, window, draw) {
+  var best = cands[0].total;
+  if (best >= SPAR_MATE - 200) return { index: 0, method: 'forced-mate', p: 1, pool: 1 };
+  var pool = cands.filter(function(c) { return c.total >= best - window; });
+  var weights = pool.map(function(c) { return Math.exp((c.total - best) / temperature); });
+  var sum = weights.reduce(function(a, b) { return a + b; }, 0);
+  var x = draw * sum;
+  for (var i = 0; i < pool.length; i++) {
+    x -= weights[i];
+    if (x < 0) return { index: i, method: 'softmax', p: Math.round(weights[i] / sum * 10000) / 10000, pool: pool.length };
+  }
+  return { index: pool.length - 1, method: 'softmax', p: Math.round(weights[pool.length - 1] / sum * 10000) / 10000, pool: pool.length };
+}
+
+var SPAR_FILES = 'abcdefgh';
+function sparSquareName(sq) { return SPAR_FILES[sq & 7] + (8 - (sq >> 4)); }
+function sparInternalUci(m) { return sparSquareName(m.from) + sparSquareName(m.to) + (m.promotion || ''); }
+
+/*
+  agent-chess: choose a move for the side to move. position: a Chess (never modified; the
+  search runs on a copy). The search uses chess.js 1.4.0's internal move generator
+  (_moves/_makeMove/_undoMove, about 100x faster than the SAN-producing public API); the
+  vendored version is pinned and board-spar.test.js checks the internals and perft.
+  opts: strength, seed, memory, ply, maxDepth, nodeCap, capMs (Infinity for tests), now.
+  Returns { san, uci, log } or null when there is no legal move.
+*/
+function agentChessMove(position, opts) {
+  opts = opts || {};
+  var eng = SPAR_CONFIG.engine;
+  var strength = typeof opts.strength === 'number' ? opts.strength : SPAR_CONFIG.strength;
+  var maxDepth = opts.maxDepth || eng.maxDepth;
+  var nodeCap = opts.nodeCap || eng.nodeCap;
+  var capMs = opts.capMs === undefined ? eng.capMs : opts.capMs;
+  var nowFn = opts.now || function() { return Date.now(); };
+  var params = sparStrengthParams(strength);
+  var work = new Chess(position.fen());
+  var rootFen = work.fen();
+  var side = work.turn();
+  var sans = {};
+  work.moves({ verbose: true }).forEach(function(m) { sans[m.from + m.to + (m.promotion || '')] = m.san; });
+  var started = nowFn();
+  var nodes = 0, aborted = false, timeCap = false, limited = false;
+
+  function checkLimits() {
+    if (!limited) return;
+    if (nodes > nodeCap) { aborted = true; throw 'abort'; }
+    if (capMs !== Infinity && (nodes & 255) === 0 && nowFn() - started > capMs) { aborted = true; timeCap = true; throw 'abort'; }
+  }
+
+  // Score from the side to move's point of view.
+  function staticEval() {
+    var t = sparEvalTotal(sparEvalTerms(work));
+    return work.turn() === 'w' ? t : -t;
+  }
+
+  // Fifty-move rule: a draw unless the side to move is mated (chess.js ends such a game at once).
+  function fiftyMoveScore(ply) {
+    var moves = work._moves({ legal: false });
+    for (var i = 0; i < moves.length; i++) {
+      work._makeMove(moves[i]);
+      var legal = !work._isKingAttacked(moves[i].color);
+      work._undoMove();
+      if (legal) return 0;
+    }
+    return work.isCheck() ? -SPAR_MATE + ply : 0;
+  }
+
+  function quiesce(alpha, beta, ply, qLeft, afterCapture) {
+    nodes++;
+    checkLimits();
+    if (afterCapture && work.isInsufficientMaterial()) return 0;  // only a capture can leave too little to mate
+    if (work._halfMoves >= 100) return fiftyMoveScore(ply);
+    var inCheck = work.isCheck();
+    var moves = work._moves({ legal: false });
+    if (!inCheck) {
+      // Stalemate is not a position to "stand pat" in: no legal move at all is a draw.
+      var anyLegal = false;
+      for (var j = 0; j < moves.length && !anyLegal; j++) {
+        work._makeMove(moves[j]);
+        anyLegal = !work._isKingAttacked(moves[j].color);
+        work._undoMove();
+      }
+      if (!anyLegal) return 0;
+      var stand = staticEval();
+      if (stand >= beta) return stand;
+      if (stand > alpha) alpha = stand;
+      if (qLeft <= 0) return alpha;
+      moves = moves.filter(function(m) { return m.captured || m.promotion; });
+    }
+    sparSortMoves(moves);
+    var best = inCheck ? -SPAR_MATE : alpha, legal = 0;
+    for (var i = 0; i < moves.length; i++) {
+      work._makeMove(moves[i]);
+      if (work._isKingAttacked(moves[i].color)) { work._undoMove(); continue; }
+      legal++;
+      var v = -quiesce(-beta, -alpha, ply + 1, qLeft - 1, !!moves[i].captured);
+      work._undoMove();
+      if (v > best) best = v;
+      if (v > alpha) alpha = v;
+      if (alpha >= beta) break;
+    }
+    if (inCheck && !legal) return -SPAR_MATE + ply;
+    return best;
+  }
+
+  function negamax(depth, alpha, beta, ply, afterCapture) {
+    nodes++;
+    checkLimits();
+    if (afterCapture && work.isInsufficientMaterial()) return 0;
+    if (work._halfMoves >= 100) return fiftyMoveScore(ply);
+    if (depth <= 0) return quiesce(alpha, beta, ply, eng.qDepth, false);
+    var moves = sparSortMoves(work._moves({ legal: false }));
+    var best = -SPAR_MATE, legal = 0;
+    for (var i = 0; i < moves.length; i++) {
+      work._makeMove(moves[i]);
+      if (work._isKingAttacked(moves[i].color)) { work._undoMove(); continue; }
+      legal++;
+      var v = -negamax(depth - 1, -beta, -alpha, ply + 1, !!moves[i].captured);
+      work._undoMove();
+      if (v > best) best = v;
+      if (v > alpha) alpha = v;
+      if (alpha >= beta) break;
+    }
+    if (!legal) return work.isCheck() ? -SPAR_MATE + ply : 0;
+    return best;
+  }
+
+  // Memory terms for the root moves, known before the search so the root window can use them.
+  var mem = opts.memory || null;
+  var memTerms = {};
+  var memRecs = {};
+
+  // The legal root moves, ordered.
+  var rootMoves = [];
+  sparSortMoves(work._moves({ legal: false })).forEach(function(m) {
+    work._makeMove(m);
+    var illegal = work._isKingAttacked(m.color);
+    work._undoMove();
+    if (!illegal) {
+      rootMoves.push(m);
+      var u = sparInternalUci(m);
+      var rec = mem ? sparMemoryLookup(mem, rootFen, u) : null;
+      memRecs[u] = rec;
+      memTerms[u] = rec ? sparMemoryTerm(rec) : 0;
+    }
+  });
+  if (!rootMoves.length) return null;
+
+  // One full-width root pass: every move gets an exact score unless it falls below
+  // (best - window), where only "worse than the window" is known.
+  // The window is applied to memory-adjusted scores (a remembered loss can push a move down and
+  // let an alternative that was below the raw window win), so each move's floor accounts for its
+  // own memory term.
+  function searchRoot(depth, ordered) {
+    var results = [];
+    var best = -Infinity;
+    for (var i = 0; i < ordered.length; i++) {
+      var m = ordered[i];
+      var memTerm = memTerms[sparInternalUci(m)] || 0;
+      var floor = best === -Infinity || opts.exactAll ? -SPAR_MATE - 1 : best - params.window - memTerm;
+      work._makeMove(m);
+      var v = -negamax(depth - 1, -SPAR_MATE - 1, -floor, 1, !!m.captured);
+      work._undoMove();
+      var exact = v > floor;
+      results.push({ m: m, score: v, exact: exact });
+      if (exact && v + memTerm > best) best = v + memTerm;
+    }
+    return results;
+  }
+
+  var results = null, depthDone = 0, ordered = rootMoves;
+  for (var depth = 1; depth <= maxDepth; depth++) {
+    limited = depth > 1;  // depth 1 always completes, so a move always exists
+    var pass;
+    try { pass = searchRoot(depth, ordered); } catch (e) { if (e !== 'abort') throw e; break; }
+    results = pass;
+    depthDone = depth;
+    ordered = pass.slice().sort(function(a, b) { return b.score - a.score; }).map(function(r) { return r.m; });
+  }
+  results.forEach(function(r) { r.uci = sparInternalUci(r.m); r.san = sans[r.uci]; });
+
+  // Candidates: exact scores, plus the memory term.
+  var cands = results.filter(function(r) { return r.exact; }).map(function(r) {
+    var uci = r.uci;
+    var rec = memRecs[uci];
+    var memTerm = memTerms[uci];
+    var after = new Chess(rootFen);
+    after.move(r.san);
+    var terms = sparEvalTerms(after);
+    var sign = side === 'w' ? 1 : -1;
+    return {
+      san: r.san, uci: uci, score: r.score, memory: memTerm, total: r.score + memTerm,
+      static_terms_after_move: { material: sign * terms.material, pst: sign * terms.pst, bishop_pair: sign * terms.bishop_pair },
+      memory_record: rec ? { plays: rec.plays, w: rec.w, d: rec.d, l: rec.l, bad: rec.bad, good: rec.good } : null
+    };
+  });
+  cands.sort(function(a, b) { return b.total - a.total || (a.uci < b.uci ? -1 : 1); });
+  // Moves cut by the window: the search only proved them no better than score_at_most (before
+  // the memory term). A remembered loss can be the reason a move is here.
+  var pruned = results.filter(function(r) { return !r.exact; }).map(function(r) {
+    return { san: r.san, uci: r.uci, score_at_most: r.score, memory: memTerms[r.uci], memory_record: memRecs[r.uci] ? { plays: memRecs[r.uci].plays, l: memRecs[r.uci].l, bad: memRecs[r.uci].bad, good: memRecs[r.uci].good } : null };
+  });
+  var draw = sparMulberry32(typeof opts.seed === 'number' ? opts.seed : 1)();
+  var sel = sparSelect(cands, params.temperature, params.window, draw);
+  var chosen = sel.method === 'forced-mate' ? cands[0] : cands.filter(function(c) { return c.total >= cands[0].total - params.window; })[sel.index];
+  var searchBest = cands.reduce(function(m, c) { return Math.max(m, c.score); }, -Infinity);
+  var log = {
+    v: SPAR_CONFIG.logVersion, phase: 'engine', ply: opts.ply === undefined ? null : opts.ply,
+    fen: rootFen, side: side, san: chosen.san, uci: chosen.uci, seed: opts.seed,
+    engine: {
+      version: SPAR_CONFIG.version,
+      config: { strength: strength, maxDepth: maxDepth, nodeCap: nodeCap, capMs: capMs === Infinity ? null : capMs },
+      depth: depthDone, nodes: nodes, ms: nowFn() - started, node_cap_hit: aborted && !timeCap, time_cap_hit: timeCap,
+      chosen_score: chosen.score, best_score: searchBest, memory_term: chosen.memory,
+      candidates: cands,
+      pruned: pruned,
+      selection: { method: sel.method, temperature: params.temperature, window: params.window, draw: draw, p: sel.p, pool: sel.pool, chose_best: chosen === cands[0] }
+    }
+  };
+  return { san: chosen.san, uci: chosen.uci, log: log };
+}
+
+// Replays the selection from a logged engine entry: the candidates, temperature, window and
+// draw must reproduce the logged move. Returns the uci the log implies.
+function sparReplaySelection(entry) {
+  var e = entry.engine;
+  var cands = e.candidates.map(function(c) { return { uci: c.uci, total: c.total }; });
+  var sel = sparSelect(cands, e.selection.temperature, e.selection.window, e.selection.draw);
+  if (sel.method === 'forced-mate') return cands[0].uci;
+  return cands.filter(function(c) { return c.total >= cands[0].total - e.selection.window; })[sel.index].uci;
+}
+
+/* ---------- Memory (JSON; see the design doc) ---------- */
+
+function sparMemoryNew() { return { v: 1, positions: {}, games: [] }; }
+
+function sparMemoryLookup(mem, fen, uci) {
+  var pos = mem && mem.positions && mem.positions[sparPositionKey(fen)];
+  return (pos && pos.moves && pos.moves[uci]) || null;
+}
+
+// Centipawns added to a candidate: a bad record (blame) lowers it, a good one raises it a little.
+function sparMemoryTerm(rec) {
+  var cfg = SPAR_CONFIG.memory;
+  var raw = (rec.good - rec.bad) * cfg.perBlame;
+  return Math.round(Math.max(-cfg.maxPenalty, Math.min(cfg.maxBonus, raw)));
+}
+
+// Record a finished game. game: { id, seed, result: 'win'|'loss'|'draw' (the engine's), ts,
+// moves: [{ fen, uci, predicted }] for the engine's own moves in order, endScore: the engine's
+// score of the final position (-SPAR_MATE when it was mated) }.
+// Blame goes to the move after which the engine's own search score fell furthest.
+function sparMemoryRecordGame(mem, game) {
+  var cfg = SPAR_CONFIG.memory;
+  var moves = game.moves;
+  var drops = moves.map(function(m, i) {
+    var next = i + 1 < moves.length ? moves[i + 1].best : game.endScore;
+    return typeof next === 'number' && typeof m.predicted === 'number' ? Math.max(0, m.predicted - next) : 0;
+  });
+  var blame = drops.map(function(d) { return Math.min(1, d / cfg.lossScale); });
+  if (game.result === 'loss' && moves.length) {
+    var worst = 0;
+    drops.forEach(function(d, i) { if (d > drops[worst]) worst = i; });
+    var sum = blame.reduce(function(a, b) { return a + b; }, 0);
+    if (sum < 0.5) blame[worst] += 0.5 - sum;  // a loss always blames something
+  }
+  moves.forEach(function(m, i) {
+    var key = sparPositionKey(m.fen);
+    var pos = mem.positions[key] || (mem.positions[key] = { moves: {} });
+    var rec = pos.moves[m.uci] || (pos.moves[m.uci] = { plays: 0, w: 0, d: 0, l: 0, bad: 0, good: 0, last: null, ts: 0 });
+    rec.plays++;
+    if (game.result === 'win') { rec.w++; rec.good = Math.round((rec.good + cfg.winCredit) * 1000) / 1000; }
+    else if (game.result === 'loss') { rec.l++; rec.bad = Math.round((rec.bad + blame[i]) * 1000) / 1000; }
+    else rec.d++;
+    rec.last = game.id;
+    rec.ts = game.ts || 0;
+  });
+  mem.games.push({ id: game.id, result: game.result, seed: game.seed, ts: game.ts || 0, engine: SPAR_CONFIG.version, engine_moves: moves.length });
+  sparMemoryPrune(mem);
+  return mem;
+}
+
+function sparMemoryPrune(mem) {
+  var cfg = SPAR_CONFIG.memory;
+  if (mem.games.length > cfg.maxGames) mem.games = mem.games.slice(mem.games.length - cfg.maxGames);
+  var keys = Object.keys(mem.positions);
+  if (keys.length > cfg.maxPositions) {
+    var newest = function(k) { var ms = mem.positions[k].moves; return Math.max.apply(null, Object.keys(ms).map(function(u) { return ms[u].ts || 0; })); };
+    keys.sort(function(a, b) { return newest(b) - newest(a); });
+    keys.slice(cfg.maxPositions).forEach(function(k) { delete mem.positions[k]; });
+  }
+  return mem;
+}
+
+// Parse and validate stored or imported memory text; null when it is not usable.
+function sparMemoryParse(text) {
+  var data;
+  try { data = JSON.parse(text); } catch (e) { return null; }
+  if (!data || data.v !== 1 || typeof data.positions !== 'object' || !data.positions || Array.isArray(data.positions) || !Array.isArray(data.games)) return null;
+  var out = sparMemoryNew();
+  Object.keys(data.positions).forEach(function(key) {
+    var moves = data.positions[key] && data.positions[key].moves;
+    if (!moves || typeof moves !== 'object' || typeof key !== 'string' || key.length > 100) return;
+    var clean = {};
+    Object.keys(moves).forEach(function(uci) {
+      var r = moves[uci];
+      if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(uci) || !r) return;
+      var num = function(x) { return typeof x === 'number' && isFinite(x) && x >= 0 && x <= 100000 ? x : 0; };
+      var stamp = function(x) { return typeof x === 'number' && isFinite(x) && x >= 0 && x <= 8.64e15 ? x : 0; };  // a Date.now() value
+      clean[uci] = { plays: num(r.plays), w: num(r.w), d: num(r.d), l: num(r.l), bad: num(r.bad), good: num(r.good), last: typeof r.last === 'string' ? r.last.slice(0, 40) : null, ts: stamp(r.ts) };
+    });
+    if (Object.keys(clean).length) out.positions[key] = { moves: clean };
+  });
+  data.games.slice(-SPAR_CONFIG.memory.maxGames).forEach(function(g) {
+    if (g && typeof g.id === 'string' && ['win', 'loss', 'draw'].indexOf(g.result) !== -1) {
+      out.games.push({ id: g.id.slice(0, 40), result: g.result, seed: typeof g.seed === 'number' && isFinite(g.seed) ? g.seed : 0, ts: typeof g.ts === 'number' && isFinite(g.ts) && g.ts >= 0 && g.ts <= 8.64e15 ? g.ts : 0, engine: typeof g.engine === 'string' ? g.engine.slice(0, 40) : '', engine_moves: typeof g.engine_moves === 'number' ? g.engine_moves : 0 });
+    }
+  });
+  return sparMemoryPrune(out);
+}
+
+// The game result from the engine's point of view once the game is over, else null.
+function sparGameResult(chess, engineColor, plyCount) {
+  if (chess.isCheckmate()) return chess.turn() === engineColor ? 'loss' : 'win';
+  if (chess.isGameOver()) return 'draw';
+  return plyCount >= SPAR_CONFIG.maxPlies ? 'draw' : null;
+}
+/* TASK_1918_SPAR_END */
 
 /* TASK_1057_FAVORITE_EVENTS_START - pure; the board writes these events, the coach reviews them. */
 // #1057: describe a favorite being added, switched to or revived at a position. Returns the
@@ -5431,6 +5907,7 @@ function trainOpponentMoveEndsLine(t, san, gapPending) {
 function trainStep() {
   var t = train;
   if (!t) return;
+  if (t.spar) return sparStep(t);  // #1918: a spar game is not graded
   clearTimeout(t.hintTimer);
   t.hintSquare = null;
   var plies = game.history().length - t.rootPly;
@@ -5532,6 +6009,7 @@ function trainEndLine(message) {
   t.stats.lines++;
   t.lineId++;
   trainSaveRating(t);  // #1145: flush the line's rated moves, if any
+  if (sparBegin(t, message)) return;  // #1918: play on against the spar opponent instead of moving on
   t.busy = true;
   clearTimeout(t.hintTimer);
   t.hintSquare = null;
@@ -5539,17 +6017,255 @@ function trainEndLine(message) {
   var lineId = t.lineId;
   t.lineTimer = setTimeout(function() {
     if (train !== t || t.lineId !== lineId) return;
-    while (game.history().length > t.rootPly) game.undo();
-    t.gapPending = false;
-    t.changeEndPly = 0;  // #830b: the post-change allowance belongs to the line that made the change
-    trainChooseTarget(t);
-    if (!t.target && trainShowNextStep(t)) return;  // #1144: nothing actionable left - ask what next (busy stays on)
-    t.busy = false;
-    viewPly = game.history().length;
-    render();
-    trainStep();
+    trainNextLine(t);
   }, TRAIN_CONFIG.lineEndPauseMs);
 }
+
+// Back to the root and on to the next line (after trainEndLine's pause, or a finished spar game).
+function trainNextLine(t) {
+  while (game.history().length > t.rootPly) game.undo();
+  t.gapPending = false;
+  t.changeEndPly = 0;  // #830b: the post-change allowance belongs to the line that made the change
+  trainChooseTarget(t);
+  if (!t.target && trainShowNextStep(t)) return;  // #1144: nothing actionable left - ask what next (busy stays on)
+  t.busy = false;
+  viewPly = game.history().length;
+  render();
+  trainStep();
+}
+
+/*
+  #1918 Spar mode: the session. The pure rules and the engine are in the TASK_1918_SPAR block.
+  When a Train line ends (and the game is not over) the same private game goes on: you play
+  your side freely, the opponent plays Explorer-weighted moves while the Explorer has at least
+  SPAR_CONFIG.minGames games, then agent-chess. Nothing a spar game does touches the
+  repertoire, the cards, the rating or the hints: sparOnUserMove and sparStep never reach
+  that code. Settings are local to this browser in iteration 1 (the toggle and the memory).
+*/
+var SPAR_MODE_KEY = 'chessPrepBoard.sparMode';
+var SPAR_MEMORY_KEY = 'chessPrepBoard.sparMemory.v1';
+var sparToggleEl = document.getElementById('sparToggle');
+var sparLogBtn = document.getElementById('sparLogBtn');
+var sparStatusEl = document.getElementById('sparStatus');
+var sparMemory = null;
+var sparLastGame = null;  // the last finished spar game, for the download
+
+var sparEnabledNow = null;  // the choice made this session, kept even when storage is blocked
+
+function sparEnabled() {
+  if (sparEnabledNow !== null) return sparEnabledNow;
+  try {
+    var v = localStorage.getItem(SPAR_MODE_KEY);
+    if (v === '0') return false;
+    if (v === '1') return true;
+  } catch (e) { /* storage blocked: the default */ }
+  return SPAR_CONFIG.defaultOn;
+}
+
+function sparStatus(text) { if (sparStatusEl) sparStatusEl.textContent = text || ''; }
+
+function sparLoadMemory() {
+  if (sparMemory) return sparMemory;
+  var text = null;
+  try { text = localStorage.getItem(SPAR_MEMORY_KEY); } catch (e) { /* none */ }
+  sparMemory = (text && sparMemoryParse(text)) || sparMemoryNew();
+  return sparMemory;
+}
+
+function sparSaveMemory() {
+  try { localStorage.setItem(SPAR_MEMORY_KEY, JSON.stringify(sparMemory)); }
+  catch (e) { sparStatus('Could not save agent-chess memory in this browser.'); }
+}
+
+function sparDownload(filename, text) {
+  var url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+  var a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
+}
+
+if (sparToggleEl) {
+  sparToggleEl.checked = sparEnabled();
+  sparToggleEl.onchange = function() {
+    sparEnabledNow = !!sparToggleEl.checked;
+    try { localStorage.setItem(SPAR_MODE_KEY, sparToggleEl.checked ? '1' : '0'); } catch (e) { /* session only */ }
+  };
+}
+if (sparLogBtn) sparLogBtn.onclick = function() {
+  if (sparLastGame) sparDownload('spar-' + sparLastGame.id + '.json', JSON.stringify(sparLastGame, null, 1));
+};
+document.getElementById('sparMemExportBtn').onclick = function() {
+  sparDownload('agent-chess-memory.json', JSON.stringify(sparLoadMemory(), null, 1));
+};
+document.getElementById('sparMemResetBtn').onclick = function() {
+  sparMemory = sparMemoryNew();
+  sparSaveMemory();
+  sparStatus('agent-chess memory cleared.');
+};
+document.getElementById('sparMemImportBtn').onclick = function() { document.getElementById('sparMemImportFile').click(); };
+document.getElementById('sparMemImportFile').onchange = function(ev) {
+  var file = ev.target.files && ev.target.files[0];
+  ev.target.value = '';
+  if (!file) return;
+  if (file.size > 5 * 1024 * 1024) { sparStatus('That memory file is too large.'); return; }
+  var reader = new FileReader();
+  reader.onload = function() {
+    var parsed = sparMemoryParse(String(reader.result));
+    if (!parsed) { sparStatus('That is not an agent-chess memory file; nothing changed.'); return; }
+    sparMemory = parsed;
+    sparSaveMemory();
+    sparStatus('Imported memory: ' + parsed.games.length + ' games, ' + Object.keys(parsed.positions).length + ' positions.');
+  };
+  reader.readAsText(file);
+};
+
+// Called when a Train line ends. True when a spar game took over.
+function sparBegin(t, message) {
+  if (t.spar || !sparEnabled() || game.isGameOver()) return false;
+  var seed = Math.floor(Math.random() * 4294967296) >>> 0;
+  t.spar = {
+    id: Date.now().toString(36) + '-' + seed.toString(36),
+    seed: seed,
+    startPly: game.history().length,
+    startFen: game.fen(),
+    engineColor: t.color === 'w' ? 'b' : 'w',
+    phase: 'explorer',
+    handoff: null,
+    log: [],
+    engineMoves: [],
+    memory: sparLoadMemory()
+  };
+  clearTimeout(t.hintTimer);
+  t.hintSquare = null;
+  t.bestMove = null;
+  sparStatus('');
+  if (sparLogBtn) sparLogBtn.style.display = 'none';
+  setTrainMessage(message + ' Spar mode: play on.');
+  sparStep(t);
+  return true;
+}
+
+function sparStep(t) {
+  var sp = t.spar;
+  if (!sp || train !== t) return;
+  var result = sparGameResult(game, sp.engineColor, game.history().length - sp.startPly);
+  if (result) return sparFinish(t, result);
+  if (game.turn() === t.color) {
+    t.busy = false;  // your move: unlock the pieces
+    setTrainMessage('Spar: your move.');
+    return;
+  }
+  t.busy = true;
+  setTrainMessage('Spar: opponent to move...');
+  sparOpponentMove(t, t.lineId);
+}
+
+function sparOnUserMove(t, from, to) {
+  try { game.move({ from: from, to: to, promotion: 'q' }); }
+  catch (error) { return false; }
+  hideRepertoireNotice();
+  viewPly = game.history().length;
+  render();
+  sparStep(t);
+  return true;
+}
+
+async function sparOpponentMove(t, lineId) {
+  var sp = t.spar;
+  var started = Date.now();
+  var ply = game.history().length;
+  var fen = game.fen();
+  var seed = sparMoveSeed(sp.seed, ply);
+  var entry = null;
+  var legalSans = game.moves();
+  if (sp.phase === 'explorer') {
+    var key = explorerPositionKey(fen);
+    if (!explorerLookup(key) && !explorerBlocked(key)) {
+      // Like the trainer's opponent: a slow Explorer must not stall the game. Past explorerWaitMs
+      // the fetch keeps going (and fills the cache) while this move is the engine's.
+      var waitTimer;
+      await Promise.race([
+        fetchExplorerStats(key),
+        new Promise(function(resolve) { waitTimer = setTimeout(resolve, TRAIN_CONFIG.explorerWaitMs); })
+      ]);
+      clearTimeout(waitTimer);
+    }
+    if (train !== t || t.lineId !== lineId) return;
+    var stats = explorerLookup(key) || null;
+    var choice = sparExplorerChoices(legalSans, stats, SPAR_CONFIG.minGames);
+    if (choice.handoff) {
+      sp.phase = 'engine';  // one way: the Explorer is not asked again this game
+      sp.handoff = { from: 'explorer', reason: choice.handoff, ply: ply, total: choice.total === undefined ? null : choice.total, min_games: SPAR_CONFIG.minGames };
+    } else {
+      var draw = sparMulberry32(seed)();
+      var pick = sparExplorerPick(choice, draw);
+      var probe = new Chess(fen);
+      var mv = probe.move(pick.san);
+      entry = {
+        v: SPAR_CONFIG.logVersion, phase: 'explorer', ply: ply, fen: fen, side: game.turn(), san: pick.san,
+        uci: mv.from + mv.to + (mv.promotion || ''), seed: seed, draw: draw,
+        explorer: { total: choice.total, min_games: SPAR_CONFIG.minGames, p: pick.p, moves: choice.moves.slice(0, 12) }
+      };
+    }
+  }
+  if (!entry) {
+    // Let "opponent to move" paint before the search blocks the page.
+    await new Promise(function(resolve) { setTimeout(resolve, 30); });
+    if (train !== t || t.lineId !== lineId) return;
+    var r = agentChessMove(game, { strength: SPAR_CONFIG.strength, seed: seed, memory: sp.memory, ply: ply });
+    if (!r) return sparFinish(t, sparGameResult(game, sp.engineColor, SPAR_CONFIG.maxPlies) || 'draw');
+    entry = r.log;
+    if (sp.handoff && !sp.handoffLogged) { entry.handoff = sp.handoff; sp.handoffLogged = true; }
+    sp.engineMoves.push({ fen: fen, uci: r.uci, predicted: entry.engine.chosen_score, best: entry.engine.best_score });
+  }
+  sp.log.push(entry);
+  var wait = Math.max(0, SPAR_CONFIG.moveDelayMs - (Date.now() - started));
+  t.opponentTimer = setTimeout(function() {
+    if (train !== t || t.lineId !== lineId) return;
+    playAnimatedMove(entry.san);
+    viewPly = game.history().length;
+    render();
+    sparStep(t);
+  }, wait);
+}
+
+function sparResultText(result, engineColor, t) {
+  if (result === 'draw') return 'Spar over: draw.';
+  var youWon = (result === 'loss');  // the engine's loss is your win
+  return 'Spar over: ' + (youWon ? 'you win' : 'agent-chess wins') + (game.isCheckmate() ? ' by checkmate.' : '.');
+}
+
+function sparFinish(t, result) {
+  var sp = t.spar;
+  if (!sp || sp.ended) return;
+  sp.ended = true;
+  t.lineId++;
+  clearTimeout(t.opponentTimer);
+  var endScore = result === 'win' ? 1000 : result === 'loss' ? -1000 : 0;
+  var mem = sparLoadMemory();
+  var moves = sp.engineMoves.map(function(m) { return { fen: m.fen, uci: m.uci, predicted: m.predicted, best: m.best }; });
+  sparMemoryRecordGame(mem, { id: sp.id, seed: sp.seed, result: result, ts: Date.now(), moves: moves, endScore: endScore });
+  sparSaveMemory();
+  sparLastGame = {
+    v: SPAR_CONFIG.logVersion, id: sp.id, seed: sp.seed, engine: SPAR_CONFIG.version, engine_color: sp.engineColor,
+    result_for_engine: result, start_fen: sp.startFen, handoff: sp.handoff, pgn: game.pgn(), moves: sp.log
+  };
+  if (sparLogBtn) sparLogBtn.style.display = '';
+  sparStatus('Memory: ' + mem.games.length + ' games.');
+  t.busy = true;
+  setTrainMessage(sparResultText(result, sp.engineColor, t) + ' Next line...');
+  var lineId = t.lineId;
+  t.lineTimer = setTimeout(function() {
+    if (train !== t || t.lineId !== lineId) return;
+    t.spar = null;
+    trainNextLine(t);
+  }, 2500);
+}
+
 
 /*
   #1144: when a line ends and nothing actionable is due for the side being trained,
@@ -5776,6 +6492,7 @@ function trainOnUserMove(from, to) {
   var t = train;
   if (t.busy || game.turn() !== t.color) return false;
   if (!game.moves({ square: from, verbose: true }).some(function(m) { return m.to === to; })) return false;
+  if (t.spar) return sparOnUserMove(t, from, to);  // #1918: before any grading, recording or hinting
   t.bestMove = null;
   var keyBefore = samePositionKey(game);
   var favorites = repertoireFavorites(repertoireData, keyBefore);
