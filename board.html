@@ -142,7 +142,7 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 </div>
 </div>
 <div id="sidePanel">
-<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="sparRow" style="margin-top:6px; font-size:12px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;"><label style="display:flex; gap:4px; align-items:center;" title="After a line ends, play on against Lichess-Explorer-weighted moves, then against agent-chess."><input type="checkbox" id="sparToggle"> Spar after each line</label><button id="sparLogBtn" type="button" style="display:none;" title="Download the last spar game: PGN plus the per-move explanation log (JSON).">Game log</button><button id="sparPgnBtn" type="button" style="display:none;" title="Copy the last spar game as PGN.">Copy PGN</button><button id="sparLichessBtn" type="button" style="display:none;" title="Open the last spar game in Lichess analysis (sends its PGN to lichess.org).">Open in Lichess</button><button id="sparMemExportBtn" type="button" title="Download agent-chess memory (JSON).">Export memory</button><button id="sparMemImportBtn" type="button" title="Replace agent-chess memory from a JSON file.">Import memory</button><button id="sparMemResetBtn" type="button" title="Forget everything agent-chess has learned.">Reset memory</button><input type="file" id="sparMemImportFile" accept="application/json,.json" style="display:none;"><span id="sparStatus" style="color:var(--text-secondary, #aaa);"></span></div><div id="trainNextStep" style="display:none; margin-top:6px;"><div id="trainNextStepText"></div><div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px;"><button id="trainMoreBtn" type="button"></button><button id="trainSwitchBtn" type="button">Switch color</button><button id="trainKeepBtn" type="button">Keep re-training</button></div></div></div>
+<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="sparRow" style="margin-top:6px; font-size:12px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;"><label style="display:flex; gap:4px; align-items:center;" title="After a line ends, play on against Lichess-Explorer-weighted moves, then against agent-chess."><input type="checkbox" id="sparToggle"> Spar after each line</label><button id="sparResignBtn" type="button" style="display:none;" title="Resign the spar game in progress (click twice to confirm). It counts as a win for agent-chess.">Resign</button><button id="sparLogBtn" type="button" style="display:none;" title="Download the last spar game: PGN plus the per-move explanation log (JSON).">Game log</button><button id="sparPgnBtn" type="button" style="display:none;" title="Copy the last spar game as PGN.">Copy PGN</button><button id="sparLichessBtn" type="button" style="display:none;" title="Open the last spar game in Lichess analysis (sends its PGN to lichess.org).">Open in Lichess</button><button id="sparMemExportBtn" type="button" title="Download agent-chess memory (JSON).">Export memory</button><button id="sparMemImportBtn" type="button" title="Replace agent-chess memory from a JSON file.">Import memory</button><button id="sparMemResetBtn" type="button" title="Forget everything agent-chess has learned.">Reset memory</button><input type="file" id="sparMemImportFile" accept="application/json,.json" style="display:none;"><span id="sparStatus" style="color:var(--text-secondary, #aaa);"></span></div><div id="trainNextStep" style="display:none; margin-top:6px;"><div id="trainNextStepText"></div><div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px;"><button id="trainMoreBtn" type="button"></button><button id="trainSwitchBtn" type="button">Switch color</button><button id="trainKeepBtn" type="button">Keep re-training</button></div></div></div>
 <section id="movesCard" class="panelCard">
 <div id="movesHeader">
 <div style="display:flex; align-items:baseline; gap:10px; min-width:0;"><span class="paneTitle">Moves</span>
@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "206e960 \u00b7 2026-11-15 23:01 UTC";
+var BOARD_BUILD = "ebd548c \u00b7 2026-11-15 23:41 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1735,6 +1735,9 @@ var SPAR_CONFIG = {
   // verified one ply deeper before it is played (verifyMargin), and dropped if that refutes it.
   engine: { maxDepth: 8, capMs: 400, qDepth: 6, checkExtPly: 12, ttMax: 200000, deltaMargin: 200, lmrAfter: 4, rootWindow: 150, epsilon: 10, verifyMargin: 40, verifyShare: 0.7, verifyRounds: 4 },
   memory: { maxGames: 200, maxPositions: 4000, perBlame: 80, maxBonus: 60, maxPenalty: 400, winCredit: 0.15, lossScale: 300 },
+  // The engine gives up (no more playing on) once its own search says it is this far behind on this many of its moves in a row
+  // (Michael, 2026-11-15: 3 moves at -500 cp or worse). Scores are from the engine's side; being mated counts.
+  resign: { cp: -500, moves: 3 },
   logRing: 400
 };
 var SPAR_MATE = 30000;
@@ -2382,6 +2385,7 @@ function sparHeaderedPgn(g, playerName, date) {
     c.setHeader('White', engineWhite ? g.engine : name);
     c.setHeader('Black', engineWhite ? name : g.engine);
     c.setHeader('Result', result);
+    if (g.resigned) c.setHeader('Termination', 'resignation');
     c.setHeader('SparGame', String(g.id));
     return c.pgn();
   } catch (e) { return g.pgn; }
@@ -6060,6 +6064,7 @@ function stopTraining(message, uidOverride) {
   clearTimeout(t.hintTimer);
   clearTimeout(t.opponentTimer);
   clearTimeout(t.lineTimer);
+  sparSyncResign();
   baseFen = t.saved.baseFen;
   game = new Chess(normalizeFen(baseFen));
   t.saved.history.forEach(function(san) { game.move(san); });
@@ -6310,6 +6315,43 @@ function sparPgnDate() {
   return d.getFullYear() + '.' + two(d.getMonth() + 1) + '.' + two(d.getDate());
 }
 function sparShownPgn() { return sparHeaderedPgn(sparLastGame, sparPlayerName(), sparPgnDate()); }
+// Resign: visible only while a spar game is in progress; the first click arms it (4 s), the second resigns.
+var sparResignTimer = null;
+function sparSyncResign() {
+  var el = document.getElementById('sparResignBtn');
+  if (!el) return;
+  var live = !!(train && train.spar && !train.spar.ended);
+  el.style.display = live ? '' : 'none';
+  if (!live) sparResignDisarm();
+}
+function sparResignDisarm() {
+  clearTimeout(sparResignTimer);
+  sparResignTimer = null;
+  var el = document.getElementById('sparResignBtn');
+  if (el) el.textContent = 'Resign';
+}
+function sparResign() {
+  var t = train;
+  if (!t || !t.spar || t.spar.ended) return false;
+  var sp = t.spar;
+  // An engine move that was computed but not yet played (the short think delay) must not stay in the log.
+  var n = game.history().length;
+  sp.log = sp.log.filter(function(e) { return e.ply < n; });
+  if (sp.engineMoves.length && sp.engineMoves[sp.engineMoves.length - 1].fen === game.fen()) sp.engineMoves.pop();
+  sp.resignedBy = 'player';
+  sparFinish(t, 'win');  // the engine's win
+  return true;
+}
+var sparResignBtn = document.getElementById('sparResignBtn');
+if (sparResignBtn) sparResignBtn.onclick = function() {
+  if (sparResignTimer === null) {
+    sparResignBtn.textContent = 'Confirm resign?';
+    sparResignTimer = setTimeout(sparResignDisarm, 4000);
+    return;
+  }
+  sparResignDisarm();
+  sparResign();
+};
 function sparShowGameButtons(show) {
   ['sparLogBtn', 'sparPgnBtn', 'sparLichessBtn'].forEach(function(id) {
     var el = document.getElementById(id);
@@ -6394,6 +6436,7 @@ function sparBegin(t, message) {
   t.bestMove = null;
   sparStatus('');
   sparShowGameButtons(false);
+  sparSyncResign();
   setTrainMessage(message + ' Spar mode: play on.');
   sparStep(t);
   return true;
@@ -6468,6 +6511,14 @@ async function sparOpponentMove(t, lineId) {
     if (train !== t || t.lineId !== lineId) return;
     var r = agentChessMove(game, { strength: SPAR_CONFIG.strength, seed: seed, memory: sp.memory, ply: ply });
     if (!r) return sparFinish(t, sparGameResult(game, sp.engineColor, SPAR_CONFIG.maxPlies) || 'draw');
+    // Auto-resign: this move's search score is the engine's own verdict. Three in a row at or below the line and it stops
+    // playing on instead of waiting to be mated. The move it just found is not played.
+    var rcfg = SPAR_CONFIG.resign;
+    sp.behind = r.log.engine.chosen_score <= rcfg.cp ? (sp.behind || 0) + 1 : 0;
+    if (sp.behind >= rcfg.moves) {
+      sp.resignedBy = 'engine';
+      return sparFinish(t, 'loss');
+    }
     entry = r.log;
     if (sp.handoff && !sp.handoffLogged) { entry.handoff = sp.handoff; sp.handoffLogged = true; }
     sp.engineMoves.push({ fen: fen, uci: r.uci, predicted: entry.engine.chosen_score, best: entry.engine.best_score });
@@ -6529,13 +6580,14 @@ function sparFinish(t, result) {
   sparSaveMemory();
   sparLastGame = {
     v: SPAR_CONFIG.logVersion, id: sp.id, seed: sp.seed, engine: SPAR_CONFIG.version, engine_color: sp.engineColor,
-    result_for_engine: result, start_fen: sp.startFen, handoff: sp.handoff, pgn: game.pgn(), moves: sp.log
+    result_for_engine: result, start_fen: sp.startFen, handoff: sp.handoff, pgn: game.pgn(), moves: sp.log, resigned: !!sp.resignedBy, resigned_by: sp.resignedBy || null
   };
   sparShowGameButtons(true);
+  sparSyncResign();
   sparStatus('Memory: ' + mem.games.length + ' games.');
   sparUploadGame(sparLastGame);
   t.busy = true;
-  setTrainMessage(sparResultText(result, sp.engineColor, t) + ' Next line...');
+  setTrainMessage((sp.resignedBy === 'player' ? 'Spar over: you resigned; agent-chess wins.' : sp.resignedBy === 'engine' ? 'Spar over: agent-chess resigns; you win.' : sparResultText(result, sp.engineColor, t)) + ' Next line...');
   var lineId = t.lineId;
   t.lineTimer = setTimeout(function() {
     if (train !== t || t.lineId !== lineId) return;
