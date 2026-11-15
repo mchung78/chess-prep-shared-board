@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "81d7f02 \u00b7 2026-11-15 20:14 UTC";
+var BOARD_BUILD = "fdb8ab9 \u00b7 2026-11-15 20:59 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -6323,6 +6323,33 @@ function sparResultText(result, engineColor, t) {
   return 'Spar over: ' + (youWon ? 'you win' : 'agent-chess wins') + (game.isCheckmate() ? ' by checkmate.' : '.');
 }
 
+/*
+  TASK_1918b: share the finished game with the Worker (D1) so agents can read it through MCP tools instead of an uploaded file.
+  Signed-in players only (the same Firebase ID token /explorer uses); a failure never blocks the game, and the local Game-log
+  download stays. The upload is a slimmed copy (top candidates and a few pruned moves per move) to stay under the Worker's body limit.
+*/
+var SPAR_UPLOAD_URL = 'https://mint-claude-agent-token.chess-prep.workers.dev/spar-games';
+var SPAR_UPLOAD_MAX_BYTES = 380000;
+function sparSlimGame(g) {
+  return Object.assign({}, g, { moves: g.moves.map(function(m) {
+    if (!m.engine) return m;
+    var e = Object.assign({}, m.engine);
+    e.candidates = (e.candidates || []).slice(0, 8);
+    e.pruned = (e.pruned || []).slice(0, 8);
+    return Object.assign({}, m, { engine: e });
+  }) });
+}
+async function sparUploadGame(g) {
+  try {
+    var auth = await explorerAuthHeader();
+    if (!auth.Authorization) return;  // not signed in: the local download is the only copy
+    var body = JSON.stringify(sparSlimGame(g));
+    if (body.length > SPAR_UPLOAD_MAX_BYTES) { sparStatus('Game log too large to upload; use Game log.'); return; }
+    var response = await fetch(SPAR_UPLOAD_URL, { method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, auth), body: body });
+    sparStatus(response.ok ? 'Game log saved to your account.' : 'Game log not uploaded (' + response.status + '); use Game log.');
+  } catch (e) { sparStatus('Game log not uploaded; use Game log.'); }
+}
+
 function sparFinish(t, result) {
   var sp = t.spar;
   if (!sp || sp.ended) return;
@@ -6340,6 +6367,7 @@ function sparFinish(t, result) {
   };
   if (sparLogBtn) sparLogBtn.style.display = '';
   sparStatus('Memory: ' + mem.games.length + ' games.');
+  sparUploadGame(sparLastGame);
   t.busy = true;
   setTrainMessage(sparResultText(result, sp.engineColor, t) + ' Next line...');
   var lineId = t.lineId;
