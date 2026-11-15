@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "60fe723 \u00b7 2026-11-15 22:57 UTC";
+var BOARD_BUILD = "206e960 \u00b7 2026-11-15 23:01 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -2364,6 +2364,29 @@ function sparMemoryParse(text) {
 }
 
 // The game result from the engine's point of view once the game is over, else null.
+// The finished game's PGN with player headers, for Copy PGN, Open in Lichess and the downloaded log: the player's name, the engine's
+// id and version, the date, the result and the spar game id. Rebuilt from the moves, so the caller's PGN is not modified. The uploaded
+// copy stays the plain game (the Worker keeps no headers), so the player's name is not sent anywhere.
+function sparHeaderedPgn(g, playerName, date) {
+  try {
+    var c = new Chess();
+    c.loadPgn(g.pgn);
+    var name = String(playerName || '').replace(/["\\\[\]\r\n]/g, '').trim().slice(0, 40) || 'Player';
+    var engineWhite = g.engine_color === 'w';
+    var engineWon = g.result_for_engine === 'win';
+    var result = g.result_for_engine === 'draw' ? '1/2-1/2' : (engineWon === engineWhite ? '1-0' : '0-1');
+    c.setHeader('Event', 'Spar vs agent-chess');
+    c.setHeader('Site', 'chess-prep board');
+    c.setHeader('Date', date || '????.??.??');
+    c.setHeader('Round', '-');
+    c.setHeader('White', engineWhite ? g.engine : name);
+    c.setHeader('Black', engineWhite ? name : g.engine);
+    c.setHeader('Result', result);
+    c.setHeader('SparGame', String(g.id));
+    return c.pgn();
+  } catch (e) { return g.pgn; }
+}
+
 function sparGameResult(chess, engineColor, plyCount) {
   if (chess.isCheckmate()) return chess.turn() === engineColor ? 'loss' : 'win';
   if (chess.isGameOver()) return 'draw';
@@ -6278,6 +6301,15 @@ if (sparToggleEl) {
     try { localStorage.setItem(SPAR_MODE_KEY, sparToggleEl.checked ? '1' : '0'); } catch (e) { /* session only */ }
   };
 }
+function sparPlayerName() {
+  try { return currentUser && currentUser.displayName ? String(currentUser.displayName) : ''; } catch (e) { return ''; }
+}
+function sparPgnDate() {
+  var d = new Date();
+  var two = function(n) { return (n < 10 ? '0' : '') + n; };
+  return d.getFullYear() + '.' + two(d.getMonth() + 1) + '.' + two(d.getDate());
+}
+function sparShownPgn() { return sparHeaderedPgn(sparLastGame, sparPlayerName(), sparPgnDate()); }
 function sparShowGameButtons(show) {
   ['sparLogBtn', 'sparPgnBtn', 'sparLichessBtn'].forEach(function(id) {
     var el = document.getElementById(id);
@@ -6286,11 +6318,11 @@ function sparShowGameButtons(show) {
 }
 // The download is compact and keeps the top candidates per move (sparSlimGame): about a third of the full pretty-printed log.
 if (sparLogBtn) sparLogBtn.onclick = function() {
-  if (sparLastGame) sparDownload('spar-' + sparLastGame.id + '.json', JSON.stringify(sparSlimGame(sparLastGame)));
+  if (sparLastGame) sparDownload('spar-' + sparLastGame.id + '.json', JSON.stringify(Object.assign(sparSlimGame(sparLastGame), { pgn: sparShownPgn() })));
 };
 document.getElementById('sparPgnBtn').onclick = function() {
   if (!sparLastGame) return;
-  var text = sparLastGame.pgn;
+  var text = sparShownPgn();
   var done = function(ok) { sparStatus(ok ? 'PGN copied.' : 'Could not copy; use Game log.'); };
   var fallback = function() {
     var ta = document.createElement('textarea');
@@ -6310,7 +6342,7 @@ document.getElementById('sparLichessBtn').onclick = function() {
   var form = document.createElement('form');
   form.method = 'POST'; form.action = 'https://lichess.org/import'; form.target = '_blank'; form.rel = 'noopener';
   var field = document.createElement('input');
-  field.type = 'hidden'; field.name = 'pgn'; field.value = sparLastGame.pgn;
+  field.type = 'hidden'; field.name = 'pgn'; field.value = sparShownPgn();
   form.appendChild(field);
   document.body.appendChild(form);
   form.submit();
