@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "b914f08 \u00b7 2026-11-15 22:34 UTC";
+var BOARD_BUILD = "60fe723 \u00b7 2026-11-15 22:57 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1740,6 +1740,10 @@ var SPAR_CONFIG = {
 var SPAR_MATE = 30000;
 
 var SPAR_VALUE = { p: 100, n: 320, b: 330, r: 500, q: 900, k: 0 };
+// The same values indexed by the piece letter's char code: an array load with a small integer is monomorphic and fast, where a
+// string-keyed lookup on the hot path (eval, move ordering) was megamorphic (profile, iteration 4).
+var SPAR_VALUE_C = [];
+(function() { for (var t in SPAR_VALUE) SPAR_VALUE_C[t.charCodeAt(0)] = SPAR_VALUE[t]; })()
 // Piece-square tables from White's side, a8..h1 (the order chess.js board() returns).
 var SPAR_PST = {
   p: [0,0,0,0,0,0,0,0, 50,50,50,50,50,50,50,50, 10,10,20,30,30,20,10,10, 5,5,10,25,25,10,5,5,
@@ -1810,7 +1814,9 @@ function sparExplorerPick(choice, draw) {
 
 /* ---------- Evaluation (named terms, centipawns from White's point of view) ---------- */
 
+var SPAR_PST_C = [];
 function sparEvalTerms(chess) {
+  if (!SPAR_PST_C.length) for (var pt in SPAR_PST) SPAR_PST_C[pt.charCodeAt(0)] = SPAR_PST[pt];
   var board = chess._board;  // chess.js 1.4.0 internal 0x88 array (pinned; the tests check it exists)
   var material = 0, pst = 0, bishops = { w: 0, b: 0 }, queens = 0, kings = { w: null, b: null };
   for (var i = 0; i < 128; i++) {
@@ -1819,11 +1825,12 @@ function sparEvalTerms(chess) {
     if (!sq) continue;
     var r = i >> 4, c = i & 7;
     var sign = sq.color === 'w' ? 1 : -1;
-    material += sign * SPAR_VALUE[sq.type];
-    if (sq.type === 'b') bishops[sq.color]++;
-    else if (sq.type === 'q') queens++;
-    if (sq.type === 'k') kings[sq.color] = [r, c];
-    else pst += sign * SPAR_PST[sq.type][sq.color === 'w' ? r * 8 + c : (7 - r) * 8 + c];
+    var tc = sq.type.charCodeAt(0);
+    material += sign * SPAR_VALUE_C[tc];
+    if (tc === 98) bishops[sq.color]++;        // b
+    else if (tc === 113) queens++;             // q
+    if (tc === 107) kings[sq.color] = [r, c]; // k
+    else pst += sign * SPAR_PST_C[tc][sq.color === 'w' ? r * 8 + c : (7 - r) * 8 + c];
   }
   // King: middlegame table while queens are on, else walk to the centre.
   var king = 0;
@@ -1844,8 +1851,8 @@ function sparEvalTotal(terms) { return terms.material + terms.pst + terms.bishop
 
 function sparMoveOrderScore(m) {
   var s = 0;
-  if (m.captured) s += 10 * SPAR_VALUE[m.captured] - SPAR_VALUE[m.piece] / 10 + 1000;
-  if (m.promotion) s += SPAR_VALUE[m.promotion] + 900;
+  if (m.captured) s += 10 * SPAR_VALUE_C[m.captured.charCodeAt(0)] - SPAR_VALUE_C[m.piece.charCodeAt(0)] / 10 + 1000;
+  if (m.promotion) s += SPAR_VALUE_C[m.promotion.charCodeAt(0)] + 900;
   return s;
 }
 
@@ -1859,7 +1866,7 @@ function sparSortMoves(moves) {
 function sparStrengthParams(strength) {
   var s = Math.max(800, Math.min(2000, strength));
   var x = (s - 800) / 1200;  // 0..1
-  return { nodeCap: Math.round(6000 * Math.pow(15, x)), epsilon: SPAR_CONFIG.engine.epsilon };
+  return { nodeCap: Math.round(9000 * Math.pow(15, x)), epsilon: SPAR_CONFIG.engine.epsilon };
 }
 
 // Choose among candidates [{ uci, total }] sorted by total, descending; draw in [0, 1). The pool
@@ -1967,17 +1974,17 @@ function agentChessMove(position, opts) {
   function quiesce(alpha, beta, ply, qLeft, afterCapture) {
     var qKey = work._hash;
     if (!afterCapture && rep.get(qKey) > 0) { nodes++; checkLimits(); return drawScore(); }
-    if (!work.isCheck()) return quiesceBody(alpha, beta, ply, qLeft, afterCapture);
+    var qCheck = work.isCheck();
+    if (!qCheck) return quiesceBody(alpha, beta, ply, qLeft, afterCapture, false);
     rep.set(qKey, 1);
-    try { return quiesceBody(alpha, beta, ply, qLeft, afterCapture); } finally { rep.delete(qKey); }
+    try { return quiesceBody(alpha, beta, ply, qLeft, afterCapture, true); } finally { rep.delete(qKey); }
   }
 
-  function quiesceBody(alpha, beta, ply, qLeft, afterCapture) {
+  function quiesceBody(alpha, beta, ply, qLeft, afterCapture, inCheck) {
     nodes++;
     checkLimits();
     if (afterCapture && work.isInsufficientMaterial()) return 0;  // only a capture can leave too little to mate
     if (work._halfMoves >= 100) return fiftyMoveScore(ply);
-    var inCheck = work.isCheck();
     var moves = work._moves({ legal: false });
     if (!inCheck) {
       // Stalemate is not a position to "stand pat" in: no legal move at all is a draw.
@@ -1999,7 +2006,7 @@ function agentChessMove(position, opts) {
     for (var i = 0; i < moves.length; i++) {
       // Delta pruning: a capture that cannot lift the stand-pat score to alpha even with a margin is not worth searching,
       // unless it gives check (it may mate) or promotes. The check is known only once the move is made.
-      var deltaPrune = !inCheck && !moves[i].promotion && stand + SPAR_VALUE[moves[i].captured] + eng.deltaMargin < alpha;
+      var deltaPrune = !inCheck && !moves[i].promotion && stand + SPAR_VALUE_C[moves[i].captured.charCodeAt(0)] + eng.deltaMargin < alpha;
       work._makeMove(moves[i]);
       if (work._isKingAttacked(moves[i].color) || (deltaPrune && !work.isCheck())) { work._undoMove(); continue; }
       legal++;
