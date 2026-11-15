@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "36b17ba \u00b7 2026-11-15 21:48 UTC";
+var BOARD_BUILD = "b914f08 \u00b7 2026-11-15 22:34 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1722,7 +1722,7 @@ function repertoireStatsText(stats, firstColour) {
   Everything below is deterministic given (position, config, seed, memory).
 */
 var SPAR_CONFIG = {
-  version: 'agent-chess/0.1.0',
+  version: 'agent-chess/0.2.0',
   logVersion: 1,
   defaultOn: true,
   minGames: 10,            // Explorer hand-off: fewer games than this at the position
@@ -1733,7 +1733,7 @@ var SPAR_CONFIG = {
   // within epsilon of the best count as equivalent and a seeded pick among those gives variety.
   // Strength comes from the search budget (nodes, time), not from noise. A chosen move is
   // verified one ply deeper before it is played (verifyMargin), and dropped if that refutes it.
-  engine: { maxDepth: 6, capMs: 400, qDepth: 6, rootWindow: 150, epsilon: 10, verifyMargin: 40, verifyShare: 0.7, verifyRounds: 4 },
+  engine: { maxDepth: 8, capMs: 400, qDepth: 6, checkExtPly: 12, ttMax: 200000, deltaMargin: 200, lmrAfter: 4, rootWindow: 150, epsilon: 10, verifyMargin: 40, verifyShare: 0.7, verifyRounds: 4 },
   memory: { maxGames: 200, maxPositions: 4000, perBlame: 80, maxBonus: 60, maxPenalty: 400, winCredit: 0.15, lossScale: 300 },
   logRing: 400
 };
@@ -1910,6 +1910,40 @@ function agentChessMove(position, opts) {
     if (timeLimit !== Infinity && (nodes & 255) === 0 && nowFn() - started > timeLimit) { aborted = true; timeCap = true; throw 'abort'; }
   }
 
+  // Repetition (iteration 3): a position that already occurred in the game or on the current search path is
+  // scored as a draw. The draw is worth `-contempt` to the engine when it stands better (so it does not
+  // settle for a perpetual in a won position) and `+` when it stands clearly worse (so it takes one).
+  var rep = new Map();
+  var repHits = 0;  // draw-by-repetition scores handed out so far: a TT entry whose subtree changed it depends on the path
+  var contempt = 0;
+  function drawScore() { repHits++; return work.turn() === side ? -contempt : contempt; }
+  function setupRepetition() {
+    try {
+      var h = position.history();
+      var replay = new Chess(position.header && position.header().FEN ? position.header().FEN : undefined);
+      rep.set(replay._hash, (rep.get(replay._hash) || 0) + 1);
+      for (var hi = 0; hi < h.length; hi++) { replay.move(h[hi]); rep.set(replay._hash, (rep.get(replay._hash) || 0) + 1); }
+    } catch (e) { rep = new Map(); }
+    rep.set(work._hash, Math.max(1, rep.get(work._hash) || 0));  // the root itself, also if the replay failed
+  }
+
+  // Transposition table, killer moves and history ordering (iteration 3).
+  var tt = new Map();
+  var killers = [];
+  var history = {};
+  function moveCode(m) { return m.from * 128 + m.to; }
+  function toTT(sc, ply) { return sc > SPAR_MATE - 200 ? sc + ply : sc < -SPAR_MATE + 200 ? sc - ply : sc; }
+  function fromTT(sc, ply) { return sc > SPAR_MATE - 200 ? sc - ply : sc < -SPAR_MATE + 200 ? sc + ply : sc; }
+  function orderMoves(moves, ttCode, ply) {
+    var k = killers[ply] || [];
+    for (var oi = 0; oi < moves.length; oi++) {
+      var m = moves[oi], code = moveCode(m);
+      m.__o = code === ttCode ? 1e7 : sparMoveOrderScore(m) + (m.captured ? 0 : (code === k[0] ? 900 : code === k[1] ? 800 : 0) + Math.min(700, history[code] || 0));
+    }
+    moves.sort(function(a, b) { return b.__o - a.__o; });
+    return moves;
+  }
+
   // Score from the side to move's point of view.
   function staticEval() {
     var t = sparEvalTotal(sparEvalTerms(work));
@@ -1928,7 +1962,17 @@ function agentChessMove(position, opts) {
     return work.isCheck() ? -SPAR_MATE + ply : 0;
   }
 
+  // Repetition inside quiescence: a capture or promotion can never recreate an earlier position, but a check evasion can,
+  // so an in-check node is registered on the path and a node reached by a non-capture is looked up.
   function quiesce(alpha, beta, ply, qLeft, afterCapture) {
+    var qKey = work._hash;
+    if (!afterCapture && rep.get(qKey) > 0) { nodes++; checkLimits(); return drawScore(); }
+    if (!work.isCheck()) return quiesceBody(alpha, beta, ply, qLeft, afterCapture);
+    rep.set(qKey, 1);
+    try { return quiesceBody(alpha, beta, ply, qLeft, afterCapture); } finally { rep.delete(qKey); }
+  }
+
+  function quiesceBody(alpha, beta, ply, qLeft, afterCapture) {
     nodes++;
     checkLimits();
     if (afterCapture && work.isInsufficientMaterial()) return 0;  // only a capture can leave too little to mate
@@ -1953,8 +1997,11 @@ function agentChessMove(position, opts) {
     sparSortMoves(moves);
     var best = inCheck ? -SPAR_MATE : alpha, legal = 0;
     for (var i = 0; i < moves.length; i++) {
+      // Delta pruning: a capture that cannot lift the stand-pat score to alpha even with a margin is not worth searching,
+      // unless it gives check (it may mate) or promotes. The check is known only once the move is made.
+      var deltaPrune = !inCheck && !moves[i].promotion && stand + SPAR_VALUE[moves[i].captured] + eng.deltaMargin < alpha;
       work._makeMove(moves[i]);
-      if (work._isKingAttacked(moves[i].color)) { work._undoMove(); continue; }
+      if (work._isKingAttacked(moves[i].color) || (deltaPrune && !work.isCheck())) { work._undoMove(); continue; }
       legal++;
       var v = -quiesce(-beta, -alpha, ply + 1, qLeft - 1, !!moves[i].captured);
       work._undoMove();
@@ -1971,21 +2018,61 @@ function agentChessMove(position, opts) {
     checkLimits();
     if (afterCapture && work.isInsufficientMaterial()) return 0;
     if (work._halfMoves >= 100) return fiftyMoveScore(ply);
+    var key = work._hash;
+    if (rep.get(key) > 0) return drawScore();
     if (depth <= 0) return quiesce(alpha, beta, ply, eng.qDepth, false);
-    var moves = sparSortMoves(work._moves({ legal: false }));
-    var best = -SPAR_MATE, legal = 0;
-    for (var i = 0; i < moves.length; i++) {
-      work._makeMove(moves[i]);
-      if (work._isKingAttacked(moves[i].color)) { work._undoMove(); continue; }
-      legal++;
-      var v = -negamax(depth - 1, -beta, -alpha, ply + 1, !!moves[i].captured);
-      work._undoMove();
-      if (v > best) best = v;
-      if (v > alpha) alpha = v;
-      if (alpha >= beta) break;
+    var entry = tt.get(key), ttCode = -1;
+    var clockOk = work._halfMoves < 70;  // the hash ignores the halfmove clock: near the fifty-move rule scores are not reusable
+    if (entry) {
+      ttCode = entry.m;
+      if (entry.ok && clockOk && entry.d >= depth) {
+        var ts = fromTT(entry.s, ply);
+        if (entry.f === 0 || (entry.f === 1 && ts >= beta) || (entry.f === 2 && ts <= alpha)) return ts;
+      }
     }
-    if (!legal) return work.isCheck() ? -SPAR_MATE + ply : 0;
-    return best;
+    rep.set(key, 1);
+    var hits0 = repHits;
+    try {
+      var alpha0 = alpha;
+      var moves = orderMoves(work._moves({ legal: false }), ttCode, ply);
+      var best = -SPAR_MATE, bestCode = -1, legal = 0;
+      var nodeCheck = work.isCheck();
+      for (var i = 0; i < moves.length; i++) {
+        var mv = moves[i];
+        work._makeMove(mv);
+        if (work._isKingAttacked(mv.color)) { work._undoMove(); continue; }
+        legal++;
+        var ext = ply < eng.checkExtPly && work.isCheck() ? 1 : 0;
+        var v;
+        // Late move reduction: quiet moves tried late at a deep node are first searched one ply shallower in a zero window;
+        // only one that beats alpha that way is searched in full.
+        if (depth >= 3 && legal > eng.lmrAfter && !nodeCheck && !ext && !mv.captured && !mv.promotion) {
+          v = -negamax(depth - 2, -alpha - 1, -alpha, ply + 1, false);
+          if (v > alpha) v = -negamax(depth - 1, -beta, -alpha, ply + 1, false);
+        } else {
+          v = -negamax(depth - 1 + ext, -beta, -alpha, ply + 1, !!mv.captured);
+        }
+        work._undoMove();
+        if (v > best) { best = v; bestCode = moveCode(mv); }
+        if (v > alpha) alpha = v;
+        if (alpha >= beta) {
+          if (!mv.captured) {
+            var kk = killers[ply] || (killers[ply] = []);
+            var code = moveCode(mv);
+            if (kk[0] !== code) { kk[1] = kk[0]; kk[0] = code; }
+            history[code] = (history[code] || 0) + depth * depth;
+          }
+          break;
+        }
+      }
+      if (!legal) return work.isCheck() ? -SPAR_MATE + ply : 0;
+      if (tt.size >= eng.ttMax) tt.clear();
+      // A score that a repetition draw influenced depends on the path that led here: keep the best move for ordering, never reuse the score.
+      tt.set(key, { d: depth, s: toTT(best, ply), f: best >= beta ? 1 : best > alpha0 ? 0 : 2, m: bestCode, ok: repHits === hits0 && clockOk });
+      return best;
+    } finally {
+      rep.delete(key);
+    }
   }
 
   // Memory terms for the root moves, known before the search so the root window can use them.
@@ -2008,6 +2095,11 @@ function agentChessMove(position, opts) {
     }
   });
   if (!rootMoves.length) return null;
+  setupRepetition();
+  var rootEval = staticEval();
+  contempt = rootEval > 40 ? Math.min(150, Math.round((rootEval - 40) / 2)) : rootEval < -80 ? Math.max(-100, Math.round((rootEval + 80) / 2)) : 0;
+  // Test hook: hands the search internals to a test so repetition and table behaviour can be driven directly.
+  if (opts.probe) opts.probe({ negamax: negamax, quiesce: quiesce, work: function() { return work; }, rep: rep, tt: tt, resetLimits: function() { limited = false; } });
 
   // One full-width root pass: every move gets an exact score unless it falls below
   // (best - window), where only "worse than the window" is known.
