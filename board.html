@@ -237,7 +237,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "b565760 \u00b7 2026-11-15 18:41 UTC";
+var BOARD_BUILD = "81d7f02 \u00b7 2026-11-15 20:14 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1729,7 +1729,11 @@ var SPAR_CONFIG = {
   strength: 1400,          // nominal level, 800-2000
   maxPlies: 160,           // spar plies before the game is called a draw
   moveDelayMs: 450,        // same pacing as the trainer's opponent
-  engine: { maxDepth: 4, nodeCap: 30000, capMs: 400, qDepth: 6 },
+  // No randomness in move choice (Michael, 2026-11-15): the engine plays its best move; moves
+  // within epsilon of the best count as equivalent and a seeded pick among those gives variety.
+  // Strength comes from the search budget (nodes, time), not from noise. A chosen move is
+  // verified one ply deeper before it is played (verifyMargin), and dropped if that refutes it.
+  engine: { maxDepth: 6, capMs: 400, qDepth: 6, rootWindow: 150, epsilon: 10, verifyMargin: 40, verifyShare: 0.7, verifyRounds: 4 },
   memory: { maxGames: 200, maxPositions: 4000, perBlame: 80, maxBonus: 60, maxPenalty: 400, winCredit: 0.15, lossScale: 300 },
   logRing: 400
 };
@@ -1850,27 +1854,23 @@ function sparSortMoves(moves) {
   return moves;
 }
 
-// Strength (800-2000) -> selection parameters. Weaker = hotter softmax and a wider pool.
+// Strength (800-2000) -> the search budget: a weaker level simply searches less and so sees less.
+// Not calibrated yet (iteration 2 measures it against Stockfish).
 function sparStrengthParams(strength) {
   var s = Math.max(800, Math.min(2000, strength));
   var x = (s - 800) / 1200;  // 0..1
-  return { temperature: Math.round(120 - 105 * x), window: Math.round(300 - 250 * x) };
+  return { nodeCap: Math.round(6000 * Math.pow(15, x)), epsilon: SPAR_CONFIG.engine.epsilon };
 }
 
-// Pick among candidates [{ uci, total }] sorted by total, descending; draw in [0, 1).
-// Pure, so a logged selection can be replayed.
-function sparSelect(cands, temperature, window, draw) {
+// Choose among candidates [{ uci, total }] sorted by total, descending; draw in [0, 1). The pool
+// is the moves within epsilon of the best (equivalent, none of them a known mistake); the draw
+// only picks among those. Pure, so a logged selection can be replayed.
+function sparSelect(cands, epsilon, draw) {
   var best = cands[0].total;
-  if (best >= SPAR_MATE - 200) return { index: 0, method: 'forced-mate', p: 1, pool: 1 };
-  var pool = cands.filter(function(c) { return c.total >= best - window; });
-  var weights = pool.map(function(c) { return Math.exp((c.total - best) / temperature); });
-  var sum = weights.reduce(function(a, b) { return a + b; }, 0);
-  var x = draw * sum;
-  for (var i = 0; i < pool.length; i++) {
-    x -= weights[i];
-    if (x < 0) return { index: i, method: 'softmax', p: Math.round(weights[i] / sum * 10000) / 10000, pool: pool.length };
-  }
-  return { index: pool.length - 1, method: 'softmax', p: Math.round(weights[pool.length - 1] / sum * 10000) / 10000, pool: pool.length };
+  if (best >= SPAR_MATE - 200) return { index: 0, method: 'forced-mate', pool: 1 };
+  var pool = 0;
+  while (pool < cands.length && cands[pool].total >= best - epsilon) pool++;
+  return { index: Math.min(pool - 1, Math.floor(draw * pool)), method: 'best-equivalent', pool: pool };
 }
 
 var SPAR_FILES = 'abcdefgh';
@@ -1882,7 +1882,7 @@ function sparInternalUci(m) { return sparSquareName(m.from) + sparSquareName(m.t
   search runs on a copy). The search uses chess.js 1.4.0's internal move generator
   (_moves/_makeMove/_undoMove, about 100x faster than the SAN-producing public API); the
   vendored version is pinned and board-spar.test.js checks the internals and perft.
-  opts: strength, seed, memory, ply, maxDepth, nodeCap, capMs (Infinity for tests), now.
+  opts: strength, seed, memory, ply, maxDepth, nodeCap, capMs (Infinity for tests), now, noVerify.
   Returns { san, uci, log } or null when there is no legal move.
 */
 function agentChessMove(position, opts) {
@@ -1890,10 +1890,10 @@ function agentChessMove(position, opts) {
   var eng = SPAR_CONFIG.engine;
   var strength = typeof opts.strength === 'number' ? opts.strength : SPAR_CONFIG.strength;
   var maxDepth = opts.maxDepth || eng.maxDepth;
-  var nodeCap = opts.nodeCap || eng.nodeCap;
+  var params = sparStrengthParams(strength);
+  var nodeCap = opts.nodeCap || params.nodeCap;
   var capMs = opts.capMs === undefined ? eng.capMs : opts.capMs;
   var nowFn = opts.now || function() { return Date.now(); };
-  var params = sparStrengthParams(strength);
   var work = new Chess(position.fen());
   var rootFen = work.fen();
   var side = work.turn();
@@ -1901,11 +1901,13 @@ function agentChessMove(position, opts) {
   work.moves({ verbose: true }).forEach(function(m) { sans[m.from + m.to + (m.promotion || '')] = m.san; });
   var started = nowFn();
   var nodes = 0, aborted = false, timeCap = false, limited = false;
+  var nodeLimit = nodeCap;
+  var timeLimit = capMs === Infinity ? Infinity : capMs * eng.verifyShare;  // the rest is for verification
 
   function checkLimits() {
     if (!limited) return;
-    if (nodes > nodeCap) { aborted = true; throw 'abort'; }
-    if (capMs !== Infinity && (nodes & 255) === 0 && nowFn() - started > capMs) { aborted = true; timeCap = true; throw 'abort'; }
+    if (nodes > nodeLimit) { aborted = true; throw 'abort'; }
+    if (timeLimit !== Infinity && (nodes & 255) === 0 && nowFn() - started > timeLimit) { aborted = true; timeCap = true; throw 'abort'; }
   }
 
   // Score from the side to move's point of view.
@@ -2018,7 +2020,7 @@ function agentChessMove(position, opts) {
     for (var i = 0; i < ordered.length; i++) {
       var m = ordered[i];
       var memTerm = memTerms[sparInternalUci(m)] || 0;
-      var floor = best === -Infinity || opts.exactAll ? -SPAR_MATE - 1 : best - params.window - memTerm;
+      var floor = best === -Infinity || opts.exactAll ? -SPAR_MATE - 1 : best - eng.rootWindow - memTerm;
       work._makeMove(m);
       var v = -negamax(depth - 1, -SPAR_MATE - 1, -floor, 1, !!m.captured);
       work._undoMove();
@@ -2041,7 +2043,7 @@ function agentChessMove(position, opts) {
   results.forEach(function(r) { r.uci = sparInternalUci(r.m); r.san = sans[r.uci]; });
 
   // Candidates: exact scores, plus the memory term.
-  var cands = results.filter(function(r) { return r.exact; }).map(function(r) {
+  function makeCand(r) {
     var uci = r.uci;
     var rec = memRecs[uci];
     var memTerm = memTerms[uci];
@@ -2054,41 +2056,123 @@ function agentChessMove(position, opts) {
       static_terms_after_move: { material: sign * terms.material, pst: sign * terms.pst, bishop_pair: sign * terms.bishop_pair },
       memory_record: rec ? { plays: rec.plays, w: rec.w, d: rec.d, l: rec.l, bad: rec.bad, good: rec.good } : null
     };
-  });
+  }
+  var cands = results.filter(function(r) { return r.exact; }).map(makeCand);
   cands.sort(function(a, b) { return b.total - a.total || (a.uci < b.uci ? -1 : 1); });
+  var draw = sparMulberry32(typeof opts.seed === 'number' ? opts.seed : 1)();
+  // Verify the move about to be played one ply deeper than the search saw it. If that shows it is
+  // worse than it looked (by verifyMargin), take the deeper score and re-rank: the engine does
+  // not play a move it has found out is weak. A verification that runs out of budget changes nothing.
+  var verify = [];
+  var notDeepened = [];
+  function rank() { cands.sort(function(a, b) { return b.total - a.total || (a.uci < b.uci ? -1 : 1); }); }
+  var sel = sparSelect(cands, params.epsilon, draw);
+  var chosen = cands[sel.index];
+  if (!opts.noVerify && depthDone >= 1) {
+    work = new Chess(rootFen);  // an aborted search leaves the working position mid-line
+    limited = true;
+    nodeLimit = nodes + Math.floor(nodeCap * 0.5);
+    timeLimit = capMs;
+    var byUci = {};
+    results.forEach(function(r) { byUci[r.uci] = r; });
+    // Search a candidate one ply deeper than the main search saw it and take that score.
+    // False when the budget ran out (nothing changes then).
+    var deepen = function(c) {
+      var rr = byUci[c.uci], before = c.score, deeper;
+      try {
+        work._makeMove(rr.m);
+        deeper = -negamax(depthDone, -SPAR_MATE - 1, SPAR_MATE + 1, 1, !!rr.m.captured);
+        work._undoMove();
+      } catch (e) { if (e !== 'abort') throw e; verify.push({ uci: c.uci, depth: depthDone + 1, before: before, aborted: true }); return false; }
+      c.score = deeper;
+      c.total = deeper + c.memory;
+      c.deepened = true;
+      verify.push({ uci: c.uci, depth: depthDone + 1, before: before, after: deeper, refuted: deeper < before - eng.verifyMargin });
+      return true;
+    };
+    // Check the move that would be played; a small change re-ranks and may change which move that is.
+    for (var vr = 0; vr <= cands.length && !chosen.deepened; vr++) {  // each check deepens one more move, so this ends
+      var beforeScore = chosen.score;
+      if (!deepen(chosen)) break;
+      if (chosen.score >= beforeScore - eng.verifyMargin) {
+        rank();
+        sel = sparSelect(cands, params.epsilon, draw);
+        chosen = cands[sel.index];
+        continue;
+      }
+      // The move about to be played was worse than it looked. The best score has fallen, so (1) look
+      // again at the moves the root window had cut, and (2) re-rank the leading few at the deeper
+      // depth, so that the scores compared are equally deep. Only deepened moves stay in the running.
+      chosen.refuted = true;
+      rank();
+      var reopenAborted = false;
+      var reopen = function() {
+        for (var i = 0; i < results.length; i++) {
+          var r = results[i];
+          if (r.exact) continue;
+          var floor = cands[0].total - eng.rootWindow - memTerms[r.uci];
+          var v;
+          try {
+            work._makeMove(r.m);
+            v = -negamax(depthDone - 1, -SPAR_MATE - 1, -floor, 1, !!r.m.captured);
+            work._undoMove();
+          } catch (e) { if (e !== 'abort') throw e; reopenAborted = true; return; }
+          if (v > floor) { r.exact = true; r.score = v; cands.push(makeCand(r)); }
+        }
+      };
+      reopen();
+      rank();
+      if (reopenAborted) work = new Chess(rootFen);  // the interrupted search left it mid-line
+      for (var round = 0; round < eng.verifyRounds && !reopenAborted; round++) {
+        var next = null;
+        for (var ci = 0; ci < cands.length && !next; ci++) if (!cands[ci].deepened) next = cands[ci];
+        if (!next) break;
+        var bestDeep = cands.filter(function(c) { return c.deepened; })[0];
+        if (bestDeep && next.total < bestDeep.total - eng.rootWindow) break;  // too far behind to matter
+        if (!deepen(next)) break;
+        rank();
+      }
+      notDeepened = cands.filter(function(c) { return !c.deepened; });
+      cands = cands.filter(function(c) { return c.deepened; });
+      rank();
+      break;
+    }
+    rank();
+    sel = sparSelect(cands, params.epsilon, draw);
+    chosen = cands[sel.index];
+  }
   // Moves cut by the window: the search only proved them no better than score_at_most (before
   // the memory term). A remembered loss can be the reason a move is here.
   var pruned = results.filter(function(r) { return !r.exact; }).map(function(r) {
     return { san: r.san, uci: r.uci, score_at_most: r.score, memory: memTerms[r.uci], memory_record: memRecs[r.uci] ? { plays: memRecs[r.uci].plays, l: memRecs[r.uci].l, bad: memRecs[r.uci].bad, good: memRecs[r.uci].good } : null };
   });
-  var draw = sparMulberry32(typeof opts.seed === 'number' ? opts.seed : 1)();
-  var sel = sparSelect(cands, params.temperature, params.window, draw);
-  var chosen = sel.method === 'forced-mate' ? cands[0] : cands.filter(function(c) { return c.total >= cands[0].total - params.window; })[sel.index];
+  // Candidates left out of the deeper re-rank (behind, or out of budget) are listed with their score.
+  notDeepened.forEach(function(c) { pruned.push({ san: c.san, uci: c.uci, score_at_most: c.score, memory: c.memory, memory_record: c.memory_record, not_deepened: true }); });
   var searchBest = cands.reduce(function(m, c) { return Math.max(m, c.score); }, -Infinity);
   var log = {
     v: SPAR_CONFIG.logVersion, phase: 'engine', ply: opts.ply === undefined ? null : opts.ply,
     fen: rootFen, side: side, san: chosen.san, uci: chosen.uci, seed: opts.seed,
     engine: {
       version: SPAR_CONFIG.version,
-      config: { strength: strength, maxDepth: maxDepth, nodeCap: nodeCap, capMs: capMs === Infinity ? null : capMs },
+      config: { strength: strength, maxDepth: maxDepth, nodeCap: nodeCap, capMs: capMs === Infinity ? null : capMs, epsilon: params.epsilon },
       depth: depthDone, nodes: nodes, ms: nowFn() - started, node_cap_hit: aborted && !timeCap, time_cap_hit: timeCap,
       chosen_score: chosen.score, best_score: searchBest, memory_term: chosen.memory,
       candidates: cands,
       pruned: pruned,
-      selection: { method: sel.method, temperature: params.temperature, window: params.window, draw: draw, p: sel.p, pool: sel.pool, chose_best: chosen === cands[0] }
+      verify: verify,
+      regret: searchBest - chosen.score,
+      selection: { method: sel.method, epsilon: params.epsilon, draw: draw, pool: sel.pool, equivalent: cands.slice(0, sel.pool).map(function(c) { return c.uci; }), chose_best: chosen === cands[0] }
     }
   };
   return { san: chosen.san, uci: chosen.uci, log: log };
 }
 
-// Replays the selection from a logged engine entry: the candidates, temperature, window and
-// draw must reproduce the logged move. Returns the uci the log implies.
+// Replays the selection from a logged engine entry: the candidates, epsilon and draw must
+// reproduce the logged move. Returns the uci the log implies.
 function sparReplaySelection(entry) {
   var e = entry.engine;
   var cands = e.candidates.map(function(c) { return { uci: c.uci, total: c.total }; });
-  var sel = sparSelect(cands, e.selection.temperature, e.selection.window, e.selection.draw);
-  if (sel.method === 'forced-mate') return cands[0].uci;
-  return cands.filter(function(c) { return c.total >= cands[0].total - e.selection.window; })[sel.index].uci;
+  return cands[sparSelect(cands, e.selection.epsilon, e.selection.draw).index].uci;
 }
 
 /* ---------- Memory (JSON; see the design doc) ---------- */
