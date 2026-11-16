@@ -149,7 +149,7 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 </div>
 </div>
 <div id="sidePanel">
-<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="sparRow" style="margin-top:6px; font-size:12px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;"><button id="sparResignBtn" type="button" style="display:none;" title="Resign the spar game in progress (click twice to confirm). It counts as a win for agent-chess.">Resign</button><span id="sparStatus" style="color:var(--text-secondary, #aaa);"></span></div><div id="trainNextStep" style="display:none; margin-top:6px;"><div id="trainNextStepText"></div><div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px;"><button id="trainMoreBtn" type="button"></button><button id="trainSwitchBtn" type="button">Switch color</button><button id="trainKeepBtn" type="button">Keep re-training</button></div></div></div>
+<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="sparRow" style="margin-top:6px; font-size:12px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;"><button id="sparNextBtn" type="button" style="display:none;" title="Continue with the next training line.">Next line</button><button id="sparResignBtn" type="button" style="display:none;" title="Resign the spar game in progress (click twice to confirm). It counts as a win for agent-chess.">Resign</button><span id="sparStatus" style="color:var(--text-secondary, #aaa);"></span></div><div id="trainNextStep" style="display:none; margin-top:6px;"><div id="trainNextStepText"></div><div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px;"><button id="trainMoreBtn" type="button"></button><button id="trainSwitchBtn" type="button">Switch color</button><button id="trainKeepBtn" type="button">Keep re-training</button></div></div></div>
 <section id="movesCard" class="panelCard">
 <div id="movesHeader">
 <div style="display:flex; align-items:baseline; gap:10px; min-width:0;"><span class="paneTitle">Moves</span>
@@ -260,7 +260,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "1eff560 \u00b7 2026-11-16 00:28 UTC";
+var BOARD_BUILD = "4ae09de \u00b7 2026-11-16 00:29 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -6138,6 +6138,7 @@ function stopTraining(message, uidOverride) {
   clearTimeout(t.opponentTimer);
   clearTimeout(t.lineTimer);
   sparSyncResign();
+  sparSyncNext();
   baseFen = t.saved.baseFen;
   game = new Chess(normalizeFen(baseFen));
   t.saved.history.forEach(function(san) { game.move(san); });
@@ -6498,6 +6499,7 @@ function sparBegin(t, message) {
   sparStatus('');
   sparShowGameButtons(false);
   sparSyncResign();
+  sparSyncNext();
   setTrainMessage(message + ' Spar mode: play on.');
   sparStep(t);
   return true;
@@ -6648,14 +6650,31 @@ function sparFinish(t, result) {
   sparStatus('Memory: ' + mem.games.length + ' games.');
   sparUploadGame(sparLastGame);
   t.busy = true;
-  setTrainMessage((sp.resignedBy === 'player' ? 'Spar over: you resigned; agent-chess wins.' : sp.resignedBy === 'engine' ? 'Spar over: agent-chess resigns; you win.' : sparResultText(result, sp.engineColor, t)) + ' Next line...');
-  var lineId = t.lineId;
-  t.lineTimer = setTimeout(function() {
-    if (train !== t || t.lineId !== lineId) return;
-    t.spar = null;
-    trainNextLine(t);
-  }, 2500);
+  setTrainMessage((sp.resignedBy === 'player' ? 'Spar over: you resigned; agent-chess wins.' : sp.resignedBy === 'engine' ? 'Spar over: agent-chess resigns; you win.' : sparResultText(result, sp.engineColor, t)) + ' Press Next line to continue.');
+  // Michael, 2026-11-15: the board waits here (no automatic next line) so the finished game can be looked at, copied or discussed.
+  sp.waiting = true;
+  sparSyncNext();
+  var nextBtn = document.getElementById('sparNextBtn');
+  if (nextBtn) { try { nextBtn.focus(); } catch (e) { /* not focusable */ } }
 }
+
+// "Next line": the only way on after a spar game (Stop training also leaves it).
+function sparSyncNext() {
+  var el = document.getElementById('sparNextBtn');
+  if (!el) return;
+  el.style.display = (train && train.spar && train.spar.ended && train.spar.waiting) ? '' : 'none';
+}
+function sparNextLine() {
+  var t = train;
+  if (!t || !t.spar || !t.spar.ended || !t.spar.waiting) return false;
+  t.spar.waiting = false;
+  t.spar = null;
+  sparSyncNext();
+  trainNextLine(t);
+  return true;
+}
+var sparNextBtn = document.getElementById('sparNextBtn');
+if (sparNextBtn) sparNextBtn.onclick = function() { sparNextLine(); };
 
 
 /*
