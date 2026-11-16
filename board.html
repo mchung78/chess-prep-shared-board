@@ -260,7 +260,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "d1af04f \u00b7 2026-11-16 00:13 UTC";
+var BOARD_BUILD = "1eff560 \u00b7 2026-11-16 00:28 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -3467,6 +3467,7 @@ function snapGhostToSquare(ghost, sq) {
 }
 
 function onCustomDragUp(ev) {
+  if (ev.button !== 0) return;  // another button released mid-drag (a right-click on top of a left-drag) does not drop the piece
   document.removeEventListener('mousemove', onCustomDragMove);
   document.removeEventListener('mouseup', onCustomDragUp);
   if (!dragCtx) return;
@@ -5236,6 +5237,7 @@ function renderBoard() {
         span.style.cursor = 'pointer';
         span.onmousedown = (function(fromSq) {
           return function(ev) {
+            if (ev.button !== 0 || (ev.ctrlKey && /Mac/.test(navigator.platform))) return;  // only the primary button lifts a piece: a right-click (or Ctrl-click on a Mac) is a context menu, not a move
             if (!isAtLive()) return;  // TASK_613: browsing history is read-only
             if (piecesLocked() || dropPending) return;  // Train is auto-playing, or a dropped piece is still being committed (#1746): nothing can be lifted
             var p = game.get(fromSq);
