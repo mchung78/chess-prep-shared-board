@@ -260,7 +260,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "4ae09de \u00b7 2026-11-16 00:29 UTC";
+var BOARD_BUILD = "01f4fd0 \u00b7 2026-11-16 00:57 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -3466,6 +3466,100 @@ function snapGhostToSquare(ghost, sq) {
   ghost.style.top = (rect.top + rect.height / 2 - ghost.offsetHeight / 2) + 'px';
 }
 
+/*
+  Right-click arrow (Michael, 2026-11-15), like Lichess: press the right button on one square and release it on another to draw a
+  green arrow between them (an SVG over the board, so it follows the board when flipped). One arrow for now: drawing a second
+  replaces the first, repeating the same arrow removes it, a left-click on the board clears it, and so does any change of the
+  position shown. While the button is held the arrow previews. The board's context menu is suppressed so the right button is free.
+*/
+var boardArrow = null;      // { from, to, fen }
+var arrowDrag = null;       // { from, to } while the right button is down
+var ARROW_COLOR = 'rgb(21, 120, 27)';
+function arrowGeometry(from, to) {
+  var a = boardEl.querySelector('[data-square="' + from + '"]'), b = boardEl.querySelector('[data-square="' + to + '"]');
+  if (!a || !b) return null;
+  var sz = a.offsetWidth;
+  var x1 = a.offsetLeft + sz / 2, y1 = a.offsetTop + sz / 2, x2 = b.offsetLeft + sz / 2, y2 = b.offsetTop + sz / 2;
+  var dx = x2 - x1, dy = y2 - y1, len = Math.sqrt(dx * dx + dy * dy);
+  if (!len) return null;
+  var ux = dx / len, uy = dy / len, nx = -uy, ny = ux;
+  var shaft = sz * 0.15, headW = sz * 0.34, headL = sz * 0.4, startGap = sz * 0.12;
+  var sx = x1 + ux * startGap, sy = y1 + uy * startGap;                 // start just off the centre of the origin square
+  var bx = x2 - ux * headL, by = y2 - uy * headL;                       // where the shaft meets the head
+  var pts = [
+    [sx + nx * shaft / 2, sy + ny * shaft / 2], [bx + nx * shaft / 2, by + ny * shaft / 2], [bx + nx * headW, by + ny * headW],
+    [x2, y2], [bx - nx * headW, by - ny * headW], [bx - nx * shaft / 2, by - ny * shaft / 2], [sx - nx * shaft / 2, sy - ny * shaft / 2]
+  ];
+  return pts.map(function(p) { return p[0].toFixed(1) + ',' + p[1].toFixed(1); }).join(' ');
+}
+// Paints the committed arrow (or the preview while dragging) over the board; clears a committed arrow that belongs to another position.
+function drawBoardArrow(fen) {
+  var old = boardEl.querySelector('#boardArrow');
+  if (old) old.remove();
+  if (boardArrow && fen && boardArrow.fen !== fen) boardArrow = null;
+  if (arrowDrag && fen && arrowDrag.fen !== fen) cancelArrowDrag();   // the position changed under a held right button: drop the gesture
+  var arrow = arrowDrag && arrowDrag.to && arrowDrag.to !== arrowDrag.from ? arrowDrag : boardArrow;
+  if (!arrow) return;
+  var points = arrowGeometry(arrow.from, arrow.to);
+  if (!points) return;
+  var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('id', 'boardArrow');
+  // Pixel geometry in a viewBox, drawn at 100% of the board: a window resize (which only changes --square-size) scales it with the board.
+  svg.setAttribute('viewBox', '0 0 ' + boardEl.clientWidth + ' ' + boardEl.clientHeight);
+  svg.setAttribute('preserveAspectRatio', 'none');
+  svg.setAttribute('data-from', arrow.from);
+  svg.setAttribute('data-to', arrow.to);
+  svg.style.cssText = 'position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none; z-index:5;';
+  var poly = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
+  poly.setAttribute('points', points);
+  poly.setAttribute('fill', ARROW_COLOR);
+  poly.setAttribute('fill-opacity', '0.75');
+  svg.appendChild(poly);
+  boardEl.appendChild(svg);
+}
+function cancelArrowDrag() {
+  arrowDrag = null;
+  document.removeEventListener('mousemove', onArrowMove);
+  document.removeEventListener('mouseup', onArrowUp);
+}
+function clearBoardArrow() {
+  if (!boardArrow) return;
+  boardArrow = null;
+  drawBoardArrow(null);
+}
+boardEl.addEventListener('contextmenu', function(ev) { ev.preventDefault(); });
+boardEl.addEventListener('mousedown', function(ev) {
+  if (ev.button === 0) { clearBoardArrow(); return; }
+  if (ev.button !== 2) return;
+  var sq = squareAtPoint(ev.clientX, ev.clientY);
+  if (!sq) return;
+  arrowDrag = { from: sq, to: null, fen: buildViewGame().fen() };
+  document.addEventListener('mousemove', onArrowMove);
+  document.addEventListener('mouseup', onArrowUp);
+});
+function onArrowMove(ev) {
+  if (!arrowDrag) return;
+  var sq = squareAtPoint(ev.clientX, ev.clientY);
+  if (sq === arrowDrag.to) return;
+  arrowDrag.to = sq;
+  drawBoardArrow(null);
+}
+function onArrowUp(ev) {
+  if (ev.button !== 2) return;
+  document.removeEventListener('mousemove', onArrowMove);
+  document.removeEventListener('mouseup', onArrowUp);
+  var drag = arrowDrag;
+  arrowDrag = null;
+  if (!drag) return;
+  var to = squareAtPoint(ev.clientX, ev.clientY);
+  var viewFen = buildViewGame().fen();
+  if (to && to !== drag.from && drag.fen === viewFen) {
+    var same = boardArrow && boardArrow.from === drag.from && boardArrow.to === to;
+    boardArrow = same ? null : { from: drag.from, to: to, fen: viewFen };
+  }
+  drawBoardArrow(null);
+}
+
 function onCustomDragUp(ev) {
   if (ev.button !== 0) return;  // another button released mid-drag (a right-click on top of a left-drag) does not drop the piece
   document.removeEventListener('mousemove', onCustomDragMove);
@@ -5288,6 +5382,7 @@ function renderBoard() {
   turnLabel.textContent = (displayGame.turn() === 'w' ? 'White' : 'Black') + ' to move' +
     (displayGame.isCheckmate() ? ' - checkmate' : displayGame.isCheck() ? ' - check' : '') +
     (isAtLive() ? '' : ' (viewing move ' + viewPly + ' of ' + game.history().length + ')');
+  drawBoardArrow(displayGame.fen());  // right-click arrow, if one is set for this position
   var animateMove = pendingMoveAnimation;
   pendingMoveAnimation = null;
   if (animateMove && isAtLive()) animateMoveOnBoard(animateMove);  // #689
