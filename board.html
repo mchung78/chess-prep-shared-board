@@ -260,7 +260,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "25734a0 \u00b7 2026-11-16 02:50 UTC";
+var BOARD_BUILD = "eba5bcc \u00b7 2026-11-16 23:31 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1760,7 +1760,7 @@ var SPAR_CONFIG = {
   memory: { maxGames: 200, maxPositions: 4000, perBlame: 80, maxBonus: 60, maxPenalty: 400, winCredit: 0.15, lossScale: 300,
     // v2, learned from Stockfish-labelled games: a move whose labelled regret is at least labelMinRegret is penalised by labelScale of it; the
     // labelled better move of that position gets betterShare of the regret it avoided (at most maxBetter).
-    labelMinRegret: 40, labelScale: 0.8, betterShare: 0.6, maxBetter: 150, maxLabelled: 400 },
+    labelMinRegret: 40, labelScale: 0.8, betterShare: 0.6, maxBetter: 150, maxLabelled: 2000 },   // the Worker offers only the newest 1000 labelled games, so every offered id is still remembered as applied
   // The engine gives up (no more playing on) once its own search says it is this far behind on this many of its moves in a row
   // (Michael, 2026-11-15: 3 moves at -500 cp or worse). Scores are from the engine's side; being mated counts.
   resign: { cp: -500, moves: 3 },
@@ -2503,6 +2503,42 @@ function sparMemoryParse(text) {
       out.games.push({ id: g.id.slice(0, 40), result: g.result, seed: typeof g.seed === 'number' && isFinite(g.seed) ? g.seed : 0, ts: typeof g.ts === 'number' && isFinite(g.ts) && g.ts >= 0 && g.ts <= 8.64e15 ? g.ts : 0, engine: typeof g.engine === 'string' ? g.engine.slice(0, 40) : '', engine_moves: typeof g.engine_moves === 'number' ? g.engine_moves : 0 });
     }
   });
+  return sparMemoryPrune(out);
+}
+
+// Merge two memories into a new one (browser copy and account copy). Both grow from a common history, so a record that is in both is the same
+// lesson seen at two moments: the one with more evidence (plays plus labelled plays) wins, never the sum, which would count games twice.
+// Records in only one are kept; game and labelled ids are unioned. Idempotent, and nothing is deleted except by the usual size caps.
+function sparMemoryMerge(a, b) {
+  var cfg = SPAR_CONFIG.memory;
+  var out = sparMemoryNew();
+  var weight = function(r) { return r.plays || 0; };   // result evidence; labelled evidence is merged separately below
+  [a, b].forEach(function(src, which) {
+    if (!src || !src.positions) return;
+    Object.keys(src.positions).forEach(function(key) {
+      var p = src.positions[key];
+      var dst = out.positions[key] || (out.positions[key] = { moves: {} });
+      Object.keys(p.moves || {}).forEach(function(u) {
+        var r = p.moves[u], have = dst.moves[u];
+        if (!have) { dst.moves[u] = JSON.parse(JSON.stringify(r)); return; }
+        // The results part (plays, w/d/l, blame) comes from the copy with more plays; the Stockfish part (nl, reg) from the copy with more labelled
+        // plays, so one copy's games never erase the other's labelled lessons (a labelled game id is only ever marked learned together with its lesson).
+        var winner = weight(r) > weight(have) || (weight(r) === weight(have) && (r.ts || 0) > (have.ts || 0)) ? r : have;
+        var labelSrc = (r.nl || 0) > (have.nl || 0) ? r : have;
+        var rec = JSON.parse(JSON.stringify(winner));
+        delete rec.nl; delete rec.reg;
+        if (labelSrc.nl) { rec.nl = labelSrc.nl; rec.reg = labelSrc.reg; }
+        dst.moves[u] = rec;
+      });
+      if (p.best && (!dst.best || p.best.gain > dst.best.gain || (p.best.gain === dst.best.gain && p.best.n > dst.best.n))) dst.best = JSON.parse(JSON.stringify(p.best));
+    });
+    (src.games || []).forEach(function(g) {
+      if (!out.games.some(function(x) { return x.id === g.id; })) out.games.push(JSON.parse(JSON.stringify(g)));
+    });
+    (src.labelled || []).forEach(function(id) { if (out.labelled.indexOf(id) === -1) out.labelled.push(id); });
+  });
+  out.games.sort(function(x, y) { return (x.ts || 0) - (y.ts || 0); });
+  if (out.labelled.length > cfg.maxLabelled) out.labelled = out.labelled.slice(out.labelled.length - cfg.maxLabelled);
   return sparMemoryPrune(out);
 }
 
@@ -6570,7 +6606,9 @@ function sparLoadMemory() {
   return sparMemory;
 }
 
+var sparMemoryRev = 0;   // bumped on every local change, so a sync that finishes after a game ended knows to merge again
 function sparSaveMemory() {
+  sparMemoryRev++;
   try { localStorage.setItem(SPAR_MEMORY_KEY, JSON.stringify(sparMemory)); }
   catch (e) { sparStatus('Could not save agent-chess memory in this browser.'); }
 }
@@ -6591,6 +6629,7 @@ if (sparToggleEl) {
   sparToggleEl.onchange = function() {
     sparEnabledNow = !!sparToggleEl.checked;
     try { localStorage.setItem(SPAR_MODE_KEY, sparToggleEl.checked ? '1' : '0'); } catch (e) { /* session only */ }
+    if (sparToggleEl.checked) sparSyncMemory();
   };
 }
 function sparPlayerName() {
@@ -6668,8 +6707,10 @@ document.getElementById('sparMemExportBtn').onclick = function() {
   sparDownload('agent-chess-memory.json', JSON.stringify(sparLoadMemory(), null, 1));
 };
 document.getElementById('sparMemResetBtn').onclick = function() {
+  if (!sparMemoryUsable()) { sparMemStatus(SPAR_NOT_OWNER_TEXT); return; }
   sparMemory = sparMemoryNew();
   sparSaveMemory();
+  sparSyncMemory({ reset: true });
   sparMemStatus('agent-chess memory cleared.');
 };
 document.getElementById('sparMemImportBtn').onclick = function() { document.getElementById('sparMemImportFile').click(); };
@@ -6682,8 +6723,10 @@ document.getElementById('sparMemImportFile').onchange = function(ev) {
   reader.onload = function() {
     var parsed = sparMemoryParse(String(reader.result));
     if (!parsed) { sparMemStatus('That is not an agent-chess memory file; nothing changed.'); return; }
+    if (!sparMemoryUsable()) { sparMemStatus(SPAR_NOT_OWNER_TEXT); return; }
     sparMemory = parsed;
     sparSaveMemory();
+    sparSyncMemory({ replace: true });
     sparMemStatus('Imported memory: ' + parsed.games.length + ' games, ' + Object.keys(parsed.positions).length + ' positions.');
   };
   reader.readAsText(file);
@@ -6703,7 +6746,7 @@ function sparBegin(t, message) {
     handoff: null,
     log: [],
     engineMoves: [],
-    memory: sparLoadMemory()
+    memory: sparMemoryForGame()
   };
   clearTimeout(t.hintTimer);
   t.hintSquare = null;
@@ -6842,6 +6885,150 @@ async function sparUploadGame(g) {
   } catch (e) { sparStatus('Game log not uploaded; use Game log in Settings > Training.'); }
 }
 
+/*
+  Memory sync: the player's memory also lives on the Worker (D1, one per verified email), so it follows them between browsers and
+  Stockfish labels added by an agent arrive by themselves. Signed-in players only; a failure never blocks play and the local copy stays.
+  Each round: read the account copy, merge it with this browser's (sparMemoryMerge), learn the labels of games labelled since the last
+  sync (once per game id), and write back only if that changed the account copy. A concurrent write by another browser is detected
+  (409) and merged again. Import replaces the account copy; Reset clears it and marks the existing labels as already seen.
+*/
+var SPAR_MEMORY_URL = 'https://mint-claude-agent-token.chess-prep.workers.dev/spar-memory';
+var SPAR_MEMORY_OWNER_KEY = 'chessPrepBoard.sparMemory.owner';
+var sparSyncBusy = false, sparSyncQueued = null, sparSyncRetries = 0;
+// A Reset or an Import is a job that lasts until its write has succeeded (and, for Reset, until every existing label has been marked
+// seen), however many rate-limited retries that takes: { kind: 'reset'|'replace', uid, clear: first write not done yet, seen: label ids }.
+var sparOp = null;
+var SPAR_SYNC_RETRY_MS = 11000;   // the Worker allows 3 requests per 10 s
+function sparStable(v) {
+  if (Array.isArray(v)) return '[' + v.map(sparStable).join(',') + ']';
+  if (v && typeof v === 'object') return '{' + Object.keys(v).sort().map(function(k) { return JSON.stringify(k) + ':' + sparStable(v[k]); }).join(',') + '}';
+  return JSON.stringify(v);
+}
+async function sparMemoryCall(auth, body) {
+  var response = await fetch(SPAR_MEMORY_URL, { method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, auth), body: JSON.stringify(body) });
+  var json = null;
+  try { json = await response.json(); } catch (e) { /* no body */ }
+  return { status: response.status, ok: response.ok, json: json };
+}
+function sparMemoryAssign(target, src) { target.v = src.v; target.positions = src.positions; target.games = src.games; target.labelled = src.labelled; return target; }
+function sparUserId() { try { return currentUser && currentUser.uid ? String(currentUser.uid) : ''; } catch (e) { return ''; } }
+// The browser copy belongs to one account. When another account signs in on the same browser, the first one's copy is put aside (and
+// comes back when that account returns) instead of being merged into the new account. A copy with no owner yet (made before sync
+// existed, or signed out) is claimed by the first account that syncs.
+function sparMemoryOwnerNow() { try { return localStorage.getItem(SPAR_MEMORY_OWNER_KEY); } catch (e) { return null; } }
+/*
+  One account per browser. The browser's memory belongs to the first signed-in account that uses it (the owner marker). That account's
+  memory syncs; another account signing in on the same browser plays without touching it and without syncing (nothing is merged
+  between accounts, so nothing can leak between them). Signed out, the browser copy works as it always did.
+*/
+var sparSessionOwner = null;   // the claim as this page knows it, so a blocked or failing localStorage cannot make the copy free for everyone
+function sparMemoryUsable() {
+  var uid = sparUserId();
+  if (!uid) return true;
+  var owner = sparMemoryOwnerNow() || sparSessionOwner;
+  if (!owner) {   // unowned: the first signed-in account to use it claims it
+    sparSessionOwner = uid;
+    try { localStorage.setItem(SPAR_MEMORY_OWNER_KEY, uid); } catch (e) { /* the session claim above still holds */ }
+    return true;
+  }
+  return owner === uid;
+}
+var SPAR_NOT_OWNER_TEXT = 'This browser\'s agent-chess memory belongs to another account, so it is not used or synced for this one.';
+// The memory a spar game uses: the browser's when it is this account's, else a fresh one that is never stored.
+function sparMemoryForGame() { return sparMemoryUsable() ? sparLoadMemory() : sparMemoryNew(); }
+async function sparSyncMemory(opts) {
+  opts = opts || {};
+  // A job is only for a signed-in account (signed out, Reset and Import affect this browser's copy alone), and it belongs to that account.
+  if ((opts.reset || opts.replace) && sparUserId()) sparOp = { kind: opts.reset ? 'reset' : 'replace', uid: sparUserId(), clear: true, seen: [] };
+  if (sparSyncBusy) { sparSyncQueued = Object.assign({}, sparSyncQueued || {}); return; }
+  sparSyncBusy = true;
+  var local = null, merged = null, learned = 0, uid = '', revAtStart = 0, rateLimited = false, moreLeft = false, myOp = null, reached = false;
+  try {
+    // The account is fixed before the token is requested and checked again after: a token and an owner must come from the same user.
+    var user = currentUser;
+    uid = sparUserId();
+    var auth = await explorerAuthHeader();
+    if (!auth.Authorization) sparOp = null;   // no token: the job cannot be carried out for the account, and must not linger for a later one
+    if (!auth.Authorization || !uid || currentUser !== user) return;   // signed out, or the account changed while waiting for the token
+    if (sparOp && sparOp.uid !== uid) sparOp = null;   // a job belongs to the account that started it
+    reached = true;
+    myOp = sparOp;   // the job this sync carries out; one requested while it runs is left for the next sync
+    if (!sparMemoryUsable()) { sparOp = null; sparMemStatus(SPAR_NOT_OWNER_TEXT); return; }
+    local = sparLoadMemory();
+    revAtStart = sparMemoryRev;
+    merged = sparMemoryParse(JSON.stringify(local)) || sparMemoryNew();   // a snapshot: another account switching the shared object while this waits cannot leak into it
+    var version = null;
+    // At most one extra page of labels per sync: a sync is get, [get], put, which fits the Worker's 3 requests per 10 s. A longer backlog
+    // is worked off over the next syncs, and what was learned is kept locally even if the account copy could not be written yet.
+    for (var attempt = 0; attempt < 3; attempt++) {
+      if (currentUser !== user) return;
+      var op = myOp;
+      if (op && op.clear) {
+        if (op.kind === 'reset') { merged = sparMemoryNew(); merged.labelled = op.seen.slice(); }   // the browser copy is the imported or cleared one
+      }
+      var got = await sparMemoryCall(auth, { op: 'get', known: merged.labelled.slice() });
+      if (currentUser !== user) return;   // the account changed while waiting for the reply
+      if (got.status === 429) { rateLimited = true; throw new Error('rate limited'); }
+      if (!got.ok || !got.json) throw new Error('get ' + got.status);
+      var server = got.json.memory ? sparMemoryParse(JSON.stringify(got.json.memory)) : null;
+      version = got.json.updated_at || null;
+      if (!(op && op.clear)) merged = sparMemoryMerge(merged, server || sparMemoryNew());
+      var pending = got.json.pending || [];
+      moreLeft = !!got.json.more;
+      for (var page = 0; page < 2 && pending.length; page++) {
+        pending.forEach(function(p) {
+          if (op && op.kind === 'reset') { if (merged.labelled.indexOf(p.id) === -1) merged.labelled.push(p.id); }   // Reset forgets lessons: existing labels are marked seen, not learned
+          else learned += sparMemoryApplyLabels(merged, p.id, p.rows) ? 1 : 0;
+        });
+        if (page === 1) break;
+        var more = await sparMemoryCall(auth, { op: 'get', known: merged.labelled.slice() });
+        if (currentUser !== user) return;
+        if (more.status === 429) { rateLimited = true; moreLeft = true; break; }   // keep what was learned; the rest comes on a later sync
+        if (!more.ok || !more.json) throw new Error('get ' + more.status);        // an unreadable page is not an empty one (a Reset must not finish early)
+        pending = more.ok && more.json && more.json.pending ? more.json.pending : [];
+        moreLeft = !!(more.ok && more.json && more.json.more);
+      }
+      if (op && op.kind === 'reset') op.seen = merged.labelled.slice();
+      var changed = !server || (op && op.clear) || sparStable(sparMemoryMerge(server, sparMemoryNew())) !== sparStable(merged);
+      if (!changed) break;
+      if (rateLimited) break;
+      if (currentUser !== user) return;
+      var put = await sparMemoryCall(auth, { op: 'put', memory: merged, expected_updated_at: version });
+      if (currentUser !== user) return;
+      if (put.ok) { if (op) op.clear = false; break; }
+      if (put.status === 429) { rateLimited = true; break; }
+      if (put.status !== 409) throw new Error('put ' + put.status);
+      // Another browser wrote first: read its copy again and merge it in.
+      if (attempt === 2) throw new Error('changed');
+    }
+    if (myOp && sparOp === myOp && !rateLimited) {
+      myOp.clear = false;
+      if (!(myOp.kind === 'reset' && moreLeft)) sparOp = null;   // done: written, and for Reset every existing label is seen
+      else rateLimited = true;                                    // more labels to mark seen: continue shortly
+    }
+    if (!rateLimited) sparMemStatus('Memory saved to your account (' + merged.games.length + ' games, ' + Object.keys(merged.positions).length + ' positions' + (learned ? ', ' + learned + ' newly labelled game' + (learned === 1 ? '' : 's') + ' learned' : '') + ').');
+  } catch (e) {
+    if (!rateLimited) sparMemStatus('Memory not synced to your account; it is kept in this browser.');
+  } finally {
+    // Whatever was learned stays in this browser, even when the account copy could not be written; a game that ended meanwhile is merged back in.
+    if (local && merged && uid && sparUserId() === uid) {
+      var changedMeanwhile = sparMemoryRev !== revAtStart;
+      sparMemoryAssign(local, changedMeanwhile ? sparMemoryMerge(local, merged) : merged);
+      sparSaveMemory();
+      if (changedMeanwhile && !sparSyncQueued) sparSyncQueued = {};
+    }
+    sparSyncBusy = false;
+    if (reached && sparOp && sparOp !== myOp && !sparSyncQueued) sparSyncQueued = {};   // a Reset or Import arrived while this sync ran: it gets its own sync
+    if (rateLimited && sparSyncRetries < 12) {
+      sparSyncRetries++;
+      sparMemStatus('Memory sync continues shortly (rate limit).');
+      sparSyncQueued = null;
+      setTimeout(function() { sparSyncMemory({}); }, SPAR_SYNC_RETRY_MS);
+    } else if (sparSyncQueued) { var next = sparSyncQueued; sparSyncQueued = null; sparSyncMemory(next); }
+    if (!rateLimited && !sparOp) sparSyncRetries = 0;
+  }
+}
+
 function sparFinish(t, result) {
   var sp = t.spar;
   if (!sp || sp.ended) return;
@@ -6849,17 +7036,21 @@ function sparFinish(t, result) {
   t.lineId++;
   clearTimeout(t.opponentTimer);
   var endScore = result === 'win' ? 1000 : result === 'loss' ? -1000 : 0;
-  var mem = sparLoadMemory();
-  var moves = sp.engineMoves.map(function(m) { return { fen: m.fen, uci: m.uci, predicted: m.predicted, best: m.best }; });
-  sparMemoryRecordGame(mem, { id: sp.id, seed: sp.seed, result: result, ts: Date.now(), moves: moves, endScore: endScore });
-  sparSaveMemory();
+  var usable = sparMemoryUsable();   // another account's game is never recorded in this browser's (the owner's) memory
+  var mem = usable ? sparLoadMemory() : sparMemoryNew();
+  if (usable) {
+    var moves = sp.engineMoves.map(function(m) { return { fen: m.fen, uci: m.uci, predicted: m.predicted, best: m.best }; });
+    sparMemoryRecordGame(mem, { id: sp.id, seed: sp.seed, result: result, ts: Date.now(), moves: moves, endScore: endScore });
+    sparSaveMemory();
+    sparSyncMemory();
+  }
   sparLastGame = {
     v: SPAR_CONFIG.logVersion, id: sp.id, seed: sp.seed, engine: SPAR_CONFIG.version, engine_color: sp.engineColor,
     result_for_engine: result, start_fen: sp.startFen, handoff: sp.handoff, pgn: game.pgn(), moves: sp.log, resigned: !!sp.resignedBy, resigned_by: sp.resignedBy || null
   };
   sparShowGameButtons(true);
   sparSyncResign();
-  sparStatus('Memory: ' + mem.games.length + ' games.');
+  sparStatus(usable ? 'Memory: ' + mem.games.length + ' games.' : SPAR_NOT_OWNER_TEXT);
   sparUploadGame(sparLastGame);
   t.busy = true;
   setTrainMessage((sp.resignedBy === 'player' ? 'Spar over: you resigned; agent-chess wins.' : sp.resignedBy === 'engine' ? 'Spar over: agent-chess resigns; you win.' : sparResultText(result, sp.engineColor, t)) + ' Press Next line to continue.');
