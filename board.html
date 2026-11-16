@@ -260,7 +260,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "01f4fd0 \u00b7 2026-11-16 00:57 UTC";
+var BOARD_BUILD = "ed925e0 \u00b7 2026-11-16 02:02 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1745,7 +1745,7 @@ function repertoireStatsText(stats, firstColour) {
   Everything below is deterministic given (position, config, seed, memory).
 */
 var SPAR_CONFIG = {
-  version: 'agent-chess/0.2.0',
+  version: 'agent-chess/0.3.0',
   logVersion: 1,
   defaultOn: true,
   minGames: 10,            // Explorer hand-off: fewer games than this at the position
@@ -1756,7 +1756,7 @@ var SPAR_CONFIG = {
   // within epsilon of the best count as equivalent and a seeded pick among those gives variety.
   // Strength comes from the search budget (nodes, time), not from noise. A chosen move is
   // verified one ply deeper before it is played (verifyMargin), and dropped if that refutes it.
-  engine: { maxDepth: 8, capMs: 400, qDepth: 6, checkExtPly: 12, ttMax: 200000, deltaMargin: 200, lmrAfter: 4, rootWindow: 150, epsilon: 10, verifyMargin: 40, verifyShare: 0.7, verifyRounds: 4 },
+  engine: { terms: { rooks: true, pawns: true, passed: true }, maxDepth: 8, capMs: 400, qDepth: 6, checkExtPly: 12, ttMax: 200000, deltaMargin: 200, lmrAfter: 4, rootWindow: 150, epsilon: 10, verifyMargin: 40, verifyShare: 0.7, verifyRounds: 4 },
   memory: { maxGames: 200, maxPositions: 4000, perBlame: 80, maxBonus: 60, maxPenalty: 400, winCredit: 0.15, lossScale: 300 },
   // The engine gives up (no more playing on) once its own search says it is this far behind on this many of its moves in a row
   // (Michael, 2026-11-15: 3 moves at -500 cp or worse). Scores are from the engine's side; being mated counts.
@@ -1841,37 +1841,85 @@ function sparExplorerPick(choice, draw) {
 /* ---------- Evaluation (named terms, centipawns from White's point of view) ---------- */
 
 var SPAR_PST_C = [];
+// Scratch arrays reused by every evaluation (it runs at every search leaf, so nothing is allocated per call).
+var SPAR_PAWNS_W = new Int8Array(8), SPAR_PAWNS_B = new Int8Array(8);
+var SPAR_W_MIN = new Int8Array(8), SPAR_W_MAX = new Int8Array(8), SPAR_B_MIN = new Int8Array(8), SPAR_B_MAX = new Int8Array(8);
+var SPAR_ROOKS = new Int8Array(66);   // rooks as (colour 1/-1, row, file): at most 20 can exist (two each plus eight promotions each), so none is ever dropped
+var SPAR_PASSED = [0, 5, 10, 20, 40, 70];   // by steps advanced from the pawn's own starting rank (0 = still home .. 5 = one step from queening)
 function sparEvalTerms(chess) {
   if (!SPAR_PST_C.length) for (var pt in SPAR_PST) SPAR_PST_C[pt.charCodeAt(0)] = SPAR_PST[pt];
   var board = chess._board;  // chess.js 1.4.0 internal 0x88 array (pinned; the tests check it exists)
-  var material = 0, pst = 0, bishops = { w: 0, b: 0 }, queens = 0, kings = { w: null, b: null };
+  var T = SPAR_CONFIG.engine.terms;
+  var pawnsW = SPAR_PAWNS_W, pawnsB = SPAR_PAWNS_B, wMin = SPAR_W_MIN, wMax = SPAR_W_MAX, bMin = SPAR_B_MIN, bMax = SPAR_B_MAX, rooks = SPAR_ROOKS;
+  pawnsW.fill(0); pawnsB.fill(0); wMin.fill(9); wMax.fill(-1); bMin.fill(9); bMax.fill(-1);   // rows are 0x88 rows: row 0 is rank 8
+  var nRooks = 0;
+  var material = 0, pst = 0, bishopsW = 0, bishopsB = 0, queens = 0;
+  var wkR = -1, wkC = 0, bkR = -1, bkC = 0;
   for (var i = 0; i < 128; i++) {
     if (i & 0x88) { i += 7; continue; }
     var sq = board[i];
     if (!sq) continue;
     var r = i >> 4, c = i & 7;
-    var sign = sq.color === 'w' ? 1 : -1;
+    var white = sq.color === 'w';
     var tc = sq.type.charCodeAt(0);
-    material += sign * SPAR_VALUE_C[tc];
-    if (tc === 98) bishops[sq.color]++;        // b
-    else if (tc === 113) queens++;             // q
-    if (tc === 107) kings[sq.color] = [r, c]; // k
-    else pst += sign * SPAR_PST_C[tc][sq.color === 'w' ? r * 8 + c : (7 - r) * 8 + c];
+    material += white ? SPAR_VALUE_C[tc] : -SPAR_VALUE_C[tc];
+    if (tc === 107) {                                // k
+      if (white) { wkR = r; wkC = c; } else { bkR = r; bkC = c; }
+      continue;
+    }
+    pst += (white ? 1 : -1) * SPAR_PST_C[tc][white ? r * 8 + c : (7 - r) * 8 + c];
+    if (tc === 98) { if (white) bishopsW++; else bishopsB++; }   // b
+    else if (tc === 113) queens++;                               // q
+    else if (tc === 112) {                                       // p
+      if (white) { pawnsW[c]++; if (r < wMin[c]) wMin[c] = r; if (r > wMax[c]) wMax[c] = r; }
+      else { pawnsB[c]++; if (r > bMax[c]) bMax[c] = r; if (r < bMin[c]) bMin[c] = r; }
+    } else if (tc === 114) { rooks[nRooks * 3] = white ? 1 : -1; rooks[nRooks * 3 + 1] = r; rooks[nRooks * 3 + 2] = c; nRooks++; }   // r
   }
   // King: middlegame table while queens are on, else walk to the centre.
   var king = 0;
-  ['w', 'b'].forEach(function(color) {
-    var pos = kings[color];
-    if (!pos) return;
-    var sign = color === 'w' ? 1 : -1;
-    if (queens > 0) king += sign * SPAR_PST.k[color === 'w' ? pos[0] * 8 + pos[1] : (7 - pos[0]) * 8 + pos[1]];
-    else king += sign * Math.round(30 - 10 * Math.max(Math.abs(pos[0] - 3.5), Math.abs(pos[1] - 3.5)));
-  });
-  var bishopPair = (bishops.w >= 2 ? 30 : 0) - (bishops.b >= 2 ? 30 : 0);
-  return { material: material, pst: pst + king, bishop_pair: bishopPair };
+  if (wkR >= 0) king += queens > 0 ? SPAR_PST.k[wkR * 8 + wkC] : Math.round(30 - 10 * Math.max(Math.abs(wkR - 3.5), Math.abs(wkC - 3.5)));
+  if (bkR >= 0) king -= queens > 0 ? SPAR_PST.k[(7 - bkR) * 8 + bkC] : Math.round(30 - 10 * Math.max(Math.abs(bkR - 3.5), Math.abs(bkC - 3.5)));
+  var bishopPair = (bishopsW >= 2 ? 30 : 0) - (bishopsB >= 2 ? 30 : 0);
+  var rookTerm = 0, pawnTerm = 0, passedTerm = 0, k, f;
+  if (T.rooks) {  // a rook wants a file with no pawn of its own (semi-open), best one with none at all (open); and the seventh rank
+    for (k = 0; k < nRooks; k++) {
+      var col = rooks[k * 3], rr = rooks[k * 3 + 1], rf = rooks[k * 3 + 2];
+      var own = col === 1 ? pawnsW[rf] : pawnsB[rf], opp = col === 1 ? pawnsB[rf] : pawnsW[rf];
+      var rs = own === 0 ? (opp === 0 ? 20 : 10) : 0;
+      if ((col === 1 && rr === 1) || (col === -1 && rr === 6)) rs += 15;
+      rookTerm += col * rs;
+    }
+  }
+  if (T.pawns || T.passed) {
+    for (f = 0; f < 8; f++) {
+      var pw = pawnsW[f], pb = pawnsB[f];
+      if (!pw && !pb) continue;
+      if (T.pawns) {   // doubled and isolated pawns
+        if (pw > 1) pawnTerm -= 10 * (pw - 1);
+        if (pb > 1) pawnTerm += 10 * (pb - 1);
+        var nbW = (f > 0 ? pawnsW[f - 1] : 0) + (f < 7 ? pawnsW[f + 1] : 0), nbB = (f > 0 ? pawnsB[f - 1] : 0) + (f < 7 ? pawnsB[f + 1] : 0);
+        if (pw && !nbW) pawnTerm -= 12 * pw;
+        if (pb && !nbB) pawnTerm += 12 * pb;
+      }
+      if (T.passed) {  // no enemy pawn ahead on its file or the neighbours; worth more the further it has come
+        var lo = f > 0 ? f - 1 : 0, hi = f < 7 ? f + 1 : 7, q;
+        if (pw) {
+          var wr = wMin[f], blocked = false;
+          for (q = lo; q <= hi; q++) if (bMin[q] < wr) { blocked = true; break; }
+          if (!blocked) passedTerm += SPAR_PASSED[6 - wr];
+        }
+        if (pb) {
+          var br = bMax[f], blockedB = false;
+          for (q = lo; q <= hi; q++) if (wMax[q] > br) { blockedB = true; break; }
+          if (!blockedB) passedTerm -= SPAR_PASSED[br - 1];
+        }
+      }
+    }
+  }
+  return { material: material, pst: pst + king, bishop_pair: bishopPair, rooks: rookTerm, pawn_structure: pawnTerm, passed_pawns: passedTerm };
 }
 
-function sparEvalTotal(terms) { return terms.material + terms.pst + terms.bishop_pair; }
+function sparEvalTotal(terms) { return terms.material + terms.pst + terms.bishop_pair + terms.rooks + terms.pawn_structure + terms.passed_pawns; }
 
 /* ---------- Search ---------- */
 
@@ -2178,7 +2226,7 @@ function agentChessMove(position, opts) {
     var sign = side === 'w' ? 1 : -1;
     return {
       san: r.san, uci: uci, score: r.score, memory: memTerm, total: r.score + memTerm,
-      static_terms_after_move: { material: sign * terms.material, pst: sign * terms.pst, bishop_pair: sign * terms.bishop_pair },
+      static_terms_after_move: { material: sign * terms.material, pst: sign * terms.pst, bishop_pair: sign * terms.bishop_pair, rooks: sign * terms.rooks, pawn_structure: sign * terms.pawn_structure, passed_pawns: sign * terms.passed_pawns },
       memory_record: rec ? { plays: rec.plays, w: rec.w, d: rec.d, l: rec.l, bad: rec.bad, good: rec.good } : null
     };
   }
