@@ -260,7 +260,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "ed925e0 \u00b7 2026-11-16 02:02 UTC";
+var BOARD_BUILD = "25734a0 \u00b7 2026-11-16 02:50 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1745,7 +1745,7 @@ function repertoireStatsText(stats, firstColour) {
   Everything below is deterministic given (position, config, seed, memory).
 */
 var SPAR_CONFIG = {
-  version: 'agent-chess/0.3.0',
+  version: 'agent-chess/0.4.0',
   logVersion: 1,
   defaultOn: true,
   minGames: 10,            // Explorer hand-off: fewer games than this at the position
@@ -1757,7 +1757,10 @@ var SPAR_CONFIG = {
   // Strength comes from the search budget (nodes, time), not from noise. A chosen move is
   // verified one ply deeper before it is played (verifyMargin), and dropped if that refutes it.
   engine: { terms: { rooks: true, pawns: true, passed: true }, maxDepth: 8, capMs: 400, qDepth: 6, checkExtPly: 12, ttMax: 200000, deltaMargin: 200, lmrAfter: 4, rootWindow: 150, epsilon: 10, verifyMargin: 40, verifyShare: 0.7, verifyRounds: 4 },
-  memory: { maxGames: 200, maxPositions: 4000, perBlame: 80, maxBonus: 60, maxPenalty: 400, winCredit: 0.15, lossScale: 300 },
+  memory: { maxGames: 200, maxPositions: 4000, perBlame: 80, maxBonus: 60, maxPenalty: 400, winCredit: 0.15, lossScale: 300,
+    // v2, learned from Stockfish-labelled games: a move whose labelled regret is at least labelMinRegret is penalised by labelScale of it; the
+    // labelled better move of that position gets betterShare of the regret it avoided (at most maxBetter).
+    labelMinRegret: 40, labelScale: 0.8, betterShare: 0.6, maxBetter: 150, maxLabelled: 400 },
   // The engine gives up (no more playing on) once its own search says it is this far behind on this many of its moves in a row
   // (Michael, 2026-11-15: 3 moves at -500 cp or worse). Scores are from the engine's side; being mated counts.
   resign: { cp: -500, moves: 3 },
@@ -2159,7 +2162,7 @@ function agentChessMove(position, opts) {
   // Memory terms for the root moves, known before the search so the root window can use them.
   var mem = opts.memory || null;
   var memTerms = {};
-  var memRecs = {};
+  var memPos = mem ? sparMemoryPosition(mem, rootFen) : null;
 
   // The legal root moves, ordered.
   var rootMoves = [];
@@ -2170,9 +2173,7 @@ function agentChessMove(position, opts) {
     if (!illegal) {
       rootMoves.push(m);
       var u = sparInternalUci(m);
-      var rec = mem ? sparMemoryLookup(mem, rootFen, u) : null;
-      memRecs[u] = rec;
-      memTerms[u] = rec ? sparMemoryTerm(rec) : 0;
+      memTerms[u] = sparMemoryTermFor(memPos, u);
     }
   });
   if (!rootMoves.length) return null;
@@ -2218,7 +2219,6 @@ function agentChessMove(position, opts) {
   // Candidates: exact scores, plus the memory term.
   function makeCand(r) {
     var uci = r.uci;
-    var rec = memRecs[uci];
     var memTerm = memTerms[uci];
     var after = new Chess(rootFen);
     after.move(r.san);
@@ -2227,7 +2227,7 @@ function agentChessMove(position, opts) {
     return {
       san: r.san, uci: uci, score: r.score, memory: memTerm, total: r.score + memTerm,
       static_terms_after_move: { material: sign * terms.material, pst: sign * terms.pst, bishop_pair: sign * terms.bishop_pair, rooks: sign * terms.rooks, pawn_structure: sign * terms.pawn_structure, passed_pawns: sign * terms.passed_pawns },
-      memory_record: rec ? { plays: rec.plays, w: rec.w, d: rec.d, l: rec.l, bad: rec.bad, good: rec.good } : null
+      memory_record: sparMemoryLogRecord(memPos, uci)
     };
   }
   var cands = results.filter(function(r) { return r.exact; }).map(makeCand);
@@ -2317,7 +2317,7 @@ function agentChessMove(position, opts) {
   // Moves cut by the window: the search only proved them no better than score_at_most (before
   // the memory term). A remembered loss can be the reason a move is here.
   var pruned = results.filter(function(r) { return !r.exact; }).map(function(r) {
-    return { san: r.san, uci: r.uci, score_at_most: r.score, memory: memTerms[r.uci], memory_record: memRecs[r.uci] ? { plays: memRecs[r.uci].plays, l: memRecs[r.uci].l, bad: memRecs[r.uci].bad, good: memRecs[r.uci].good } : null };
+    return { san: r.san, uci: r.uci, score_at_most: r.score, memory: memTerms[r.uci], memory_record: sparMemoryLogRecord(memPos, r.uci) };
   });
   // Candidates left out of the deeper re-rank (behind, or out of budget) are listed with their score.
   notDeepened.forEach(function(c) { pruned.push({ san: c.san, uci: c.uci, score_at_most: c.score, memory: c.memory, memory_record: c.memory_record, not_deepened: true }); });
@@ -2350,7 +2350,7 @@ function sparReplaySelection(entry) {
 
 /* ---------- Memory (JSON; see the design doc) ---------- */
 
-function sparMemoryNew() { return { v: 1, positions: {}, games: [] }; }
+function sparMemoryNew() { return { v: 2, positions: {}, games: [], labelled: [] }; }
 
 function sparMemoryLookup(mem, fen, uci) {
   var pos = mem && mem.positions && mem.positions[sparPositionKey(fen)];
@@ -2362,6 +2362,68 @@ function sparMemoryTerm(rec) {
   var cfg = SPAR_CONFIG.memory;
   var raw = (rec.good - rec.bad) * cfg.perBlame;
   return Math.round(Math.max(-cfg.maxPenalty, Math.min(cfg.maxBonus, raw)));
+}
+
+// The remembered facts about one position (or null).
+function sparMemoryPosition(mem, fen) {
+  return (mem && mem.positions && mem.positions[sparPositionKey(fen)]) || null;
+}
+
+// The whole memory term for one root move: v1 blame/credit from results, plus (v2) a penalty for a Stockfish-labelled regret and a
+// bonus for the position's labelled better move. Bounded, so a remembered move is demoted or promoted, never banned or forced.
+function sparMemoryTermFor(pos, uci) {
+  if (!pos) return 0;
+  var cfg = SPAR_CONFIG.memory;
+  var rec = pos.moves && pos.moves[uci];
+  var term = rec ? sparMemoryTerm(rec) : 0;
+  if (rec && rec.nl > 0 && rec.reg >= cfg.labelMinRegret) term -= Math.min(cfg.maxPenalty, Math.round(rec.reg * cfg.labelScale));
+  if (pos.best && pos.best.uci === uci && pos.best.gain > 0) term += Math.min(cfg.maxBetter, Math.round(pos.best.gain * cfg.betterShare));
+  return Math.max(-cfg.maxPenalty, Math.min(cfg.maxBetter, term));
+}
+
+// What the log shows for a candidate's memory (null when memory knows nothing about the move).
+function sparMemoryLogRecord(pos, uci) {
+  var rec = pos && pos.moves && pos.moves[uci];
+  var better = pos && pos.best && pos.best.uci === uci && pos.best.gain > 0 ? { cp: pos.best.cp, gain: pos.best.gain, n: pos.best.n } : null;
+  if (!rec && !better) return null;
+  var out = rec ? { plays: rec.plays, w: rec.w, d: rec.d, l: rec.l, bad: rec.bad, good: rec.good } : { plays: 0, w: 0, d: 0, l: 0, bad: 0, good: 0 };
+  if (rec && rec.nl > 0) { out.nl = rec.nl; out.reg = rec.reg; }
+  if (better) out.better = better;
+  return out;
+}
+
+// Apply Stockfish labels to the memory: rows are { fen, uci, sf_best, best_cp, played_cp, regret, wp_loss } for the engine's own moves of
+// one game. Each move's regret is averaged into its record; the position remembers Stockfish's better move and how much it was worth.
+// A game id is applied once (importing the same labels twice changes nothing). Returns the number of rows applied.
+function sparMemoryApplyLabels(mem, gameId, rows, now) {
+  var cfg = SPAR_CONFIG.memory;
+  var stamp = typeof now === 'number' && isFinite(now) && now > 0 ? now : Date.now();   // labelled records count as freshly learned, so eviction keeps them
+  if (typeof gameId !== 'string' || !gameId || gameId.length > 40 || !Array.isArray(rows)) return 0;   // an id longer than the stored 40 characters could never match itself again
+  if (!Array.isArray(mem.labelled)) mem.labelled = [];
+  if (mem.labelled.indexOf(gameId) !== -1) return 0;
+  var applied = 0;
+  rows.forEach(function(r) {
+    if (!r || typeof r.fen !== 'string' || typeof r.uci !== 'string' || typeof r.sf_best !== 'string' || !/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(r.uci) || !/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(r.sf_best)) return;
+    var regret = typeof r.regret === 'number' && isFinite(r.regret) ? Math.max(0, Math.min(500, r.regret)) : null;
+    if (regret === null) return;
+    var key = sparPositionKey(r.fen);
+    var pos = mem.positions[key] || (mem.positions[key] = { moves: {} });
+    var rec = pos.moves[r.uci] || (pos.moves[r.uci] = { plays: 0, w: 0, d: 0, l: 0, bad: 0, good: 0, last: null, ts: 0 });
+    var nl = (rec.nl || 0) + 1;
+    rec.reg = Math.round(((rec.reg || 0) * (nl - 1) + regret) / nl * 10) / 10;
+    rec.nl = nl;
+    rec.ts = Math.max(rec.ts || 0, stamp);
+    if (r.sf_best !== r.uci && regret >= cfg.labelMinRegret) {
+      var same = pos.best && pos.best.uci === r.sf_best;
+      pos.best = { uci: r.sf_best, cp: typeof r.best_cp === 'number' && isFinite(r.best_cp) ? Math.max(-10000, Math.min(10000, Math.round(r.best_cp))) : 0,
+        gain: Math.round(Math.max(regret, same ? pos.best.gain : 0)), n: same ? pos.best.n + 1 : 1 };
+    }
+    applied++;
+  });
+  mem.labelled.push(gameId);
+  if (mem.labelled.length > cfg.maxLabelled) mem.labelled = mem.labelled.slice(mem.labelled.length - cfg.maxLabelled);
+  sparMemoryPrune(mem);
+  return applied;
 }
 
 // Record a finished game. game: { id, seed, result: 'win'|'loss'|'draw' (the engine's), ts,
@@ -2414,7 +2476,7 @@ function sparMemoryPrune(mem) {
 function sparMemoryParse(text) {
   var data;
   try { data = JSON.parse(text); } catch (e) { return null; }
-  if (!data || data.v !== 1 || typeof data.positions !== 'object' || !data.positions || Array.isArray(data.positions) || !Array.isArray(data.games)) return null;
+  if (!data || (data.v !== 1 && data.v !== 2) || typeof data.positions !== 'object' || !data.positions || Array.isArray(data.positions) || !Array.isArray(data.games)) return null;
   var out = sparMemoryNew();
   Object.keys(data.positions).forEach(function(key) {
     var moves = data.positions[key] && data.positions[key].moves;
@@ -2426,9 +2488,16 @@ function sparMemoryParse(text) {
       var num = function(x) { return typeof x === 'number' && isFinite(x) && x >= 0 && x <= 100000 ? x : 0; };
       var stamp = function(x) { return typeof x === 'number' && isFinite(x) && x >= 0 && x <= 8.64e15 ? x : 0; };  // a Date.now() value
       clean[uci] = { plays: num(r.plays), w: num(r.w), d: num(r.d), l: num(r.l), bad: num(r.bad), good: num(r.good), last: typeof r.last === 'string' ? r.last.slice(0, 40) : null, ts: stamp(r.ts) };
+      if (typeof r.nl === 'number' && isFinite(r.nl) && r.nl >= 1 && r.nl <= 100000) { clean[uci].nl = Math.floor(r.nl); clean[uci].reg = typeof r.reg === 'number' && isFinite(r.reg) ? Math.max(0, Math.min(500, r.reg)) : 0; }
     });
-    if (Object.keys(clean).length) out.positions[key] = { moves: clean };
+    var best = data.positions[key].best, cleanBest = null;
+    if (best && typeof best === 'object' && typeof best.uci === 'string' && /^[a-h][1-8][a-h][1-8][qrbn]?$/.test(best.uci) && typeof best.gain === 'number' && isFinite(best.gain) && best.gain > 0) {
+      cleanBest = { uci: best.uci, cp: typeof best.cp === 'number' && isFinite(best.cp) ? Math.max(-10000, Math.min(10000, Math.round(best.cp))) : 0,
+        gain: Math.min(500, Math.round(best.gain)), n: typeof best.n === 'number' && isFinite(best.n) && best.n >= 1 ? Math.min(100000, Math.floor(best.n)) : 1 };
+    }
+    if (Object.keys(clean).length || cleanBest) { out.positions[key] = { moves: clean }; if (cleanBest) out.positions[key].best = cleanBest; }
   });
+  if (Array.isArray(data.labelled)) out.labelled = data.labelled.filter(function(id) { return typeof id === 'string' && id.length > 0; }).map(function(id) { return id.slice(0, 40); }).slice(-SPAR_CONFIG.memory.maxLabelled);
   data.games.slice(-SPAR_CONFIG.memory.maxGames).forEach(function(g) {
     if (g && typeof g.id === 'string' && ['win', 'loss', 'draw'].indexOf(g.result) !== -1) {
       out.games.push({ id: g.id.slice(0, 40), result: g.result, seed: typeof g.seed === 'number' && isFinite(g.seed) ? g.seed : 0, ts: typeof g.ts === 'number' && isFinite(g.ts) && g.ts >= 0 && g.ts <= 8.64e15 ? g.ts : 0, engine: typeof g.engine === 'string' ? g.engine.slice(0, 40) : '', engine_moves: typeof g.engine_moves === 'number' ? g.engine_moves : 0 });
