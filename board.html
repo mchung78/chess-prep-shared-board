@@ -216,6 +216,7 @@ Analysis mode
 <div data-row="spar" style="grid-column:1 / -1; margin:0 0 6px; padding-top:8px; border-top:1px solid var(--border-strong, #666);">
 <div style="font-size:13px; margin-bottom:4px;" title="After a Train line ends the board plays on: first Lichess-Explorer-weighted replies, then agent-chess, a home-grown engine that learns from the games it loses. These apply at once on this device; Close does not save them.">Spar vs agent-chess</div>
 <label style="display:flex; gap:6px; align-items:center; font-size:13px; margin-bottom:6px;" title="After a line ends, play on against Lichess-Explorer-weighted moves, then against agent-chess."><input type="checkbox" id="sparToggle"> Spar after each line</label>
+<label style="display:flex; gap:6px; align-items:center; font-size:13px; margin-bottom:6px;" title="When a spar game ends, Stockfish runs in the background in this browser (about 20 seconds) and scores each of agent-chess's moves, so it can learn from its mistakes. Nothing runs during a game."><input type="checkbox" id="sparLabelToggle"> Label finished games with Stockfish</label>
 <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center; font-size:12px;">
 <button id="sparLogBtn" type="button" disabled title="Download the last spar game of this session: PGN plus the per-move explanation log (JSON). Available once a game has finished.">Game log</button><button id="sparMemExportBtn" type="button" title="Download agent-chess memory (JSON).">Export memory</button><button id="sparMemImportBtn" type="button" title="Replace agent-chess memory from a JSON file.">Import memory</button><button id="sparMemResetBtn" type="button" title="Forget everything agent-chess has learned.">Reset memory</button><input type="file" id="sparMemImportFile" accept="application/json,.json" style="display:none;"><span id="sparMemStatus" role="status" aria-live="polite" style="color:var(--text-secondary, #aaa);"></span>
 </div></div>
@@ -260,7 +261,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "eba5bcc \u00b7 2026-11-16 23:31 UTC";
+var BOARD_BUILD = "9432976 \u00b7 2026-11-17 00:19 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -6839,7 +6840,7 @@ async function sparOpponentMove(t, lineId) {
     }
     entry = r.log;
     if (sp.handoff && !sp.handoffLogged) { entry.handoff = sp.handoff; sp.handoffLogged = true; }
-    sp.engineMoves.push({ fen: fen, uci: r.uci, predicted: entry.engine.chosen_score, best: entry.engine.best_score });
+    sp.engineMoves.push({ fen: fen, uci: r.uci, ply: entry.ply, predicted: entry.engine.chosen_score, best: entry.engine.best_score });
   }
   sp.log.push(entry);
   var wait = Math.max(0, SPAR_CONFIG.moveDelayMs - (Date.now() - started));
@@ -6874,15 +6875,151 @@ function sparSlimGame(g) {
     return Object.assign({}, m, { engine: e });
   }) });
 }
+// Resolves to the game's id on the Worker (sg-...) once it is stored there, else null.
 async function sparUploadGame(g) {
   try {
     var auth = await explorerAuthHeader();
-    if (!auth.Authorization) return;  // not signed in: the local download is the only copy
+    if (!auth.Authorization) return null;  // not signed in: the local download is the only copy
     var body = JSON.stringify(sparSlimGame(g));
-    if (body.length > SPAR_UPLOAD_MAX_BYTES) { sparStatus('Game log too large to upload; use Game log in Settings > Training.'); return; }
+    if (body.length > SPAR_UPLOAD_MAX_BYTES) { sparStatus('Game log too large to upload; use Game log in Settings > Training.'); return null; }
     var response = await fetch(SPAR_UPLOAD_URL, { method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, auth), body: body });
     sparStatus(response.ok ? 'Game log saved to your account.' : 'Game log not uploaded (' + response.status + '); use Game log in Settings > Training.');
-  } catch (e) { sparStatus('Game log not uploaded; use Game log in Settings > Training.'); }
+    if (!response.ok) return null;
+    var json = null;
+    try { json = await response.json(); } catch (e) { /* no body */ }
+    return json && typeof json.id === 'string' && /^sg-[0-9a-f]{16}$/.test(json.id) ? json.id : null;
+  } catch (e) { sparStatus('Game log not uploaded; use Game log in Settings > Training.'); return null; }
+}
+
+/*
+  Background Stockfish labelling (Michael, 2026-11-16: "just a background task that runs in my browser after the game").
+  When a spar game ends, the vendored Stockfish (the same engine the board uses for analysis, in its own Web Worker) scores each of
+  agent-chess's own moves against its best alternative: the best move and its score at a fixed depth, and the played move's score from
+  the same position (searchmoves). The difference is the regret. No model, no tokens, nothing at move time; the engine only learns from
+  it afterwards. The rows teach the memory at once (sparMemoryApplyLabels, once per game id) and, when the game is on the account, are
+  also stored on the Worker beside the game so agents can read them. Games are labelled one at a time. About 15-25 s per game.
+*/
+var SPAR_LABEL = { depth: 13, movetimeMs: 700, idleMs: 40, labelerPrefix: 'board stockfish-18 depth ', settingKey: 'chessPrepBoard.sparLabel' };
+var sparLabelChain = Promise.resolve();
+var sparLabelEnabledNow = null;
+function sparLabelEnabled() {
+  if (sparLabelEnabledNow !== null) return sparLabelEnabledNow;
+  var v = null;
+  try { v = localStorage.getItem(SPAR_LABEL.settingKey); } catch (e) { /* default */ }
+  return v !== '0';   // on by default
+}
+function sparWinPct(cp) { return 50 + 50 * (2 / (1 + Math.exp(-0.00368208 * Math.max(-1500, Math.min(1500, cp)))) - 1); }
+// UCI mate scores become large centipawn values the way the offline labeller does it (mate in n: 10000 - n, mated in n: -10000 + n).
+function sparLabelScore(parsed) {
+  if (!parsed) return null;
+  if (parsed.mate !== null) return parsed.mate > 0 ? 10000 - parsed.mate : -10000 - parsed.mate;
+  return parsed.cp;
+}
+// One search on an already running engine worker: resolves { cp (side to move), move } or null on an error or timeout.
+function sparLabelSearch(worker, fen, searchMove) {
+  return new Promise(function(resolve) {
+    var latest = null, settled = false;
+    var timer = setTimeout(function() { finish(null); }, SPAR_LABEL.movetimeMs + STOCKFISH_HARD_TIMEOUT_BUFFER_MS);
+    function finish(v) { if (settled) return; settled = true; clearTimeout(timer); worker.onmessage = null; worker.onerror = null; resolve(v); }
+    worker.onmessage = function(ev) {
+      var line = typeof ev.data === 'string' ? ev.data : '';
+      if (line.indexOf('info') === 0) { var p = parseUciScoreLine(line); if (p) latest = p; }
+      var best = parseUciBestmoveLine(line);
+      if (best) {
+        var cp = sparLabelScore(latest);
+        finish(cp === null ? null : { cp: cp, move: best });
+      }
+    };
+    worker.onerror = function() { finish(null); };
+    worker.postMessage('position fen ' + fen);
+    worker.postMessage('go depth ' + SPAR_LABEL.depth + ' movetime ' + SPAR_LABEL.movetimeMs + (searchMove ? ' searchmoves ' + searchMove : ''));  // searchmoves must come last
+  });
+}
+// Labels a finished game's own engine moves: rows { ply, fen, uci, sf_best, best_cp, played_cp, regret, wp_loss }, or null when Stockfish is not available.
+async function sparLabelMoves(engineMoves) {
+  var worker = null;
+  function start() {
+    try { worker = new Worker(STOCKFISH_SCRIPT_PATH); } catch (e) { worker = null; return false; }
+    worker.postMessage('uci'); worker.postMessage('isready'); worker.postMessage('ucinewgame');
+    return true;
+  }
+  // A search that errored or timed out may still answer later; a worker that did is thrown away, so a late reply can never be taken for the next position's.
+  function restart() { try { worker.terminate(); } catch (e) { /* gone */ } return start(); }
+  if (!start()) return null;
+  var rows = [];
+  try {
+    for (var i = 0; i < engineMoves.length; i++) {
+      var m = engineMoves[i];
+      if (typeof m.ply !== 'number' || typeof m.fen !== 'string') continue;
+      var best = await sparLabelSearch(worker, m.fen, null);
+      if (!best) { if (!restart()) break; continue; }   // a failed search skips that move on a fresh worker; only a job with no result at all counts as unavailable
+      var played = m.uci === best.move ? best : await sparLabelSearch(worker, m.fen, m.uci);
+      if (!played) { if (!restart()) break; continue; }
+      var clamp = function(x) { return Math.max(-1500, Math.min(1500, x)); };
+      rows.push({ ply: m.ply, fen: m.fen, uci: m.uci, sf_best: best.move, best_cp: best.cp, played_cp: played.cp,
+        regret: Math.max(0, clamp(best.cp) - clamp(played.cp)), wp_loss: Math.round(Math.max(0, sparWinPct(best.cp) - sparWinPct(played.cp)) * 10) / 10 });
+      await new Promise(function(r) { setTimeout(r, SPAR_LABEL.idleMs); });   // lets the page breathe between searches
+    }
+  } finally { if (worker) { try { worker.terminate(); } catch (e) { /* gone */ } } }
+  return rows.length ? rows : null;
+}
+// Waits (a few seconds at most) for a running memory sync to finish, so labels learned here are in the account copy before the game is offered as labelled.
+async function sparSyncSettled() {
+  for (var i = 0; i < 75 && sparSyncBusy; i++) await new Promise(function(r) { setTimeout(r, 200); });
+}
+async function sparLabelAfterGame(engineMoves, gameId, uploaded) {
+  if (!sparLabelEnabled() || !engineMoves.length) return;
+  var uid = sparUserId();
+  var rows = await sparLabelMoves(engineMoves);
+  if (!rows || !rows.length) { sparMemStatus('Stockfish was not available to label this game.'); return; }
+  if (sparUserId() !== uid) return;   // another account signed in while Stockfish ran: nothing of this game goes anywhere
+  var serverId = await uploaded;
+  var key = serverId || gameId;
+  var learned = 0;
+  if (sparMemoryUsable()) {
+    learned = sparMemoryApplyLabels(sparLoadMemory(), key, rows);
+    sparSaveMemory();
+    // The account copy must have the game id before the labels are published, or another browser could learn the game twice: sync until
+    // it has been persisted (a rate limit only delays it), a handful of tries at most.
+    for (var attempt = 0; attempt < 5; attempt++) {
+      await sparSyncSettled();
+      if (sparUserId() !== uid) return;
+      if (await sparSyncMemory()) break;
+      await new Promise(function(r) { setTimeout(r, SPAR_SYNC_RETRY_MS); });
+    }
+  }
+  var bad = rows.filter(function(r) { return r.wp_loss >= 15; }).length;
+  sparMemStatus('Stockfish labelled ' + rows.length + ' moves (' + bad + ' blunder' + (bad === 1 ? '' : 's') + '); ' + (learned ? 'agent-chess learned from them.' : 'nothing new to learn.'));
+  if (serverId) {
+    var payload = { op: 'labels', id: serverId, labeler: SPAR_LABEL.labelerPrefix + SPAR_LABEL.depth, rows: rows.map(function(r) {
+      return { ply: r.ply, uci: r.uci, sf_best: r.sf_best, best_cp: Math.round(r.best_cp), played_cp: Math.round(r.played_cp), regret: Math.round(r.regret), wp_loss: r.wp_loss };
+    }) };
+    // Stored on the Worker after the memory sync used its requests: wait out the rate-limit window, and try again on a 429 or a server error.
+    for (var tries = 0; tries < 5; tries++) {
+      await new Promise(function(r) { setTimeout(r, SPAR_SYNC_RETRY_MS); });
+      try {
+        var auth = await explorerAuthHeader();
+        if (!auth.Authorization || sparUserId() !== uid) break;
+        var res = await sparMemoryCall(auth, payload);
+        if (res.ok || (res.status >= 400 && res.status < 500 && res.status !== 429)) break;   // stored, already there, or refused for good
+      } catch (e) { /* try again */ }
+    }
+  }
+}
+// One game at a time, never blocking anything else; a failure only ends that game's labelling.
+function sparLabelGame(sp, uploaded) {
+  var moves = sp.engineMoves.slice(), id = sp.id;
+  sparLabelChain = sparLabelChain.then(function() { return sparLabelAfterGame(moves, id, uploaded); }).catch(function() { /* labelling is best effort */ });
+  return sparLabelChain;
+}
+
+var sparLabelToggleEl = document.getElementById('sparLabelToggle');
+if (sparLabelToggleEl) {
+  sparLabelToggleEl.checked = sparLabelEnabled();
+  sparLabelToggleEl.onchange = function() {
+    sparLabelEnabledNow = !!sparLabelToggleEl.checked;
+    try { localStorage.setItem(SPAR_LABEL.settingKey, sparLabelToggleEl.checked ? '1' : '0'); } catch (e) { /* session only */ }
+  };
 }
 
 /*
@@ -6942,7 +7079,7 @@ async function sparSyncMemory(opts) {
   if ((opts.reset || opts.replace) && sparUserId()) sparOp = { kind: opts.reset ? 'reset' : 'replace', uid: sparUserId(), clear: true, seen: [] };
   if (sparSyncBusy) { sparSyncQueued = Object.assign({}, sparSyncQueued || {}); return; }
   sparSyncBusy = true;
-  var local = null, merged = null, learned = 0, uid = '', revAtStart = 0, rateLimited = false, moreLeft = false, myOp = null, reached = false;
+  var local = null, merged = null, learned = 0, uid = '', revAtStart = 0, rateLimited = false, moreLeft = false, myOp = null, reached = false, persisted = false;
   try {
     // The account is fixed before the token is requested and checked again after: a token and an owner must come from the same user.
     var user = currentUser;
@@ -7006,6 +7143,7 @@ async function sparSyncMemory(opts) {
       if (!(myOp.kind === 'reset' && moreLeft)) sparOp = null;   // done: written, and for Reset every existing label is seen
       else rateLimited = true;                                    // more labels to mark seen: continue shortly
     }
+    persisted = !rateLimited;   // written, or already the same on the account
     if (!rateLimited) sparMemStatus('Memory saved to your account (' + merged.games.length + ' games, ' + Object.keys(merged.positions).length + ' positions' + (learned ? ', ' + learned + ' newly labelled game' + (learned === 1 ? '' : 's') + ' learned' : '') + ').');
   } catch (e) {
     if (!rateLimited) sparMemStatus('Memory not synced to your account; it is kept in this browser.');
@@ -7027,6 +7165,7 @@ async function sparSyncMemory(opts) {
     } else if (sparSyncQueued) { var next = sparSyncQueued; sparSyncQueued = null; sparSyncMemory(next); }
     if (!rateLimited && !sparOp) sparSyncRetries = 0;
   }
+  return persisted;
 }
 
 function sparFinish(t, result) {
@@ -7051,7 +7190,8 @@ function sparFinish(t, result) {
   sparShowGameButtons(true);
   sparSyncResign();
   sparStatus(usable ? 'Memory: ' + mem.games.length + ' games.' : SPAR_NOT_OWNER_TEXT);
-  sparUploadGame(sparLastGame);
+  var uploaded = sparUploadGame(sparLastGame);
+  if (usable) sparLabelGame(sp, uploaded);
   t.busy = true;
   setTrainMessage((sp.resignedBy === 'player' ? 'Spar over: you resigned; agent-chess wins.' : sp.resignedBy === 'engine' ? 'Spar over: agent-chess resigns; you win.' : sparResultText(result, sp.engineColor, t)) + ' Press Next line to continue.');
   // Michael, 2026-11-15: the board waits here (no automatic next line) so the finished game can be looked at, copied or discussed.
