@@ -261,7 +261,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "9432976 \u00b7 2026-11-17 00:19 UTC";
+var BOARD_BUILD = "e8f81f9 \u00b7 2026-11-19 02:39 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -3621,14 +3621,17 @@ function snapGhostToSquare(ghost, sq) {
 }
 
 /*
-  Right-click arrow (Michael, 2026-11-15), like Lichess: press the right button on one square and release it on another to draw a
-  green arrow between them (an SVG over the board, so it follows the board when flipped). One arrow for now: drawing a second
-  replaces the first, repeating the same arrow removes it, a left-click on the board clears it, and so does any change of the
-  position shown. While the button is held the arrow previews. The board's context menu is suppressed so the right button is free.
+  Right-click arrows (Michael, 2026-11-15), like Lichess: press the right button on one square and release it on another to draw
+  an arrow between them (an SVG over the board, so it follows the board when flipped). Any number of arrows can be drawn
+  (Michael, 2026-11-17). The colour follows the modifier held: none = green, Ctrl = red, Alt = blue, Shift = gold. Repeating an arrow of the
+  same colour removes it; repeating it in another colour recolours it. A left-click on the board clears every arrow, and so does
+  any change of the position shown. While the button is held the arrow previews. The board's context menu is suppressed so the
+  right button is free.
 */
-var boardArrow = null;      // { from, to, fen }
-var arrowDrag = null;       // { from, to } while the right button is down
-var ARROW_COLOR = 'rgb(21, 120, 27)';
+var boardArrows = [];       // [{ from, to, color, fen }]
+var arrowDrag = null;       // { from, to, color, fen } while the right button is down
+var ARROW_COLORS = { green: 'rgb(21, 120, 27)', red: 'rgb(180, 30, 30)', blue: 'rgb(30, 90, 190)', gold: 'rgb(212, 160, 20)' };
+function arrowColorName(ev) { return ev.ctrlKey ? 'red' : ev.altKey ? 'blue' : ev.shiftKey ? 'gold' : 'green'; }
 function arrowGeometry(from, to) {
   var a = boardEl.querySelector('[data-square="' + from + '"]'), b = boardEl.querySelector('[data-square="' + to + '"]');
   if (!a || !b) return null;
@@ -3646,29 +3649,37 @@ function arrowGeometry(from, to) {
   ];
   return pts.map(function(p) { return p[0].toFixed(1) + ',' + p[1].toFixed(1); }).join(' ');
 }
-// Paints the committed arrow (or the preview while dragging) over the board; clears a committed arrow that belongs to another position.
+// Paints the committed arrows (plus the preview while dragging) over the board; drops committed arrows that belong to another position.
 function drawBoardArrow(fen) {
-  var old = boardEl.querySelector('#boardArrow');
+  var old = boardEl.querySelector('#boardArrows');
   if (old) old.remove();
-  if (boardArrow && fen && boardArrow.fen !== fen) boardArrow = null;
+  if (fen) boardArrows = boardArrows.filter(function(a) { return a.fen === fen; });
   if (arrowDrag && fen && arrowDrag.fen !== fen) cancelArrowDrag();   // the position changed under a held right button: drop the gesture
-  var arrow = arrowDrag && arrowDrag.to && arrowDrag.to !== arrowDrag.from ? arrowDrag : boardArrow;
-  if (!arrow) return;
-  var points = arrowGeometry(arrow.from, arrow.to);
-  if (!points) return;
+  var list = boardArrows.slice();
+  if (arrowDrag && arrowDrag.to && arrowDrag.to !== arrowDrag.from) list.push(arrowDrag);
+  var shapes = [];
+  list.forEach(function(arrow) {
+    var points = arrowGeometry(arrow.from, arrow.to);
+    if (points) shapes.push({ arrow: arrow, points: points });
+  });
+  if (!shapes.length) return;
   var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  svg.setAttribute('id', 'boardArrow');
+  svg.setAttribute('id', 'boardArrows');
   // Pixel geometry in a viewBox, drawn at 100% of the board: a window resize (which only changes --square-size) scales it with the board.
   svg.setAttribute('viewBox', '0 0 ' + boardEl.clientWidth + ' ' + boardEl.clientHeight);
   svg.setAttribute('preserveAspectRatio', 'none');
-  svg.setAttribute('data-from', arrow.from);
-  svg.setAttribute('data-to', arrow.to);
   svg.style.cssText = 'position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none; z-index:5;';
-  var poly = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
-  poly.setAttribute('points', points);
-  poly.setAttribute('fill', ARROW_COLOR);
-  poly.setAttribute('fill-opacity', '0.75');
-  svg.appendChild(poly);
+  shapes.forEach(function(sh) {
+    var poly = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
+    poly.setAttribute('class', 'board-arrow');
+    poly.setAttribute('data-from', sh.arrow.from);
+    poly.setAttribute('data-to', sh.arrow.to);
+    poly.setAttribute('data-color', sh.arrow.color);
+    poly.setAttribute('points', sh.points);
+    poly.setAttribute('fill', ARROW_COLORS[sh.arrow.color]);
+    poly.setAttribute('fill-opacity', '0.75');
+    svg.appendChild(poly);
+  });
   boardEl.appendChild(svg);
 }
 function cancelArrowDrag() {
@@ -3677,8 +3688,8 @@ function cancelArrowDrag() {
   document.removeEventListener('mouseup', onArrowUp);
 }
 function clearBoardArrow() {
-  if (!boardArrow) return;
-  boardArrow = null;
+  if (!boardArrows.length) return;
+  boardArrows = [];
   drawBoardArrow(null);
 }
 boardEl.addEventListener('contextmenu', function(ev) { ev.preventDefault(); });
@@ -3687,15 +3698,16 @@ boardEl.addEventListener('mousedown', function(ev) {
   if (ev.button !== 2) return;
   var sq = squareAtPoint(ev.clientX, ev.clientY);
   if (!sq) return;
-  arrowDrag = { from: sq, to: null, fen: buildViewGame().fen() };
+  arrowDrag = { from: sq, to: null, color: arrowColorName(ev), fen: buildViewGame().fen() };
   document.addEventListener('mousemove', onArrowMove);
   document.addEventListener('mouseup', onArrowUp);
 });
 function onArrowMove(ev) {
   if (!arrowDrag) return;
-  var sq = squareAtPoint(ev.clientX, ev.clientY);
-  if (sq === arrowDrag.to) return;
+  var sq = squareAtPoint(ev.clientX, ev.clientY), color = arrowColorName(ev);
+  if (sq === arrowDrag.to && color === arrowDrag.color) return;
   arrowDrag.to = sq;
+  arrowDrag.color = color;
   drawBoardArrow(null);
 }
 function onArrowUp(ev) {
@@ -3708,8 +3720,12 @@ function onArrowUp(ev) {
   var to = squareAtPoint(ev.clientX, ev.clientY);
   var viewFen = buildViewGame().fen();
   if (to && to !== drag.from && drag.fen === viewFen) {
-    var same = boardArrow && boardArrow.from === drag.from && boardArrow.to === to;
-    boardArrow = same ? null : { from: drag.from, to: to, fen: viewFen };
+    var color = arrowColorName(ev), kept = [], same = false;
+    boardArrows.forEach(function(a) {
+      if (a.from === drag.from && a.to === to) { if (a.color === color) same = true; }   // same arrow, same colour: toggled off; another colour: replaced below
+      else kept.push(a);
+    });
+    boardArrows = same ? kept : kept.concat([{ from: drag.from, to: to, color: color, fen: viewFen }]);
   }
   drawBoardArrow(null);
 }
@@ -5536,7 +5552,7 @@ function renderBoard() {
   turnLabel.textContent = (displayGame.turn() === 'w' ? 'White' : 'Black') + ' to move' +
     (displayGame.isCheckmate() ? ' - checkmate' : displayGame.isCheck() ? ' - check' : '') +
     (isAtLive() ? '' : ' (viewing move ' + viewPly + ' of ' + game.history().length + ')');
-  drawBoardArrow(displayGame.fen());  // right-click arrow, if one is set for this position
+  drawBoardArrow(displayGame.fen());  // right-click arrows, if any are set for this position
   var animateMove = pendingMoveAnimation;
   pendingMoveAnimation = null;
   if (animateMove && isAtLive()) animateMoveOnBoard(animateMove);  // #689
