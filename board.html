@@ -218,7 +218,7 @@ Analysis mode
 <label style="display:flex; gap:6px; align-items:center; font-size:13px; margin-bottom:6px;" title="After a line ends, play on against Lichess-Explorer-weighted moves, then against agent-chess."><input type="checkbox" id="sparToggle"> Spar after each line</label>
 <label style="display:flex; gap:6px; align-items:center; font-size:13px; margin-bottom:6px;" title="When a spar game ends, Stockfish runs in the background in this browser (about 20 seconds) and scores each of agent-chess's moves, so it can learn from its mistakes. Nothing runs during a game."><input type="checkbox" id="sparLabelToggle"> Label finished games with Stockfish</label>
 <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center; font-size:12px;">
-<button id="sparLogBtn" type="button" disabled title="Download the last spar game of this session: PGN plus the per-move explanation log (JSON). Available once a game has finished.">Game log</button><button id="sparMemExportBtn" type="button" title="Download agent-chess memory (JSON).">Export memory</button><button id="sparMemImportBtn" type="button" title="Replace agent-chess memory from a JSON file.">Import memory</button><button id="sparMemResetBtn" type="button" title="Forget everything agent-chess has learned.">Reset memory</button><input type="file" id="sparMemImportFile" accept="application/json,.json" style="display:none;"><span id="sparMemStatus" role="status" aria-live="polite" style="color:var(--text-secondary, #aaa);"></span>
+<button id="sparLogBtn" type="button" disabled title="Download the last spar game of this session: PGN plus the per-move explanation log (JSON). Available once a game has finished.">Game log</button><button id="sparMemExportBtn" type="button" title="Download agent-chess memory (JSON).">Export memory</button><button id="sparMemImportBtn" type="button" title="Replace agent-chess memory from a JSON file.">Import memory</button><button id="sparMemResetBtn" type="button" title="Forget everything agent-chess has learned.">Reset memory</button><input type="file" id="sparMemImportFile" accept="application/json,.json" style="display:none;"><span id="sparMemStatus" role="status" aria-live="polite" style="color:var(--text-secondary, #aaa);"></span> <span id="sparRating" role="status" style="color:var(--text-secondary, #aaa);" title="agent-chess's rating, counting you as a fixed 1500 opponent."></span>
 </div></div>
 </div>
 <div role="tabpanel" id="settingsPane-account" data-pane="account" aria-labelledby="settingsTab-account" class="settingsPane">
@@ -261,7 +261,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "e8f81f9 \u00b7 2026-11-19 02:39 UTC";
+var BOARD_BUILD = "51553aa \u00b7 2026-11-19 02:43 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1746,7 +1746,7 @@ function repertoireStatsText(stats, firstColour) {
   Everything below is deterministic given (position, config, seed, memory).
 */
 var SPAR_CONFIG = {
-  version: 'agent-chess/0.4.0',
+  version: 'agent-chess/0.5.0',
   logVersion: 1,
   defaultOn: true,
   minGames: 10,            // Explorer hand-off: fewer games than this at the position
@@ -1757,7 +1757,7 @@ var SPAR_CONFIG = {
   // within epsilon of the best count as equivalent and a seeded pick among those gives variety.
   // Strength comes from the search budget (nodes, time), not from noise. A chosen move is
   // verified one ply deeper before it is played (verifyMargin), and dropped if that refutes it.
-  engine: { terms: { rooks: true, pawns: true, passed: true }, maxDepth: 8, capMs: 400, qDepth: 6, checkExtPly: 12, ttMax: 200000, deltaMargin: 200, lmrAfter: 4, rootWindow: 150, epsilon: 10, verifyMargin: 40, verifyShare: 0.7, verifyRounds: 4 },
+  engine: { terms: { rooks: true, pawns: true, passed: true, king: true, mobility: false, shield: false, pawnsPc1: false }, maxDepth: 8, capMs: 400, qDepth: 6, checkExtPly: 12, ttMax: 200000, deltaMargin: 200, lmrAfter: 4, rootWindow: 150, epsilon: 10, verifyMargin: 40, verifyShare: 0.7, verifyRounds: 4 },
   memory: { maxGames: 200, maxPositions: 4000, perBlame: 80, maxBonus: 60, maxPenalty: 400, winCredit: 0.15, lossScale: 300,
     // v2, learned from Stockfish-labelled games: a move whose labelled regret is at least labelMinRegret is penalised by labelScale of it; the
     // labelled better move of that position gets betterShare of the regret it avoided (at most maxBetter).
@@ -1850,6 +1850,214 @@ var SPAR_PAWNS_W = new Int8Array(8), SPAR_PAWNS_B = new Int8Array(8);
 var SPAR_W_MIN = new Int8Array(8), SPAR_W_MAX = new Int8Array(8), SPAR_B_MIN = new Int8Array(8), SPAR_B_MAX = new Int8Array(8);
 var SPAR_ROOKS = new Int8Array(66);   // rooks as (colour 1/-1, row, file): at most 20 can exist (two each plus eight promotions each), so none is ever dropped
 var SPAR_PASSED = [0, 5, 10, 20, 40, 70];   // by steps advanced from the pawn's own starting rank (0 = still home .. 5 = one step from queening)
+// King danger (iteration 7): pieces that attack the squares around a king. 0x88 tables: for a from-to difference, the step of the line that joins
+// the squares (sliders) and whether a knight jump joins them. Built once.
+var SPAR_LINE = new Int8Array(240), SPAR_KNIGHT = new Uint8Array(240);
+(function() {
+  var dirs = [-17, -16, -15, -1, 1, 15, 16, 17], kn = [-33, -31, -18, -14, 14, 18, 31, 33], d, n;
+  for (d = 0; d < 8; d++) for (n = 1; n < 8; n++) SPAR_LINE[dirs[d] * n + 119] = dirs[d];
+  for (d = 0; d < 8; d++) SPAR_KNIGHT[kn[d] + 119] = 1;
+})();
+var SPAR_ATTACK_W = [];   // attack units by piece letter's char code: n b r q
+SPAR_ATTACK_W[110] = 2; SPAR_ATTACK_W[98] = 2; SPAR_ATTACK_W[114] = 3; SPAR_ATTACK_W[113] = 5;
+var SPAR_ZONE_STEPS = [0, -1, 1, -16, 16, -17, -15, 15, 17];
+var SPAR_PIECE_SQ = new Int16Array(32), SPAR_PIECE_T = new Uint8Array(32), SPAR_PIECE_C = new Int8Array(32);
+// Squares near the king that the attackers of the other colour reach (the king's neighbours and the three squares one further towards the
+// enemy), weighted by piece; a quiet king under one attacker costs nothing, two or more cost the square of the weighted count. Centipawns
+// from the point of view of the king's own side (a positive number is danger).
+var SPAR_ZONE = new Int16Array(12);
+function sparKingDanger(board, kIdx, kingColour, n, enemyQueen) {
+  var fwd = kingColour === 1 ? -16 : 16;   // towards the enemy; white's rank 1 is row 7
+  // Globals copied to locals: a top-level var is a property load on every use, which dominated this function.
+  var ZONE = SPAR_ZONE, STEPS = SPAR_ZONE_STEPS, LINE = SPAR_LINE, KNIGHT = SPAR_KNIGHT, PSQ = SPAR_PIECE_SQ, PT = SPAR_PIECE_T, PC = SPAR_PIECE_C, AW = SPAR_ATTACK_W;
+  var nz = 0, zs, z, i;
+  for (zs = 0; zs < 12; zs++) {   // the zone once per king, not once per piece
+    z = zs < 9 ? kIdx + STEPS[zs] : kIdx + 2 * fwd + (zs - 10);
+    if (!(z & 0x88)) ZONE[nz++] = z;
+  }
+  var units = 0, attackers = 0, step, cnt, t, from, diff, line, p, k;
+  for (i = 0; i < n; i++) {
+    if (PC[i] === kingColour) continue;
+    from = PSQ[i]; t = PT[i]; cnt = 0;
+    for (k = 0; k < nz; k++) {
+      z = ZONE[k];
+      diff = z - from + 119;
+      if (t === 110) { if (KNIGHT[diff]) cnt++; continue; }
+      line = LINE[diff];
+      if (!line) continue;
+      if (t !== 113) {
+        var straight = line === -16 || line === 16 || line === -1 || line === 1;
+        if (t === 98 ? straight : !straight) continue;
+      }
+      p = from + line;
+      while (p !== z && !board[p]) p += line;
+      if (p === z) cnt++;
+    }
+    if (cnt) { units += AW[t] * cnt; attackers++; }
+  }
+  if (attackers < 2) return 0;
+  var d2 = units > 40 ? 40 : units;
+  var danger = (d2 * d2) >> 3;                  // 20 units = 50 cp, 40 units = 200 cp
+  return enemyQueen ? danger : danger >> 2;     // without a queen the attack is far less dangerous
+}
+// Mobility (iteration 9): how many squares a knight, bishop, rook or queen can go to without stepping onto a friendly piece or a square an enemy
+// pawn guards; a piece with almost none (a rook behind its own pawns, a knight on the rim, a piece about to be trapped) is worth less. Linear
+// against a typical count, plus a flat penalty when a minor piece or rook is all but shut in. Centipawns from White's point of view.
+var SPAR_MOB_ND = [-33, -31, -18, -14, 14, 18, 31, 33], SPAR_MOB_BD = [-17, -15, 15, 17], SPAR_MOB_RD = [-16, -1, 1, 16], SPAR_MOB_QD = [-17, -16, -15, -1, 1, 15, 16, 17];
+function sparMobility(board, n) {
+  var PSQ = SPAR_PIECE_SQ, PT = SPAR_PIECE_T, PC = SPAR_PIECE_C, ND = SPAR_MOB_ND, BD = SPAR_MOB_BD, RD = SPAR_MOB_RD, QD = SPAR_MOB_QD;
+  var total = 0, i, k, from, t, col, cnt, dirs, nd, z, sq, d, ownC, enemyPawn, a1, a2, p1, p2;
+  for (i = 0; i < n; i++) {
+    from = PSQ[i]; t = PT[i]; col = PC[i]; cnt = 0;
+    ownC = col === 1 ? 'w' : 'b';
+    enemyPawn = col === 1 ? 'b' : 'w';
+    // squares guarded by an enemy pawn: for a white piece the black pawns sit at z-15 and z-17, for a black piece the white pawns at z+15 and z+17
+    a1 = col === 1 ? -15 : 15; a2 = col === 1 ? -17 : 17;
+    if (t === 110) {
+      for (k = 0; k < 8; k++) {
+        z = from + ND[k];
+        if (z & 0x88) continue;
+        sq = board[z];
+        if (sq && sq.color === ownC) continue;
+        p1 = board[z + a1]; p2 = board[z + a2];
+        if ((p1 && p1.type === 'p' && p1.color === enemyPawn) || (p2 && p2.type === 'p' && p2.color === enemyPawn)) continue;
+        cnt++;
+      }
+      total += col * (4 * (cnt - 4) - (cnt <= 1 ? 15 : 0));
+    } else {
+      dirs = t === 98 ? BD : t === 114 ? RD : QD; nd = dirs.length;
+      for (k = 0; k < nd; k++) {
+        d = dirs[k]; z = from + d;
+        while (!(z & 0x88)) {
+          sq = board[z];
+          if (sq && sq.color === ownC) break;
+          p1 = board[z + a1]; p2 = board[z + a2];
+          if (!((p1 && p1.type === 'p' && p1.color === enemyPawn) || (p2 && p2.type === 'p' && p2.color === enemyPawn))) cnt++;
+          if (sq) break;
+          z += d;
+        }
+      }
+      total += col * (t === 98 ? 3 * (cnt - 5) - (cnt <= 1 ? 15 : 0) : t === 114 ? 2 * (cnt - 6) - (cnt <= 2 ? 10 : 0) : cnt - 10);
+    }
+  }
+  return total;
+}
+// Pawn shield (iteration 9): a castled king (back two ranks, a wing file) wants its pawns on the three files in front of it, one step ahead best.
+// A pawn two steps ahead is worth less, and a file with no pawn within two steps costs. Counted fully when the enemy has a queen, a quarter otherwise.
+// This is what a flank pawn push (g4, h5, g6, ...) in front of the own king gives up. Centipawns from White's point of view.
+function sparShield(kingR, kingC, pMin, pMax, white, enemyQueen) {
+  // pMin/pMax: per file, the least and most advanced pawn row (0x88 rows, row 0 = rank 8); white pawns advance towards row 0, black towards row 7
+  var total = 0, f, near, far, r;
+  for (f = kingC - 1; f <= kingC + 1; f++) {
+    if (f < 0 || f > 7) continue;
+    near = 0; far = 0;
+    if (white) { r = pMax[f]; if (r === kingR - 1) near = 1; else if (r === kingR - 2) far = 1; r = pMin[f]; if (!near && r === kingR - 1) near = 1; else if (!near && !far && r === kingR - 2) far = 1; }
+    else { r = pMin[f]; if (r === kingR + 1) near = 1; else if (r === kingR + 2) far = 1; r = pMax[f]; if (!near && r === kingR + 1) near = 1; else if (!near && !far && r === kingR + 2) far = 1; }
+    total += near ? 10 : far ? 4 : -10;
+  }
+  return enemyQueen ? total : total >> 2;
+}
+// PythonChess1's pawn activity (iteration 9, Michael 2026-11-18: port its evaluation terms behind flags). Replaces the pawns and passed terms when on.
+// Advanced pawns (5 cp per rank beyond the third), a pawn storm against the enemy king, passed pawns (the bonus grows in the endgame; the king
+// outside the pawn's square, rook support and cover, a free path, promotion threats), central pawns, phalanxes of advanced pawns, doubled, isolated and
+// backward pawns, pawn chains, and the damping when the side the score favours is behind in pieces. Constants are PythonChess1's. Centipawns, White's side.
+var SPAR_WPS = new Int16Array(16), SPAR_BPS = new Int16Array(16);
+function sparPawnsPc1(board, nwp, nbp, wkR, wkC, bkR, bkC, wMat, bMat, wCnt, bCnt, nRooks, rooks) {
+  var WPS = SPAR_WPS, BPS = SPAR_BPS, endgame = (wMat < bMat ? wMat : bMat) <= 16;
+  var score = 0, side, n, k, i, sq, r, c, rel, adv, pawns, sgn, ownKR, ownKC, enKR, enKC, enCnt, enemyPawns, ahead, f, q, found, mine, theirs, j, rr, rc;
+  var wFile = [0, 0, 0, 0, 0, 0, 0, 0], bFile = [0, 0, 0, 0, 0, 0, 0, 0];
+  for (k = 0; k < nwp; k++) wFile[WPS[k] & 7]++;
+  for (k = 0; k < nbp; k++) bFile[BPS[k] & 7]++;
+  var pawnsWhite = nwp, pawnsBlack = nbp;
+  for (side = 0; side < 2; side++) {
+    sgn = side === 0 ? 1 : -1;
+    pawns = side === 0 ? WPS : BPS; n = side === 0 ? nwp : nbp;
+    mine = side === 0 ? wFile : bFile; theirs = side === 0 ? bFile : wFile;
+    ownKR = side === 0 ? wkR : bkR; ownKC = side === 0 ? wkC : bkC; enKR = side === 0 ? bkR : wkR; enKC = side === 0 ? bkC : wkC;
+    enCnt = side === 0 ? bCnt : wCnt; enemyPawns = side === 0 ? nbp : nwp;
+    var own = side === 0 ? 'w' : 'b', enemy = side === 0 ? 'b' : 'w';
+    var behind = side === 0 ? 16 : -16;   // a step towards the own back rank, in 0x88
+    var counted = [0, 0, 0, 0, 0, 0, 0, 0];   // files whose doubled-pawn penalty is already in the score
+    for (i = 0; i < n; i++) {
+      sq = pawns[i]; r = sq >> 4; c = sq & 7;
+      rel = side === 0 ? 7 - r : r;   // 0 = the pawn's own back rank, 6 = one step from promotion
+      adv = 0;
+      if (rel >= 4) {
+        adv = 5 * (rel - 3); score += sgn * adv;
+        if (!endgame && enKR >= 0 && Math.abs(enKC - c) <= 2) score += sgn * 14;   // pawn storm
+      }
+      // passed: no enemy pawn on the file or its neighbours ahead
+      ahead = false;
+      for (f = c - 1; f <= c + 1; f++) {
+        if (f < 0 || f > 7) continue;
+        for (j = 0; j < (side === 0 ? nbp : nwp); j++) {
+          var ep = (side === 0 ? BPS : WPS)[j];
+          if ((ep & 7) === f && (side === 0 ? (ep >> 4) < r : (ep >> 4) > r)) { ahead = true; break; }
+        }
+        if (ahead) break;
+      }
+      if (!ahead) {
+        score += sgn * (endgame ? 36 : 9);
+        if (mine[c] === 1) score += sgn * adv * 2;
+        if (endgame && enKR >= 0) {
+          // the enemy king outside the square of the pawn
+          var d = 7 - rel; if (rel === 1) d--;
+          var promoR = side === 0 ? 0 : 7;
+          var kd = Math.max(Math.abs(enKR - promoR), Math.abs(enKC - c));
+          if (kd > d) score += sgn * (enCnt === 0 ? 300 : enCnt <= 1 ? 135 : 25);
+          if (rel >= 4) {
+            for (j = 0; j < nRooks; j++) {   // rook support (own rook on the pawn's file or rank with a clear path) and cover (enemy rook)
+              rr = rooks[j * 3 + 1]; rc = rooks[j * 3 + 2];
+              if (rc !== c && rr !== r) continue;
+              var between = true, step = rc === c ? (rr < r ? 16 : -16) : (rc < c ? 1 : -1), z = (rr << 4) + rc + step;
+              while (z !== sq) { if (board[z]) { between = false; break; } z += step; }
+              if (!between) continue;
+              var rookWhite = rooks[j * 3] === 1, isBehind = rc === c && (side === 0 ? rr > r : rr < r);
+              if (rookWhite === (side === 0)) { score += sgn * 25; if (isBehind) score += sgn * 75; }
+              else { score -= sgn * 25; if (isBehind) score -= sgn * 75; }
+            }
+            var stop = sq + (side === 0 ? -16 : 16);   // the square in front
+            if (!(stop & 0x88)) {
+              if (!board[stop]) {
+                score += sgn * 15;
+                if (rel === 6) score += sgn * 60;
+                else if (rel === 5) { if (!board[stop + (side === 0 ? -16 : 16)]) score += sgn * 30; }
+                else if (rel === 4) { var s2 = stop + (side === 0 ? -16 : 16), s3 = s2 + (side === 0 ? -16 : 16); if (!board[s2] && !board[s3]) score += sgn * 20; }
+              } else if (rel === 6) score += sgn * 30;
+            }
+          }
+        }
+      }
+      // static: central and bishop-file pawns
+      if (c === 3 || c === 4) score += sgn * 10; else if (c === 2 || c === 5) score += sgn * 5;
+      // defended by a pawn (chain; double if passed), and doubled / isolated / backward
+      var dl = board[sq + behind - 1], dr = board[sq + behind + 1];
+      var chained = ((c > 0 && dl && dl.type === 'p' && dl.color === own) || (c < 7 && dr && dr.type === 'p' && dr.color === own));
+      if (chained) { score += sgn * 12; if (!ahead) score += sgn * 12; }
+      if (mine[c] > 1 && !counted[c]) { counted[c] = 1; score -= sgn * 10 * (mine[c] - 1); }   // doubled: counted once per file, whatever order the pawns were found in
+      if ((c === 0 || !mine[c - 1]) && (c === 7 || !mine[c + 1])) score -= sgn * 8;                    // isolated
+      if (rel === 1 || rel === 2) {   // backward: no friendly pawn beside it on its rank (and on the third rank not guarded by a pawn)
+        var nl = c > 0 ? board[sq - 1] : null, nr = c < 7 ? board[sq + 1] : null;
+        if (!(nl && nl.type === 'p' && nl.color === own) && !(nr && nr.type === 'p' && nr.color === own) && !(rel === 2 && chained)) score -= sgn * 8;
+      }
+    }
+  }
+  // phalanx: side by side advanced pawns
+  for (side = 0; side < 2; side++) {
+    sgn = side === 0 ? 1 : -1; pawns = side === 0 ? WPS : BPS; n = side === 0 ? nwp : nbp;
+    var own2 = side === 0 ? 'w' : 'b';
+    for (i = 0; i < n; i++) {
+      sq = pawns[i]; r = sq >> 4; c = sq & 7;
+      if ((side === 0 ? 7 - r : r) < 3 || c === 7) continue;
+      var nb = board[sq + 1];
+      if (nb && nb.type === 'p' && nb.color === own2) score += sgn * 15;
+    }
+  }
+  // the pawn score counts for less when the side it favours is behind in pieces
+  var diff = wMat - bMat;
+  if ((diff >= 3 && score < 0) || (-diff >= 3 && score > 0)) score = Math.trunc((score * 70) / 100);
+  return score;
+}
 function sparEvalTerms(chess) {
   if (!SPAR_PST_C.length) for (var pt in SPAR_PST) SPAR_PST_C[pt.charCodeAt(0)] = SPAR_PST[pt];
   var board = chess._board;  // chess.js 1.4.0 internal 0x88 array (pinned; the tests check it exists)
@@ -1858,7 +2066,9 @@ function sparEvalTerms(chess) {
   pawnsW.fill(0); pawnsB.fill(0); wMin.fill(9); wMax.fill(-1); bMin.fill(9); bMax.fill(-1);   // rows are 0x88 rows: row 0 is rank 8
   var nRooks = 0;
   var material = 0, pst = 0, bishopsW = 0, bishopsB = 0, queens = 0;
-  var wkR = -1, wkC = 0, bkR = -1, bkC = 0;
+  var usePw = T.pawnsPc1, wMat = 0, bMat = 0, wCnt = 0, bCnt = 0, nwp = 0, nbp = 0, WPS = SPAR_WPS, BPS = SPAR_BPS;
+  var useKing = T.king, useMob = T.mobility, useShield = T.shield, pSq = SPAR_PIECE_SQ, pT = SPAR_PIECE_T, pC = SPAR_PIECE_C;
+  var wkR = -1, wkC = 0, bkR = -1, bkC = 0, nPieces = 0, wkI = -1, bkI = -1, wq = 0, bq = 0;
   for (var i = 0; i < 128; i++) {
     if (i & 0x88) { i += 7; continue; }
     var sq = board[i];
@@ -1868,9 +2078,14 @@ function sparEvalTerms(chess) {
     var tc = sq.type.charCodeAt(0);
     material += white ? SPAR_VALUE_C[tc] : -SPAR_VALUE_C[tc];
     if (tc === 107) {                                // k
-      if (white) { wkR = r; wkC = c; } else { bkR = r; bkC = c; }
+      if (white) { wkR = r; wkC = c; wkI = i; } else { bkR = r; bkC = c; bkI = i; }
       continue;
     }
+    if (usePw) {
+      if (tc === 112) { if (white) WPS[nwp++] = i; else BPS[nbp++] = i; }
+      else { var pmv = tc === 113 ? 9 : tc === 114 ? 5 : 3, pcn = tc === 113 ? 2 : 1; if (white) { wMat += pmv; wCnt += pcn; } else { bMat += pmv; bCnt += pcn; } }
+    }
+    if (tc !== 112 && (useKing || useMob || useShield)) { pSq[nPieces] = i; pT[nPieces] = tc; pC[nPieces] = white ? 1 : -1; nPieces++; if (tc === 113) { if (white) wq = 1; else bq = 1; } }
     pst += (white ? 1 : -1) * SPAR_PST_C[tc][white ? r * 8 + c : (7 - r) * 8 + c];
     if (tc === 98) { if (white) bishopsW++; else bishopsB++; }   // b
     else if (tc === 113) queens++;                               // q
@@ -1894,7 +2109,8 @@ function sparEvalTerms(chess) {
       rookTerm += col * rs;
     }
   }
-  if (T.pawns || T.passed) {
+  var pw2Term = usePw ? sparPawnsPc1(board, nwp, nbp, wkR, wkC, bkR, bkC, wMat, bMat, wCnt, bCnt, nRooks, rooks) : 0;
+  if ((T.pawns || T.passed) && !usePw) {
     for (f = 0; f < 8; f++) {
       var pw = pawnsW[f], pb = pawnsB[f];
       if (!pw && !pb) continue;
@@ -1920,10 +2136,18 @@ function sparEvalTerms(chess) {
       }
     }
   }
-  return { material: material, pst: pst + king, bishop_pair: bishopPair, rooks: rookTerm, pawn_structure: pawnTerm, passed_pawns: passedTerm };
+  var kingTerm = 0;
+  if (T.king && nPieces > 1 && wkI >= 0 && bkI >= 0) kingTerm = sparKingDanger(board, bkI, -1, nPieces, wq) - sparKingDanger(board, wkI, 1, nPieces, bq);
+  var mobTerm = useMob && nPieces > 0 ? sparMobility(board, nPieces) : 0;
+  var shieldTerm = 0;
+  if (T.shield) {
+    if (wkR >= 6 && (wkC <= 2 || wkC >= 5)) shieldTerm += sparShield(wkR, wkC, wMin, wMax, true, bq);
+    if (bkR >= 0 && bkR <= 1 && (bkC <= 2 || bkC >= 5)) shieldTerm -= sparShield(bkR, bkC, bMin, bMax, false, wq);
+  }
+  return { material: material, pst: pst + king, bishop_pair: bishopPair, rooks: rookTerm, pawn_structure: pawnTerm, passed_pawns: passedTerm, king_danger: kingTerm, mobility: mobTerm, king_shield: shieldTerm, pawns_pc1: pw2Term };
 }
 
-function sparEvalTotal(terms) { return terms.material + terms.pst + terms.bishop_pair + terms.rooks + terms.pawn_structure + terms.passed_pawns; }
+function sparEvalTotal(terms) { return terms.material + terms.pst + terms.bishop_pair + terms.rooks + terms.pawn_structure + terms.passed_pawns + terms.king_danger + terms.mobility + terms.king_shield + terms.pawns_pc1; }
 
 /* ---------- Search ---------- */
 
@@ -1956,6 +2180,16 @@ function sparSelect(cands, epsilon, draw) {
   var pool = 0;
   while (pool < cands.length && cands[pool].total >= best - epsilon) pool++;
   return { index: Math.min(pool - 1, Math.floor(draw * pool)), method: 'best-equivalent', pool: pool };
+}
+
+// Time management (iteration 7, for engine matches on a clock; spar mode itself keeps its fixed 400 ms): a share of what is left plus most
+// of the increment, assuming a game of about 40 moves and never planning for fewer than 20 more, never more than a quarter of the clock, and
+// a little is always kept back for the move to travel. The search then uses it as its time cap with no node cap (see agentChessMove opts).
+function sparTimeBudget(remainingMs, incMs, ply) {
+  var movesLeft = Math.max(20, 40 - Math.floor((ply || 0) / 2));
+  var budget = remainingMs / movesLeft + 0.8 * (incMs || 0);
+  budget = Math.min(budget, remainingMs * 0.25, remainingMs - 100);
+  return Math.max(20, Math.floor(budget));
 }
 
 var SPAR_FILES = 'abcdefgh';
@@ -2227,7 +2461,7 @@ function agentChessMove(position, opts) {
     var sign = side === 'w' ? 1 : -1;
     return {
       san: r.san, uci: uci, score: r.score, memory: memTerm, total: r.score + memTerm,
-      static_terms_after_move: { material: sign * terms.material, pst: sign * terms.pst, bishop_pair: sign * terms.bishop_pair, rooks: sign * terms.rooks, pawn_structure: sign * terms.pawn_structure, passed_pawns: sign * terms.passed_pawns },
+      static_terms_after_move: { material: sign * terms.material, pst: sign * terms.pst, bishop_pair: sign * terms.bishop_pair, rooks: sign * terms.rooks, pawn_structure: sign * terms.pawn_structure, passed_pawns: sign * terms.passed_pawns, king_danger: sign * terms.king_danger, mobility: sign * terms.mobility, king_shield: sign * terms.king_shield, pawns_pc1: sign * terms.pawns_pc1 },
       memory_record: sparMemoryLogRecord(memPos, uci)
     };
   }
@@ -7184,6 +7418,40 @@ async function sparSyncMemory(opts) {
   return persisted;
 }
 
+/*
+  agent-chess rating (Michael, 2026-11-17): an Elo-style number for the engine, with the player counted as a fixed 1500 opponent. The
+  Worker computes it from the player's uploaded games (op "rating"; the one function is infra/mint-token-worker/src/spar-rating.ts), so
+  this only asks for it after a game has been uploaded and shows it. A rate limit only delays it.
+*/
+function sparRatingText(r) {
+  if (!r || typeof r.rating !== 'number' || !isFinite(r.rating)) return '';
+  var text = 'agent-chess rating ' + Math.round(r.rating) + ' (' + r.games + (r.games === 1 ? ' game' : ' games') + ', ' + r.wins + 'W ' + r.draws + 'D ' + r.losses + 'L)';
+  if (typeof r.last_delta === 'number' && isFinite(r.last_delta)) text += '; last game ' + (r.last_delta >= 0 ? '+' : '\u2212') + Math.abs(Math.round(r.last_delta));
+  return text;
+}
+function sparShowRating(text) { var el = document.getElementById('sparRating'); if (el) el.textContent = text || ''; }
+async function sparFetchRating() {
+  for (var tries = 0; tries < 4; tries++) {
+    try {
+      var auth = await explorerAuthHeader();
+      if (!auth.Authorization) return null;
+      var res = await sparMemoryCall(auth, { op: 'rating' });
+      if (res.ok && res.json) return res.json;
+      if (res.status !== 429 && res.status < 500) return null;
+    } catch (e) { /* try again */ }
+    await new Promise(function(resolve) { setTimeout(resolve, SPAR_SYNC_RETRY_MS); });
+  }
+  return null;
+}
+async function sparRatingAfterGame(uploaded, statusPrefix) {
+  var id = await uploaded;
+  if (!id) return;   // not uploaded (signed out or failed): the rating did not change
+  var text = sparRatingText(await sparFetchRating());
+  if (!text) return;
+  sparShowRating(text);
+  sparStatus((statusPrefix ? statusPrefix + ' ' : '') + text + '.');
+}
+
 function sparFinish(t, result) {
   var sp = t.spar;
   if (!sp || sp.ended) return;
@@ -7205,8 +7473,10 @@ function sparFinish(t, result) {
   };
   sparShowGameButtons(true);
   sparSyncResign();
-  sparStatus(usable ? 'Memory: ' + mem.games.length + ' games.' : SPAR_NOT_OWNER_TEXT);
+  var finishStatus = usable ? 'Memory: ' + mem.games.length + ' games.' : SPAR_NOT_OWNER_TEXT;
+  sparStatus(finishStatus);
   var uploaded = sparUploadGame(sparLastGame);
+  sparRatingAfterGame(uploaded, finishStatus);
   if (usable) sparLabelGame(sp, uploaded);
   t.busy = true;
   setTrainMessage((sp.resignedBy === 'player' ? 'Spar over: you resigned; agent-chess wins.' : sp.resignedBy === 'engine' ? 'Spar over: agent-chess resigns; you win.' : sparResultText(result, sp.engineColor, t)) + ' Press Next line to continue.');
