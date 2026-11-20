@@ -149,7 +149,7 @@ html, body { background: var(--bg-primary, #18181b); color: var(--text-primary, 
 </div>
 </div>
 <div id="sidePanel">
-<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="sparRow" style="margin-top:6px; font-size:12px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;"><button id="sparNextBtn" type="button" style="display:none;" title="Continue with the next training line.">Next line</button><button id="sparResignBtn" type="button" style="display:none;" title="Resign the spar game in progress (click twice to confirm). It counts as a win for agent-chess.">Resign</button><span id="sparStatus" style="color:var(--text-secondary, #aaa);"></span></div><div id="trainNextStep" style="display:none; margin-top:6px;"><div id="trainNextStepText"></div><div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px;"><button id="trainMoreBtn" type="button"></button><button id="trainSwitchBtn" type="button">Switch color</button><button id="trainKeepBtn" type="button">Keep re-training</button></div></div></div>
+<div id="trainPanel" role="status" aria-live="polite" style="display:none; font-size:13px; margin:0; padding:6px 8px; border-radius:4px; background:var(--bg-secondary, #262626); border:1px solid var(--border-strong, #666);"><div id="trainMessage" style="min-height:1.3em;"></div><div id="trainStats" style="color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="trainLichess" style="display:none; color:var(--text-secondary, #aaa); font-size:12px;"></div><div id="sparRow" style="margin-top:6px; font-size:12px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;"><button id="sparNextBtn" type="button" style="display:none;" title="Continue with the next training line.">Next line</button><button id="sparResignBtn" type="button" style="display:none;" title="Resign the spar game in progress (click twice to confirm). It counts as a win for agent-chess.">Resign</button><span id="sparEloLine" style="font-weight:600;"></span> <span id="sparStatus" style="color:var(--text-secondary, #aaa);"></span></div><div id="trainNextStep" style="display:none; margin-top:6px;"><div id="trainNextStepText"></div><div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px;"><button id="trainMoreBtn" type="button"></button><button id="trainSwitchBtn" type="button">Switch color</button><button id="trainKeepBtn" type="button">Keep re-training</button></div></div></div>
 <section id="movesCard" class="panelCard">
 <div id="movesHeader">
 <div style="display:flex; align-items:baseline; gap:10px; min-width:0;"><span class="paneTitle">Moves</span>
@@ -217,6 +217,14 @@ Analysis mode
 <div style="font-size:13px; margin-bottom:4px;" title="After a Train line ends the board plays on: first Lichess-Explorer-weighted replies, then agent-chess, a home-grown engine that learns from the games it loses. These apply at once on this device; Close does not save them.">Spar vs agent-chess</div>
 <label style="display:flex; gap:6px; align-items:center; font-size:13px; margin-bottom:6px;" title="After a line ends, play on against Lichess-Explorer-weighted moves, then against agent-chess."><input type="checkbox" id="sparToggle"> Spar after each line</label>
 <label style="display:flex; gap:6px; align-items:center; font-size:13px; margin-bottom:6px;" title="When a spar game ends, Stockfish runs in the background in this browser (about 20 seconds) and scores each of agent-chess's moves, so it can learn from its mistakes. Nothing runs during a game."><input type="checkbox" id="sparLabelToggle"> Label finished games with Stockfish</label>
+<div id="sparEloRow" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center; font-size:13px; margin-bottom:6px;" title="How strong agent-chess plays. Adaptive follows your rating: it starts at 1000 and moves with your results over about your last 20 games. Fixed plays at the level you pick. Levels are Elo on the Stockfish scale; under 1320 they are extrapolated.">
+<label for="sparEloMode">Opponent strength</label>
+<select id="sparEloMode"><option value="adaptive">Adaptive (follows your rating)</option><option value="fixed">Fixed</option></select>
+<input type="range" id="sparEloSlider" min="1000" max="2200" step="50" value="1500" aria-label="Fixed opponent strength (Elo)" style="min-width:120px; flex:1 1 120px;">
+<output id="sparEloOut" for="sparEloSlider" style="min-width:3.5em;"></output>
+<button id="sparEloResetBtn" type="button" title="Forget your spar rating and start again at 1000.">Reset rating</button>
+<span id="sparEloSummary" role="status" style="flex-basis:100%; color:var(--text-secondary, #aaa); font-size:12px;"></span>
+</div>
 <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center; font-size:12px;">
 <button id="sparLogBtn" type="button" disabled title="Download the last spar game of this session: PGN plus the per-move explanation log (JSON). Available once a game has finished.">Game log</button><button id="sparMemExportBtn" type="button" title="Download agent-chess memory (JSON).">Export memory</button><button id="sparMemImportBtn" type="button" title="Replace agent-chess memory from a JSON file.">Import memory</button><button id="sparMemResetBtn" type="button" title="Forget everything agent-chess has learned.">Reset memory</button><input type="file" id="sparMemImportFile" accept="application/json,.json" style="display:none;"><span id="sparMemStatus" role="status" aria-live="polite" style="color:var(--text-secondary, #aaa);"></span> <span id="sparRating" role="status" style="color:var(--text-secondary, #aaa);" title="agent-chess's rating, counting you as a fixed 1500 opponent."></span>
 </div></div>
@@ -261,7 +269,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "3c63d2d \u00b7 2026-11-20 00:45 UTC";
+var BOARD_BUILD = "1619f6a \u00b7 2026-11-20 04:52 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -2191,6 +2199,33 @@ function sparSortMoves(moves) {
 
 // Strength (800-2000) -> the search budget: a weaker level simply searches less and so sees less.
 // Not calibrated yet (iteration 2 measures it against Stockfish).
+/*
+  Elo to search parameters (#1950, calibrated against Stockfish UCI_Elo, node-capped agent vs Stockfish at one second a move, 240 games, and an
+  epsilon ladder for the low end; docs/tasks/TASK_1950_agent_chess_strength_program.md). Strength is a node budget, so a level plays the same
+  on any device: Elo = intercept + slope * log2(nodes), about 74 Elo a doubling. Below floorNodes the search cannot get any weaker, so the
+  equivalence pool (epsilon) widens instead, which is the only noise in the engine and applies only to levels under about 1380. Stockfish's
+  weakest level is 1320, so every number under that is extrapolated from the epsilon ladder. ceilingMs only stops a slow device from hanging.
+*/
+var SPAR_ELO = {
+  min: 1000, max: 2200,
+  intercept: 820, slope: 74.25,
+  floorNodes: 250,
+  epsTable: [[1411, 10], [1286, 30], [1166, 60], [981, 100], [811, 150], [696, 250]],   // [Elo, epsilon] at floorNodes, descending Elo
+  ceilingMs: 6000
+};
+function sparEloParams(elo) {
+  var e = Math.max(SPAR_ELO.min, Math.min(SPAR_ELO.max, Number(elo) || SPAR_ELO.min));
+  var floorElo = SPAR_ELO.intercept + SPAR_ELO.slope * Math.log(SPAR_ELO.floorNodes) / Math.LN2;
+  if (e >= floorElo) {
+    return { elo: e, nodeCap: Math.round(Math.pow(2, (e - SPAR_ELO.intercept) / SPAR_ELO.slope)), epsilon: SPAR_CONFIG.engine.epsilon, capMs: SPAR_ELO.ceilingMs };
+  }
+  var t = SPAR_ELO.epsTable, eps = t[t.length - 1][1];
+  for (var i = 0; i < t.length - 1; i++) {
+    if (e <= t[i][0] && e >= t[i + 1][0]) { eps = t[i][1] + (t[i + 1][1] - t[i][1]) * (t[i][0] - e) / (t[i][0] - t[i + 1][0]); break; }
+  }
+  return { elo: e, nodeCap: SPAR_ELO.floorNodes, epsilon: Math.round(eps), capMs: SPAR_ELO.ceilingMs };
+}
+
 function sparStrengthParams(strength) {
   var s = Math.max(800, Math.min(2000, strength));
   var x = (s - 800) / 1200;  // 0..1
@@ -2235,9 +2270,10 @@ function agentChessMove(position, opts) {
   var eng = SPAR_CONFIG.engine;
   var strength = typeof opts.strength === 'number' ? opts.strength : SPAR_CONFIG.strength;
   var maxDepth = opts.maxDepth || eng.maxDepth;
-  var params = sparStrengthParams(strength);
+  var eloLevel = typeof opts.elo === 'number' ? opts.elo : null;
+  var params = eloLevel === null ? sparStrengthParams(strength) : sparEloParams(eloLevel);
   var nodeCap = opts.nodeCap || params.nodeCap;
-  var capMs = opts.capMs === undefined ? eng.capMs : opts.capMs;
+  var capMs = opts.capMs === undefined ? (eloLevel === null ? eng.capMs : params.capMs) : opts.capMs;
   var nowFn = opts.now || function() { return Date.now(); };
   var work = new Chess(position.fen());
   var rootFen = work.fen();
@@ -2608,7 +2644,7 @@ function agentChessMove(position, opts) {
     fen: rootFen, side: side, san: chosen.san, uci: chosen.uci, seed: opts.seed,
     engine: {
       version: SPAR_CONFIG.version,
-      config: { strength: strength, maxDepth: maxDepth, nodeCap: nodeCap, capMs: capMs === Infinity ? null : capMs, epsilon: params.epsilon },
+      config: { strength: strength, elo: eloLevel === null ? null : params.elo, maxDepth: maxDepth, nodeCap: nodeCap, capMs: capMs === Infinity ? null : capMs, epsilon: params.epsilon },
       depth: depthDone, nodes: nodes, ms: nowFn() - started, node_cap_hit: aborted && !timeCap, time_cap_hit: timeCap,
       chosen_score: chosen.score, best_score: searchBest, memory_term: chosen.memory,
       candidates: cands,
@@ -4505,6 +4541,103 @@ function trainRatingText(state, startRating, nowMs) {
     ' (' + (delta >= 0 ? '+' : '') + delta + ')';
 }
 /* TASK_1145_RATING_END */
+
+/* TASK_1950_ADAPTIVE_ELO_START */
+/*
+  #1950: agent-chess strength as an Elo, and the player's own self-adapting rating. Both are plain numbers on the Stockfish UCI_Elo scale
+  (anchored there by the calibration ladder in docs/tasks/TASK_1950_agent_chess_strength_program.md; below SPAR_ELO.anchorMin the
+  scale is extrapolated). Strength is a node budget, not time, so a level plays the same on any device.
+
+  The player's rating is Glicko-2 with each game its own rating period against the engine level that game was played at. The deviation
+  never falls below rdFloor, so the rating keeps adapting to recent games instead of freezing (a plain average over the last 20 games
+  would lag by about ten games). The last `windowGames` results are kept for the win-rate readout and for a recount. Pure; storage is
+  in the functions below that take a storage object, so tests drive them hermetically.
+*/
+var ELO_CONFIG = {
+  start: 1000, startRd: 350, startVol: 0.06,   // the first game is played at 1000 (Michael, 2026-11-20)
+  tau: 0.5,                                    // Glicko-2 volatility constraint
+  rdFloor: 75,                                 // adapt faster than a plain average: recent games always count
+  windowGames: 20,                             // results kept for the readout
+  min: 1000, max: 2200                         // the engine plays inside this range whatever the player's rating
+};
+var ELO_Q = 173.7178;                          // Glicko-2 scale constant, 400 / ln(10)
+
+function eloExpected(rating, opponent) { return 1 / (1 + Math.pow(10, (opponent - rating) / 400)); }
+
+// One Glicko-2 period with a list of games [{ opp, oppRd, score }] (score 1 / 0.5 / 0). Returns { rating, rd, vol } (rd before the floor).
+function glicko2Update(state, games, tau) {
+  var T = typeof tau === 'number' ? tau : ELO_CONFIG.tau;
+  var mu = (state.rating - 1500) / ELO_Q, phi = state.rd / ELO_Q, sigma = state.vol;
+  if (!games.length) return { rating: state.rating, rd: Math.sqrt(phi * phi + sigma * sigma) * ELO_Q, vol: sigma };
+  function g(p) { return 1 / Math.sqrt(1 + 3 * p * p / (Math.PI * Math.PI)); }
+  var vInv = 0, deltaSum = 0, i;
+  for (i = 0; i < games.length; i++) {
+    var muJ = (games[i].opp - 1500) / ELO_Q, phiJ = (typeof games[i].oppRd === 'number' ? games[i].oppRd : 0) / ELO_Q;
+    var gj = g(phiJ), e = 1 / (1 + Math.exp(-gj * (mu - muJ)));
+    vInv += gj * gj * e * (1 - e);
+    deltaSum += gj * (games[i].score - e);
+  }
+  var v = 1 / vInv, delta = v * deltaSum;
+  var a = Math.log(sigma * sigma);
+  function f(x) {
+    var ex = Math.exp(x), d2 = delta * delta, p2 = phi * phi;
+    return ex * (d2 - p2 - v - ex) / (2 * Math.pow(p2 + v + ex, 2)) - (x - a) / (T * T);
+  }
+  var A = a, B, k = 1;
+  if (delta * delta > phi * phi + v) B = Math.log(delta * delta - phi * phi - v);
+  else { while (f(a - k * T) < 0 && k < 100) k++; B = a - k * T; }
+  var fA = f(A), fB = f(B), guard = 0;
+  while (Math.abs(B - A) > 1e-6 && guard++ < 200) {
+    var C = A + (A - B) * fA / (fB - fA), fC = f(C);
+    if (fC * fB <= 0) { A = B; fA = fB; } else { fA = fA / 2; }
+    B = C; fB = fC;
+  }
+  var sigmaNew = Math.exp(A / 2);
+  var phiStar = Math.sqrt(phi * phi + sigmaNew * sigmaNew);
+  var phiNew = 1 / Math.sqrt(1 / (phiStar * phiStar) + 1 / v);
+  var muNew = mu + phiNew * phiNew * deltaSum;
+  return { rating: muNew * ELO_Q + 1500, rd: phiNew * ELO_Q, vol: sigmaNew };
+}
+
+function eloDefaultState() { return { rating: ELO_CONFIG.start, rd: ELO_CONFIG.startRd, vol: ELO_CONFIG.startVol, games: [] }; }
+
+// The stored state, repaired field by field so a bad value can never stop the rating from working.
+function eloResolveState(stored) {
+  var d = eloDefaultState(), s = stored && typeof stored === 'object' ? stored : {};
+  var rating = (typeof s.rating === 'number' && isFinite(s.rating)) ? Math.max(100, Math.min(3500, s.rating)) : d.rating;
+  var rd = (typeof s.rd === 'number' && isFinite(s.rd) && s.rd > 0) ? Math.min(ELO_CONFIG.startRd, s.rd) : d.rd;
+  var vol = (typeof s.vol === 'number' && isFinite(s.vol) && s.vol > 0 && s.vol < 1) ? s.vol : d.vol;
+  var games = [];
+  if (Array.isArray(s.games)) {
+    for (var i = 0; i < s.games.length; i++) {
+      var gm = s.games[i];
+      if (gm && typeof gm.opp === 'number' && isFinite(gm.opp) && (gm.score === 0 || gm.score === 0.5 || gm.score === 1)) games.push({ opp: gm.opp, score: gm.score, t: typeof gm.t === 'number' ? gm.t : 0 });
+    }
+  }
+  return { rating: rating, rd: rd, vol: vol, games: games.slice(-ELO_CONFIG.windowGames) };
+}
+
+// Fold one finished game (score from the player's side) into the state. engineElo is the level the engine played at.
+function eloAfterGame(state, engineElo, score, now) {
+  var s = eloResolveState(state);
+  var u = glicko2Update(s, [{ opp: engineElo, oppRd: 0, score: score }]);
+  var games = s.games.concat([{ opp: engineElo, score: score, t: now || 0 }]).slice(-ELO_CONFIG.windowGames);
+  return { rating: u.rating, rd: Math.max(ELO_CONFIG.rdFloor, u.rd), vol: u.vol, games: games };
+}
+
+// The engine level for the next game: the player's rating, kept inside the range the engine can play.
+function eloEngineLevel(state) {
+  var r = eloResolveState(state).rating;
+  return Math.round(Math.max(ELO_CONFIG.min, Math.min(ELO_CONFIG.max, r)));
+}
+
+// Wins, draws, losses of the kept window.
+function eloWindowRecord(state) {
+  var rec = { w: 0, d: 0, l: 0 }, g = eloResolveState(state).games;
+  for (var i = 0; i < g.length; i++) { if (g[i].score === 1) rec.w++; else if (g[i].score === 0.5) rec.d++; else rec.l++; }
+  return rec;
+}
+/* TASK_1950_ADAPTIVE_ELO_END */
 
 try {
   analysisMode = localStorage.getItem('chessPrepBoard.analysisMode') === '1';
@@ -6929,6 +7062,66 @@ if (sparToggleEl) {
     if (sparToggleEl.checked) sparSyncMemory();
   };
 }
+/*
+  Adaptive opponent strength (#1950). The player's rating and the strength mode are kept in this browser (localStorage), so no account,
+  Worker or rules change is involved; they do not follow the player to another device yet. The engine's level for a game is fixed when the
+  game starts and written into its log, so the rating update uses the level the game was really played at.
+*/
+var SPAR_ELO_KEY = 'chessPrepBoard.sparElo.v1';
+var sparEloStore = null;   // { mode, fixed, state }, loaded lazily; kept in memory when storage is blocked
+function sparEloLoad() {
+  if (sparEloStore) return sparEloStore;
+  var raw = null;
+  try { var text = localStorage.getItem(SPAR_ELO_KEY); raw = text ? JSON.parse(text) : null; } catch (e) { raw = null; }
+  var mode = raw && raw.mode === 'fixed' ? 'fixed' : 'adaptive';
+  var fixed = raw && typeof raw.fixed === 'number' && isFinite(raw.fixed) ? Math.max(ELO_CONFIG.min, Math.min(ELO_CONFIG.max, raw.fixed)) : 1500;
+  sparEloStore = { mode: mode, fixed: fixed, state: eloResolveState(raw && raw.state) };
+  return sparEloStore;
+}
+function sparEloSave() {
+  try { localStorage.setItem(SPAR_ELO_KEY, JSON.stringify(sparEloLoad())); } catch (e) { /* session only */ }
+}
+// The level the next game is played at.
+function sparEloNextLevel() {
+  var st = sparEloLoad();
+  return st.mode === 'fixed' ? Math.round(st.fixed) : eloEngineLevel(st.state);
+}
+function sparEloRecordText(st) {
+  var rec = eloWindowRecord(st.state), n = st.state.games.length;
+  return 'Your rating ' + Math.round(st.state.rating) + ' \u00b1 ' + Math.round(st.state.rd) + (n ? ' \u00b7 last ' + n + ': ' + rec.w + 'W ' + rec.d + 'D ' + rec.l + 'L' : ' \u00b7 no games yet');
+}
+function sparEloShow(playingLevel) {
+  var st = sparEloLoad();
+  // While a game is on, the readout names the level that game is really played at, whatever the controls now say about the next one.
+  var live = train && train.spar && !train.spar.ended && typeof train.spar.eloLevel === 'number' ? train.spar.eloLevel : null;
+  var level = typeof playingLevel === 'number' ? playingLevel : live !== null ? live : sparEloNextLevel();
+  var line = document.getElementById('sparEloLine');
+  if (line) line.textContent = 'agent-chess ~' + level + ' \u00b7 ' + sparEloRecordText(st);
+  var mode = document.getElementById('sparEloMode'), slider = document.getElementById('sparEloSlider'), out = document.getElementById('sparEloOut'), sum = document.getElementById('sparEloSummary');
+  if (mode) mode.value = st.mode;
+  if (slider) { slider.value = String(Math.round(st.fixed)); slider.disabled = st.mode !== 'fixed'; }
+  if (out) out.textContent = st.mode === 'fixed' ? String(Math.round(st.fixed)) : '~' + sparEloNextLevel();
+  if (sum) sum.textContent = sparEloRecordText(st) + (st.mode === 'adaptive' ? '. Next opponent ~' + sparEloNextLevel() + '.' : '. Playing at ' + Math.round(st.fixed) + '.');
+}
+// A finished game: scoreForEngine is 'win' | 'draw' | 'loss' from the engine's side.
+function sparEloRecordGame(level, resultForEngine) {
+  var st = sparEloLoad();
+  var score = resultForEngine === 'win' ? 0 : resultForEngine === 'loss' ? 1 : 0.5;
+  st.state = eloAfterGame(st.state, level, score, Date.now());
+  sparEloSave();
+  sparEloShow();
+}
+(function sparEloWire() {
+  var mode = document.getElementById('sparEloMode'), slider = document.getElementById('sparEloSlider'), reset = document.getElementById('sparEloResetBtn');
+  if (mode) mode.onchange = function() { sparEloLoad().mode = mode.value === 'fixed' ? 'fixed' : 'adaptive'; sparEloSave(); sparEloShow(); };
+  if (slider) slider.oninput = function() { sparEloLoad().fixed = Number(slider.value); sparEloSave(); sparEloShow(); };
+  if (reset) reset.onclick = function() {
+    if (reset.dataset.armed !== '1') { reset.dataset.armed = '1'; reset.textContent = 'Click again to confirm'; setTimeout(function() { reset.dataset.armed = ''; reset.textContent = 'Reset rating'; }, 4000); return; }
+    reset.dataset.armed = ''; reset.textContent = 'Reset rating';
+    sparEloLoad().state = eloDefaultState(); sparEloSave(); sparEloShow();
+  };
+  sparEloShow();
+})();
 function sparPlayerName() {
   try { return currentUser && currentUser.displayName ? String(currentUser.displayName) : ''; } catch (e) { return ''; }
 }
@@ -7043,12 +7236,14 @@ function sparBegin(t, message) {
     handoff: null,
     log: [],
     engineMoves: [],
-    memory: sparMemoryForGame()
+    memory: sparMemoryForGame(),
+    eloLevel: sparEloNextLevel()   // the strength this whole game is played at
   };
   clearTimeout(t.hintTimer);
   t.hintSquare = null;
   t.bestMove = null;
   sparStatus('');
+  sparEloShow(t.spar.eloLevel);
   sparShowGameButtons(false);
   sparSyncResign();
   sparSyncNext();
@@ -7124,7 +7319,7 @@ async function sparOpponentMove(t, lineId) {
     // Let "opponent to move" paint before the search blocks the page.
     await new Promise(function(resolve) { setTimeout(resolve, 30); });
     if (train !== t || t.lineId !== lineId) return;
-    var r = agentChessMove(game, { strength: SPAR_CONFIG.strength, seed: seed, memory: sp.memory, ply: ply });
+    var r = agentChessMove(game, { strength: SPAR_CONFIG.strength, elo: sp.eloLevel, seed: seed, memory: sp.memory, ply: ply });
     if (!r) return sparFinish(t, sparGameResult(game, sp.engineColor, SPAR_CONFIG.maxPlies) || 'draw');
     // Auto-resign: this move's search score is the engine's own verdict. Three in a row at or below the line and it stops
     // playing on instead of waiting to be mated. The move it just found is not played.
@@ -7515,10 +7710,11 @@ function sparFinish(t, result) {
   }
   sparLastGame = {
     v: SPAR_CONFIG.logVersion, id: sp.id, seed: sp.seed, engine: SPAR_CONFIG.version, engine_color: sp.engineColor,
-    result_for_engine: result, start_fen: sp.startFen, handoff: sp.handoff, pgn: game.pgn(), moves: sp.log, resigned: !!sp.resignedBy, resigned_by: sp.resignedBy || null
+    result_for_engine: result, engine_elo: sp.eloLevel, start_fen: sp.startFen, handoff: sp.handoff, pgn: game.pgn(), moves: sp.log, resigned: !!sp.resignedBy, resigned_by: sp.resignedBy || null
   };
   sparShowGameButtons(true);
   sparSyncResign();
+  if (sp.engineMoves.length > 0) sparEloRecordGame(sp.eloLevel, result);   // a game the engine never moved in tells nothing about strength
   var finishStatus = usable ? 'Memory: ' + mem.games.length + ' games.' : SPAR_NOT_OWNER_TEXT;
   sparStatus(finishStatus);
   var uploaded = sparUploadGame(sparLastGame);
