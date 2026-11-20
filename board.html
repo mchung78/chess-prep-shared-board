@@ -261,7 +261,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "51553aa \u00b7 2026-11-19 02:43 UTC";
+var BOARD_BUILD = "1afaf40 \u00b7 2026-11-20 00:10 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1757,7 +1757,7 @@ var SPAR_CONFIG = {
   // within epsilon of the best count as equivalent and a seeded pick among those gives variety.
   // Strength comes from the search budget (nodes, time), not from noise. A chosen move is
   // verified one ply deeper before it is played (verifyMargin), and dropped if that refutes it.
-  engine: { terms: { rooks: true, pawns: true, passed: true, king: true, mobility: false, shield: false, pawnsPc1: false }, maxDepth: 8, capMs: 400, qDepth: 6, checkExtPly: 12, ttMax: 200000, deltaMargin: 200, lmrAfter: 4, rootWindow: 150, epsilon: 10, verifyMargin: 40, verifyShare: 0.7, verifyRounds: 4 },
+  engine: { weights: null, terms: { rooks: true, pawns: true, passed: true, king: true, mobility: false, shield: false, pawnsPc1: false }, maxDepth: 8, capMs: 400, qDepth: 6, checkExtPly: 12, ttMax: 200000, deltaMargin: 200, lmrAfter: 4, rootWindow: 150, epsilon: 10, verifyMargin: 40, verifyShare: 0.7, verifyRounds: 4 },
   memory: { maxGames: 200, maxPositions: 4000, perBlame: 80, maxBonus: 60, maxPenalty: 400, winCredit: 0.15, lossScale: 300,
     // v2, learned from Stockfish-labelled games: a move whose labelled regret is at least labelMinRegret is penalised by labelScale of it; the
     // labelled better move of that position gets betterShare of the regret it avoided (at most maxBetter).
@@ -2147,7 +2147,20 @@ function sparEvalTerms(chess) {
   return { material: material, pst: pst + king, bishop_pair: bishopPair, rooks: rookTerm, pawn_structure: pawnTerm, passed_pawns: passedTerm, king_danger: kingTerm, mobility: mobTerm, king_shield: shieldTerm, pawns_pc1: pw2Term };
 }
 
-function sparEvalTotal(terms) { return terms.material + terms.pst + terms.bishop_pair + terms.rooks + terms.pawn_structure + terms.passed_pawns + terms.king_danger + terms.mobility + terms.king_shield + terms.pawns_pc1; }
+// Per-term multipliers (#1950 P2): null (the default) leaves the plain sum, so the shipped evaluation is unchanged and a disabled
+// feature costs one property read. When set, e.g. { rooks: 1.2, king_danger: 0.8 }, a missing name counts as 1, and the total is rounded to a
+// whole centipawn like the unweighted one.
+var SPAR_TERM_NAMES = ['material', 'pst', 'bishop_pair', 'rooks', 'pawn_structure', 'passed_pawns', 'king_danger', 'mobility', 'king_shield', 'pawns_pc1'];
+function sparWeightedTotal(terms, W) {
+  var total = 0;
+  for (var i = 0; i < SPAR_TERM_NAMES.length; i++) { var n = SPAR_TERM_NAMES[i], w = W[n]; total += terms[n] * (w === undefined ? 1 : w); }
+  return Math.round(total);
+}
+function sparEvalTotal(terms) {
+  var W = SPAR_CONFIG.engine.weights;
+  if (W) return sparWeightedTotal(terms, W);
+  return terms.material + terms.pst + terms.bishop_pair + terms.rooks + terms.pawn_structure + terms.passed_pawns + terms.king_danger + terms.mobility + terms.king_shield + terms.pawns_pc1;
+}
 
 /* ---------- Search ---------- */
 
@@ -2158,9 +2171,22 @@ function sparMoveOrderScore(m) {
   return s;
 }
 
-function sparSortMoves(moves) {
-  moves.sort(function(a, b) { return sparMoveOrderScore(b) - sparMoveOrderScore(a); });
+// Stable insertion sort, best score first, over a shared scratch array of scores (#1950 P5). The move lists are short (about 30), a generic
+// comparator sort costs more than it saves, and the order is identical to Array.prototype.sort's stable one, so searches visit the same nodes.
+// Not re-entrant: a caller fills SPAR_ORD_SC for its moves, sorts, and is done before anything else sorts.
+var SPAR_ORD_SC = [];
+function sparSortByScores(moves, sc) {
+  for (var i = 1; i < moves.length; i++) {
+    var m = moves[i], v = sc[i], j = i - 1;
+    while (j >= 0 && sc[j] < v) { moves[j + 1] = moves[j]; sc[j + 1] = sc[j]; j--; }
+    moves[j + 1] = m; sc[j + 1] = v;
+  }
   return moves;
+}
+function sparSortMoves(moves) {
+  var sc = SPAR_ORD_SC;
+  for (var i = 0; i < moves.length; i++) sc[i] = sparMoveOrderScore(moves[i]);
+  return sparSortByScores(moves, sc);
 }
 
 // Strength (800-2000) -> the search budget: a weaker level simply searches less and so sees less.
@@ -2255,12 +2281,12 @@ function agentChessMove(position, opts) {
   function fromTT(sc, ply) { return sc > SPAR_MATE - 200 ? sc - ply : sc < -SPAR_MATE + 200 ? sc + ply : sc; }
   function orderMoves(moves, ttCode, ply) {
     var k = killers[ply] || [];
+    var sc = SPAR_ORD_SC;
     for (var oi = 0; oi < moves.length; oi++) {
       var m = moves[oi], code = moveCode(m);
-      m.__o = code === ttCode ? 1e7 : sparMoveOrderScore(m) + (m.captured ? 0 : (code === k[0] ? 900 : code === k[1] ? 800 : 0) + Math.min(700, history[code] || 0));
+      sc[oi] = code === ttCode ? 1e7 : sparMoveOrderScore(m) + (m.captured ? 0 : (code === k[0] ? 900 : code === k[1] ? 800 : 0) + Math.min(700, history[code] || 0));
     }
-    moves.sort(function(a, b) { return b.__o - a.__o; });
-    return moves;
+    return sparSortByScores(moves, sc);
   }
 
   // Score from the side to move's point of view.
