@@ -261,7 +261,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "1afaf40 \u00b7 2026-11-20 00:10 UTC";
+var BOARD_BUILD = "3c63d2d \u00b7 2026-11-20 00:45 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -1757,7 +1757,7 @@ var SPAR_CONFIG = {
   // within epsilon of the best count as equivalent and a seeded pick among those gives variety.
   // Strength comes from the search budget (nodes, time), not from noise. A chosen move is
   // verified one ply deeper before it is played (verifyMargin), and dropped if that refutes it.
-  engine: { weights: null, terms: { rooks: true, pawns: true, passed: true, king: true, mobility: false, shield: false, pawnsPc1: false }, maxDepth: 8, capMs: 400, qDepth: 6, checkExtPly: 12, ttMax: 200000, deltaMargin: 200, lmrAfter: 4, rootWindow: 150, epsilon: 10, verifyMargin: 40, verifyShare: 0.7, verifyRounds: 4 },
+  engine: { weights: null, terms: { rooks: true, pawns: true, passed: true, king: true, mobility: false, shield: false, pawnsPc1: false }, maxDepth: 8, capMs: 400, qDepth: 6, checkExtPly: 12, ttMax: 200000, deltaMargin: 200, lmrAfter: 4, rootWindow: 150, epsilon: 10, verifyMargin: 40, verifyShare: 0.7, verifyRounds: 4, pvs: false, rfp: 0 },
   memory: { maxGames: 200, maxPositions: 4000, perBlame: 80, maxBonus: 60, maxPenalty: 400, winCredit: 0.15, lossScale: 300,
     // v2, learned from Stockfish-labelled games: a move whose labelled regret is at least labelMinRegret is penalised by labelScale of it; the
     // labelled better move of that position gets betterShare of the regret it avoided (at most maxBetter).
@@ -2375,6 +2375,20 @@ function agentChessMove(position, opts) {
         if (entry.f === 0 || (entry.f === 1 && ts >= beta) || (entry.f === 2 && ts <= alpha)) return ts;
       }
     }
+    // Reverse futility (#1950 P4, off by default): at shallow depth, far above beta on a static evaluation, assume a cutoff.
+    if (eng.rfp && depth <= 3 && beta - alpha === 1 && beta < SPAR_MATE - 1000 && beta > -SPAR_MATE + 1000 && !work.isCheck()) {
+      var rfpEval = staticEval();
+      if (rfpEval - eng.rfp * depth >= beta) {
+        // Not in check, so no legal move means stalemate (a draw, not a win): only cut off when a legal move exists.
+        var rfpMoves = work._moves({ legal: false }), rfpLegal = false;
+        for (var r = 0; r < rfpMoves.length && !rfpLegal; r++) {
+          work._makeMove(rfpMoves[r]);
+          if (!work._isKingAttacked(rfpMoves[r].color)) rfpLegal = true;
+          work._undoMove();
+        }
+        if (rfpLegal) return rfpEval - eng.rfp * depth;
+      }
+    }
     rep.set(key, 1);
     var hits0 = repHits;
     try {
@@ -2389,6 +2403,12 @@ function agentChessMove(position, opts) {
         legal++;
         var ext = ply < eng.checkExtPly && work.isCheck() ? 1 : 0;
         var v;
+        // Principal-variation search (#1950 P4, off by default): after the first move, a zero-window search proves the rest are no better;
+        // only one that lands inside the window is searched again in full.
+        if (eng.pvs && legal > 1 && beta - alpha > 1 && !(depth >= 3 && legal > eng.lmrAfter && !nodeCheck && !ext && !mv.captured && !mv.promotion)) {
+          v = -negamax(depth - 1 + ext, -alpha - 1, -alpha, ply + 1, !!mv.captured);
+          if (v > alpha && v < beta) v = -negamax(depth - 1 + ext, -beta, -alpha, ply + 1, !!mv.captured);
+        } else
         // Late move reduction: quiet moves tried late at a deep node are first searched one ply shallower in a zero window;
         // only one that beats alpha that way is searched in full.
         if (depth >= 3 && legal > eng.lmrAfter && !nodeCheck && !ext && !mv.captured && !mv.promotion) {
