@@ -269,7 +269,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "de46ba6 \u00b7 2026-11-21 00:49 UTC";
+var BOARD_BUILD = "84fed2f \u00b7 2026-11-21 01:20 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -3937,15 +3937,15 @@ function snapGhostToSquare(ghost, sq) {
 }
 
 /*
-  Right-click arrows (Michael, 2026-11-15), like Lichess: press the right button on one square and release it on another to draw
-  an arrow between them (an SVG over the board, so it follows the board when flipped). Any number of arrows can be drawn
-  (Michael, 2026-11-17). The colour follows the modifier held: none = green, Ctrl = red, Alt = blue, Shift = gold. Repeating an arrow of the
-  same colour removes it; repeating it in another colour recolours it. A left-click on the board clears every arrow, and so does
+  Right-click annotations (Michael, 2026-11-15; #1974): click a square to circle it, or press the right button on one square and
+  release it on another to draw an arrow (an SVG over the board, so it follows the board when flipped). Any number can be drawn
+  (Michael, 2026-11-17). The colour follows the modifier held: none = green, Ctrl = red, Alt = blue, Shift = gold. Repeating an annotation of the
+  same colour removes it; repeating it in another colour recolours it. A left-click on the board clears every annotation, and so does
   any change of the position shown. While the button is held the arrow previews. The board's context menu is suppressed so the
   right button is free.
 */
-var boardArrows = [];       // [{ from, to, color, fen }]
-var arrowDrag = null;       // { from, to, color, fen } while the right button is down
+var boardArrows = [];       // [{ from, to, color, fen }] (a circle has from === to)
+var arrowDrag = null;       // { from, to, color, fen, startX, startY, moved } while the right button is down
 var ARROW_COLORS = { green: 'rgb(21, 120, 27)', red: 'rgb(180, 30, 30)', blue: 'rgb(30, 90, 190)', gold: 'rgb(212, 160, 20)' };
 function arrowColorName(ev) { return ev.ctrlKey ? 'red' : ev.altKey ? 'blue' : ev.shiftKey ? 'gold' : 'green'; }
 function arrowGeometry(from, to) {
@@ -3975,6 +3975,7 @@ function drawBoardArrow(fen) {
   if (arrowDrag && arrowDrag.to && arrowDrag.to !== arrowDrag.from) list.push(arrowDrag);
   var shapes = [];
   list.forEach(function(arrow) {
+    if (arrow.from === arrow.to) { shapes.push({ circle: arrow }); return; }
     var points = arrowGeometry(arrow.from, arrow.to);
     if (points) shapes.push({ arrow: arrow, points: points });
   });
@@ -3986,6 +3987,23 @@ function drawBoardArrow(fen) {
   svg.setAttribute('preserveAspectRatio', 'none');
   svg.style.cssText = 'position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none; z-index:5;';
   shapes.forEach(function(sh) {
+    if (sh.circle) {
+      var cell = boardEl.querySelector('[data-square="' + sh.circle.from + '"]');
+      if (!cell) return;
+      var circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle'), size = cell.offsetWidth;
+      circle.setAttribute('class', 'board-circle');
+      circle.setAttribute('data-circle-square', sh.circle.from);
+      circle.setAttribute('data-color', sh.circle.color);
+      circle.setAttribute('cx', cell.offsetLeft + size / 2);
+      circle.setAttribute('cy', cell.offsetTop + size / 2);
+      circle.setAttribute('r', size * 0.38);
+      circle.setAttribute('fill', 'none');
+      circle.setAttribute('stroke', ARROW_COLORS[sh.circle.color]);
+      circle.setAttribute('stroke-width', size * 0.11);
+      circle.setAttribute('stroke-opacity', '0.85');
+      svg.appendChild(circle);
+      return;
+    }
     var poly = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
     poly.setAttribute('class', 'board-arrow');
     poly.setAttribute('data-from', sh.arrow.from);
@@ -4014,12 +4032,13 @@ boardEl.addEventListener('mousedown', function(ev) {
   if (ev.button !== 2) return;
   var sq = squareAtPoint(ev.clientX, ev.clientY);
   if (!sq) return;
-  arrowDrag = { from: sq, to: null, color: arrowColorName(ev), fen: buildViewGame().fen() };
+  arrowDrag = { from: sq, to: null, color: arrowColorName(ev), fen: buildViewGame().fen(), startX: ev.clientX, startY: ev.clientY, moved: false };
   document.addEventListener('mousemove', onArrowMove);
   document.addEventListener('mouseup', onArrowUp);
 });
 function onArrowMove(ev) {
   if (!arrowDrag) return;
+  if (Math.hypot(ev.clientX - arrowDrag.startX, ev.clientY - arrowDrag.startY) >= 4) arrowDrag.moved = true;
   var sq = squareAtPoint(ev.clientX, ev.clientY), color = arrowColorName(ev);
   if (sq === arrowDrag.to && color === arrowDrag.color) return;
   arrowDrag.to = sq;
@@ -4035,8 +4054,9 @@ function onArrowUp(ev) {
   if (!drag) return;
   var to = squareAtPoint(ev.clientX, ev.clientY);
   var viewFen = buildViewGame().fen();
-  if (to && to !== drag.from && drag.fen === viewFen) {
+  if (to && drag.fen === viewFen && (to !== drag.from || !drag.moved)) {
     var color = arrowColorName(ev), kept = [], same = false;
+    if (!drag.moved) to = drag.from;
     boardArrows.forEach(function(a) {
       if (a.from === drag.from && a.to === to) { if (a.color === color) same = true; }   // same arrow, same colour: toggled off; another colour: replaced below
       else kept.push(a);
