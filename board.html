@@ -220,7 +220,7 @@ Analysis mode
 <div id="sparEloRow" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center; font-size:13px; margin-bottom:6px;" title="How strong agent-chess plays. Adaptive follows your rating: it starts at 1000 and moves with your results over about your last 20 games. Fixed plays at the level you pick. Levels are Elo on the Stockfish scale; under 1320 they are extrapolated.">
 <label for="sparEloMode">Opponent strength</label>
 <select id="sparEloMode"><option value="adaptive">Adaptive (follows your rating)</option><option value="fixed">Fixed</option></select>
-<input type="range" id="sparEloSlider" min="1000" max="2200" step="50" value="1500" aria-label="Fixed opponent strength (Elo)" style="min-width:120px; flex:1 1 120px;">
+<input type="range" id="sparEloSlider" min="800" max="2200" step="50" value="1500" aria-label="Fixed opponent strength (Elo)" style="min-width:120px; flex:1 1 120px;">
 <output id="sparEloOut" for="sparEloSlider" style="min-width:3.5em;"></output>
 <button id="sparEloResetBtn" type="button" title="Forget your spar rating and start again at 1000.">Reset rating</button>
 <span id="sparEloSummary" role="status" style="flex-basis:100%; color:var(--text-secondary, #aaa); font-size:12px;"></span>
@@ -269,7 +269,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "1619f6a \u00b7 2026-11-20 04:52 UTC";
+var BOARD_BUILD = "de46ba6 \u00b7 2026-11-21 00:49 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -2207,7 +2207,7 @@ function sparSortMoves(moves) {
   weakest level is 1320, so every number under that is extrapolated from the epsilon ladder. ceilingMs only stops a slow device from hanging.
 */
 var SPAR_ELO = {
-  min: 1000, max: 2200,
+  min: 800, max: 2200,
   intercept: 820, slope: 74.25,
   floorNodes: 250,
   epsTable: [[1411, 10], [1286, 30], [1166, 60], [981, 100], [811, 150], [696, 250]],   // [Elo, epsilon] at floorNodes, descending Elo
@@ -4558,7 +4558,7 @@ var ELO_CONFIG = {
   tau: 0.5,                                    // Glicko-2 volatility constraint
   rdFloor: 75,                                 // adapt faster than a plain average: recent games always count
   windowGames: 20,                             // results kept for the readout
-  min: 1000, max: 2200                         // the engine plays inside this range whatever the player's rating
+  min: 800, max: 2200                          // the engine plays inside this range whatever the player's rating
 };
 var ELO_Q = 173.7178;                          // Glicko-2 scale constant, 400 / ln(10)
 
