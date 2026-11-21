@@ -269,7 +269,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "84fed2f \u00b7 2026-11-21 01:20 UTC";
+var BOARD_BUILD = "f540397 \u00b7 2026-11-21 06:21 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -7166,6 +7166,15 @@ function sparResignDisarm() {
   var el = document.getElementById('sparResignBtn');
   if (el) el.textContent = 'Resign';
 }
+// #2001: when agent-chess resigns, circle its king in red on the board (the same circle the right-click annotations use), so the
+// resignation is seen without reading the message. It belongs to the final position like any annotation: a move or leaving the position clears it.
+function sparMarkResignedKing(chess, color) {
+  var sq = null;
+  chess.board().forEach(function(row) { row.forEach(function(p) { if (p && p.type === 'k' && p.color === color) sq = p.square; }); });
+  if (!sq) return;
+  boardArrows = boardArrows.filter(function(a) { return !(a.from === sq && a.to === sq); }).concat([{ from: sq, to: sq, color: 'red', fen: chess.fen() }]);
+  drawBoardArrow(buildViewGame().fen());
+}
 function sparResign() {
   var t = train;
   if (!t || !t.spar || t.spar.ended) return false;
@@ -7347,6 +7356,7 @@ async function sparOpponentMove(t, lineId) {
     sp.behind = r.log.engine.chosen_score <= rcfg.cp ? (sp.behind || 0) + 1 : 0;
     if (sp.behind >= rcfg.moves) {
       sp.resignedBy = 'engine';
+      sparMarkResignedKing(game, sp.engineColor);
       return sparFinish(t, 'loss');
     }
     entry = r.log;
