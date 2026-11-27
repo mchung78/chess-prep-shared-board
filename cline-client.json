@@ -1,0 +1,12 @@
+{
+  "client_id": "https://chess-prep.pages.dev/cline-client.json",
+  "client_name": "Cline CLI (chess-prep)",
+  "redirect_uris": [
+    "http://127.0.0.1:1456/mcp/oauth/callback",
+    "http://127.0.0.1:1457/mcp/oauth/callback",
+    "http://127.0.0.1:1458/mcp/oauth/callback"
+  ],
+  "grant_types": ["authorization_code", "refresh_token"],
+  "response_types": ["code"],
+  "token_endpoint_auth_method": "none"
+}
