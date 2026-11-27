@@ -222,6 +222,8 @@ Analysis mode
 <select id="sparEloMode"><option value="adaptive">Adaptive (follows your rating)</option><option value="fixed">Fixed</option></select>
 <input type="range" id="sparEloSlider" min="800" max="2200" step="50" value="1500" aria-label="Fixed opponent strength (Elo)" style="min-width:120px; flex:1 1 120px;">
 <output id="sparEloOut" for="sparEloSlider" style="min-width:3.5em;"></output>
+<label for="sparTimeCap" title="The longest the opponent may spend on one move. How long it really takes follows its strength: weak levels answer at once, strong levels use more. A slower device needs more time to reach the strongest levels.">Longest think time</label>
+<select id="sparTimeCap" aria-label="Longest opponent thinking time per move"><option value="250">0.25 s</option><option value="500">0.5 s</option><option value="1000">1 s</option><option value="1500">1.5 s</option><option value="2000" selected>2 s</option></select>
 <button id="sparEloResetBtn" type="button" title="Forget your spar rating and start again at 1000.">Reset rating</button>
 <span id="sparEloSummary" role="status" style="flex-basis:100%; color:var(--text-secondary, #aaa); font-size:12px;"></span>
 </div>
@@ -269,7 +271,7 @@ Analysis mode
   (.github/scripts/sync_shared_board.py) replaces the next line with the
   chess-prep commit and its time - keep it exactly as written.
 */
-var BOARD_BUILD = "f540397 \u00b7 2026-11-21 06:21 UTC";
+var BOARD_BUILD = "d7eece8 \u00b7 2026-11-27 02:06 UTC";
 document.getElementById('buildStamp').textContent =
   BOARD_BUILD === 'dev' ? 'Version: local copy (not deployed)' : 'Version ' + BOARD_BUILD;
 var INITIAL_FEN = '';
@@ -2211,7 +2213,12 @@ var SPAR_ELO = {
   intercept: 820, slope: 74.25,
   floorNodes: 250,
   epsTable: [[1411, 10], [1286, 30], [1166, 60], [981, 100], [811, 150], [696, 250]],   // [Elo, epsilon] at floorNodes, descending Elo
-  ceilingMs: 6000
+  ceilingMs: 6000,
+  // Think time (#1950, Michael 2026-11-26). The level is a node budget, so the time a move needs follows from the level and the device's speed
+  // (sparEloMoveCapMs): weak levels answer at once, strong ones take longer. The player chooses only the LONGEST any move may take (default and
+  // maximum two seconds); a level whose budget does not fit in that is held to the ceiling below. margin covers positions slower than the
+  // measured one (measured in Node: 82k nodes/s in a tactical middlegame against 90k in the measured one).
+  timeCap: { defaultMs: 2000, minMs: 250, maxMs: 2000, stepMs: 250, margin: 1.5 }
 };
 function sparEloParams(elo) {
   var e = Math.max(SPAR_ELO.min, Math.min(SPAR_ELO.max, Number(elo) || SPAR_ELO.min));
@@ -2224,6 +2231,55 @@ function sparEloParams(elo) {
     if (e <= t[i][0] && e >= t[i + 1][0]) { eps = t[i][1] + (t[i + 1][1] - t[i][1]) * (t[i][0] - e) / (t[i][0] - t[i + 1][0]); break; }
   }
   return { elo: e, nodeCap: SPAR_ELO.floorNodes, epsilon: Math.round(eps), capMs: SPAR_ELO.ceilingMs };
+}
+
+// The chosen per-move cap, as a whole step inside the allowed range (anything unusable gives the default).
+function sparTimeCapMs(ms) {
+  var c = SPAR_ELO.timeCap, n = Number(ms);
+  if (ms === null || ms === undefined || ms === '' || typeof ms === 'boolean' || !isFinite(n)) return c.defaultMs;   // Number(null) is 0: nothing stored must not read as the shortest cap
+  return Math.max(c.minMs, Math.min(c.maxMs, Math.round(n / c.stepMs) * c.stepMs));
+}
+// The Elo a node budget plays at (the calibration line), inside the offered range.
+function sparEloAtNodes(nodes) {
+  var n = Number(nodes);
+  if (n === Infinity) return SPAR_ELO.max;
+  if (!isFinite(n) || n < 1) return SPAR_ELO.min;
+  return Math.max(SPAR_ELO.min, Math.min(SPAR_ELO.max, SPAR_ELO.intercept + SPAR_ELO.slope * Math.log(n) / Math.LN2));
+}
+// Nodes a device searches per second: a short warm-up (so the JIT has run), then a timed search of a middlegame position with verification off.
+// A middlegame, not the start position: the start is about 1.5 to 3 times cheaper per node than the positions a game is mostly played in, which would
+// make the ceiling optimistic (measured in Node, 150k vs 90k nodes a second).
+var SPAR_NPS_FEN = 'r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P1B2/2PBPN2/PP1N1PPP/R2QK2R w KQ - 0 9';
+// `now` is injectable (milliseconds). Returns { nps, nodes, ms }, or null when the clock gave no usable interval.
+function sparMeasureNps(now) {
+  var nowFn = now || function() { return Date.now(); };
+  var start = new Chess(SPAR_NPS_FEN);
+  agentChessMove(start, { nodeCap: 3000, capMs: Infinity, noVerify: true, seed: 1 });
+  var t0 = nowFn();
+  var r = agentChessMove(start, { nodeCap: 12000, capMs: Infinity, noVerify: true, seed: 1 });
+  var ms = nowFn() - t0, nodes = r && r.log && r.log.engine ? r.log.engine.nodes : 0;
+  if (!(ms > 0) || !(nodes > 0)) return null;
+  return { nps: nodes / ms * 1000, nodes: nodes, ms: ms };
+}
+// The strongest level a device can really play at the chosen cap. The search stops on time at verifyShare of the cap (the rest is the one-ply
+// verification), so that is the time a node budget has to fit into. Unknown speed: no limit beyond the offered range.
+function sparEloCeiling(nps, capMs) {
+  var n = Number(nps);
+  if (!isFinite(n) || n <= 0) return SPAR_ELO.max;
+  return Math.floor(sparEloAtNodes(n * sparTimeCapMs(capMs) * SPAR_CONFIG.engine.verifyShare / 1000));
+}
+// The per-move cap for a game played at `level`: the time its node budget needs at this device's speed (the search stops on time at verifyShare of
+// the cap), with a margin, but never below the shortest step or above the longest the player allows. Unknown speed: the longest allowed.
+function sparEloMoveCapMs(level, nps, maxMs) {
+  var c = SPAR_ELO.timeCap, top = sparTimeCapMs(maxMs), n = Number(nps);
+  if (!isFinite(n) || n <= 0) return top;
+  var need = sparEloParams(level).nodeCap / (n * SPAR_CONFIG.engine.verifyShare) * 1000 * c.margin;
+  return Math.max(c.minMs, Math.min(top, Math.ceil(need / 50) * 50));
+}
+// The level a game is really played at: the wanted level, held to what the device can search in the cap.
+function sparEloPlayLevel(level, nps, capMs) {
+  var wanted = Math.round(Number(level));
+  return Math.max(SPAR_ELO.min, Math.min(isFinite(wanted) ? wanted : SPAR_ELO.min, sparEloCeiling(nps, capMs)));   // never below the weakest level, whatever came in
 }
 
 function sparStrengthParams(strength) {
@@ -7095,7 +7151,7 @@ function sparEloLoad() {
   try { var text = localStorage.getItem(SPAR_ELO_KEY); raw = text ? JSON.parse(text) : null; } catch (e) { raw = null; }
   var mode = raw && raw.mode === 'fixed' ? 'fixed' : 'adaptive';
   var fixed = raw && typeof raw.fixed === 'number' && isFinite(raw.fixed) ? Math.max(ELO_CONFIG.min, Math.min(ELO_CONFIG.max, raw.fixed)) : 1500;
-  sparEloStore = { mode: mode, fixed: fixed, state: eloResolveState(raw && raw.state) };
+  sparEloStore = { mode: mode, fixed: fixed, timeCapMs: sparTimeCapMs(raw && raw.timeCapMs), state: eloResolveState(raw && raw.state) };
   return sparEloStore;
 }
 function sparEloSave() {
@@ -7106,6 +7162,18 @@ function sparEloNextLevel() {
   var st = sparEloLoad();
   return st.mode === 'fixed' ? Math.round(st.fixed) : eloEngineLevel(st.state);
 }
+// This device's search speed, measured once per page load the first time a game starts (a few hundred milliseconds); null until then.
+var sparNpsMeasured = null;
+function sparNpsGet(measure) {
+  if (sparNpsMeasured === null && measure) {
+    try { var m = sparMeasureNps(); if (m) sparNpsMeasured = m; } catch (e) { /* no measurement: the level is not limited */ }
+  }
+  return sparNpsMeasured ? sparNpsMeasured.nps : null;
+}
+// The level a game started now would really be played at: the wanted level held to what this device searches in the chosen cap.
+function sparEloLevelNow(measure) {
+  return sparEloPlayLevel(sparEloNextLevel(), sparNpsGet(measure), sparEloLoad().timeCapMs);
+}
 function sparEloRecordText(st) {
   var rec = eloWindowRecord(st.state), n = st.state.games.length;
   return 'Your rating ' + Math.round(st.state.rating) + ' \u00b1 ' + Math.round(st.state.rd) + (n ? ' \u00b7 last ' + n + ': ' + rec.w + 'W ' + rec.d + 'D ' + rec.l + 'L' : ' \u00b7 no games yet');
@@ -7114,14 +7182,18 @@ function sparEloShow(playingLevel) {
   var st = sparEloLoad();
   // While a game is on, the readout names the level that game is really played at, whatever the controls now say about the next one.
   var live = train && train.spar && !train.spar.ended && typeof train.spar.eloLevel === 'number' ? train.spar.eloLevel : null;
-  var level = typeof playingLevel === 'number' ? playingLevel : live !== null ? live : sparEloNextLevel();
+  var level = typeof playingLevel === 'number' ? playingLevel : live !== null ? live : sparEloLevelNow(false);
   var line = document.getElementById('sparEloLine');
   if (line) line.textContent = 'agent-chess ~' + level + ' \u00b7 ' + sparEloRecordText(st);
   var mode = document.getElementById('sparEloMode'), slider = document.getElementById('sparEloSlider'), out = document.getElementById('sparEloOut'), sum = document.getElementById('sparEloSummary');
   if (mode) mode.value = st.mode;
   if (slider) { slider.value = String(Math.round(st.fixed)); slider.disabled = st.mode !== 'fixed'; }
-  if (out) out.textContent = st.mode === 'fixed' ? String(Math.round(st.fixed)) : '~' + sparEloNextLevel();
-  if (sum) sum.textContent = sparEloRecordText(st) + (st.mode === 'adaptive' ? '. Next opponent ~' + sparEloNextLevel() + '.' : '. Playing at ' + Math.round(st.fixed) + '.');
+  var cap = document.getElementById('sparTimeCap');
+  if (cap) cap.value = String(st.timeCapMs);
+  var nps = sparNpsGet(false), next = sparEloLevelNow(false), wanted = sparEloNextLevel();
+  var limit = nps === null ? '' : ' Searching ' + Math.round(nps / 1000) + 'k nodes/s, this device reaches ~' + sparEloCeiling(nps, st.timeCapMs) + ' in ' + (st.timeCapMs / 1000) + ' s' + (next < wanted ? ' (the opponent is held to ~' + next + ')' : '') + '. A move at ~' + next + ' takes up to ' + (sparEloMoveCapMs(next, nps, st.timeCapMs) / 1000) + ' s.';
+  if (out) out.textContent = st.mode === 'fixed' ? String(Math.round(st.fixed)) : '~' + next;
+  if (sum) sum.textContent = sparEloRecordText(st) + (st.mode === 'adaptive' ? '. Next opponent ~' + next + '.' : '. Playing at ' + Math.min(Math.round(st.fixed), next) + '.') + limit;
 }
 // A finished game: scoreForEngine is 'win' | 'draw' | 'loss' from the engine's side.
 function sparEloRecordGame(level, resultForEngine) {
@@ -7135,6 +7207,8 @@ function sparEloRecordGame(level, resultForEngine) {
   var mode = document.getElementById('sparEloMode'), slider = document.getElementById('sparEloSlider'), reset = document.getElementById('sparEloResetBtn');
   if (mode) mode.onchange = function() { sparEloLoad().mode = mode.value === 'fixed' ? 'fixed' : 'adaptive'; sparEloSave(); sparEloShow(); };
   if (slider) slider.oninput = function() { sparEloLoad().fixed = Number(slider.value); sparEloSave(); sparEloShow(); };
+  var cap = document.getElementById('sparTimeCap');
+  if (cap) cap.onchange = function() { sparEloLoad().timeCapMs = sparTimeCapMs(cap.value); sparEloSave(); sparEloShow(); };
   if (reset) reset.onclick = function() {
     if (reset.dataset.armed !== '1') { reset.dataset.armed = '1'; reset.textContent = 'Click again to confirm'; setTimeout(function() { reset.dataset.armed = ''; reset.textContent = 'Reset rating'; }, 4000); return; }
     reset.dataset.armed = ''; reset.textContent = 'Reset rating';
@@ -7266,8 +7340,10 @@ function sparBegin(t, message) {
     log: [],
     engineMoves: [],
     memory: sparMemoryForGame(),
-    eloLevel: sparEloNextLevel()   // the strength this whole game is played at
+    eloLevel: sparEloLevelNow(true),   // the strength this whole game is played at (held to what the device searches in the longest think time)
+    capMs: null                         // the per-move cap, set just below from the level
   };
+  t.spar.capMs = sparEloMoveCapMs(t.spar.eloLevel, sparNpsGet(false), sparEloLoad().timeCapMs);   // fixed for the whole game
   clearTimeout(t.hintTimer);
   t.hintSquare = null;
   t.bestMove = null;
@@ -7348,7 +7424,7 @@ async function sparOpponentMove(t, lineId) {
     // Let "opponent to move" paint before the search blocks the page.
     await new Promise(function(resolve) { setTimeout(resolve, 30); });
     if (train !== t || t.lineId !== lineId) return;
-    var r = agentChessMove(game, { strength: SPAR_CONFIG.strength, elo: sp.eloLevel, seed: seed, memory: sp.memory, ply: ply });
+    var r = agentChessMove(game, { strength: SPAR_CONFIG.strength, elo: sp.eloLevel, capMs: sp.capMs, seed: seed, memory: sp.memory, ply: ply });
     if (!r) return sparFinish(t, sparGameResult(game, sp.engineColor, SPAR_CONFIG.maxPlies) || 'draw');
     // Auto-resign: this move's search score is the engine's own verdict. Three in a row at or below the line and it stops
     // playing on instead of waiting to be mated. The move it just found is not played.
